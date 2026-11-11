@@ -96,10 +96,15 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
 
 /// Folders removed by "delete all data".
 pub fn data_folders() -> Vec<PathBuf> {
-    let mut v = vec![data_dir()];
-    let logs = logs_dir();
-    if !logs.starts_with(data_dir()) {
-        v.push(logs.parent().map(Path::to_path_buf).unwrap_or(logs));
+    folders_for(data_dir(), logs_dir())
+}
+
+/// Only the logs folder itself: its parent `%LOCALAPPDATA%\Mika` is also
+/// where the installer puts the program.
+fn folders_for(data: PathBuf, logs: PathBuf) -> Vec<PathBuf> {
+    let mut v = vec![data.clone()];
+    if !logs.starts_with(&data) {
+        v.push(logs);
     }
     v
 }
@@ -130,4 +135,32 @@ pub fn wipe_all_data(secrets: &dyn SecretStore) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("cannot schedule folder removal: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wipe_never_touches_the_install_folder() {
+        let install = PathBuf::from(r"C:\Users\me\AppData\Local\Mika");
+        let v = folders_for(
+            PathBuf::from(r"C:\Users\me\AppData\Roaming\Mika"),
+            install.join("logs"),
+        );
+        assert_eq!(
+            v,
+            vec![
+                PathBuf::from(r"C:\Users\me\AppData\Roaming\Mika"),
+                install.join("logs")
+            ]
+        );
+        assert!(!v.contains(&install));
+    }
+
+    #[test]
+    fn logs_inside_data_dir_are_not_listed_twice() {
+        let data = PathBuf::from(r"D:\mika");
+        assert_eq!(folders_for(data.clone(), data.join("logs")), vec![data]);
+    }
 }
