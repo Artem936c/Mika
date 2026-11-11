@@ -1,0 +1,25 @@
+[package]
+name = "mika-tools"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+mika-core.workspace = true
+arboard.workspace = true
+async-trait.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sysinfo.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+windows.workspace = true
+winreg.workspace = true
+
+[dev-dependencies]
+mika-core = { workspace = true, features = ["testing"] }
+tempfile.workspace = true

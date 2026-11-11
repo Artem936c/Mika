@@ -1,0 +1,48 @@
+:root {
+  --ink: #f3f4fa;
+  --mute: #8d93ab;
+  --dim: #5d6279;
+  --line: rgba(255, 255, 255, 0.08);
+  --line2: rgba(255, 255, 255, 0.14);
+  --v: #8f7dff;
+  --p: #ff7eb6;
+  --c: #6fe3ff;
+  --ok: #5fe3a1;
+  --warn: #ffc65c;
+  --bad: #ff6b7d;
+  --island: #06070b;
+  --spring: cubic-bezier(0.32, 1.28, 0.54, 1);
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font: 500 13px/1.45 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  position: fixed;
+  inset: 0;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+}

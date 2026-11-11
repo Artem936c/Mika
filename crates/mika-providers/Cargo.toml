@@ -1,0 +1,18 @@
+[package]
+name = "mika-providers"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+mika-core.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+log.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+mika-core = { workspace = true, features = ["testing"] }

@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Концепт ассистента v5</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+@property --a{syntax:'<angle>';inherits:false;initial-value:0deg}
+:root{--bg:#07080d;--ink:#f3f4fa;--mute:#8d93ab;--dim:#5d6279;--line:rgba(255,255,255,.08);--line2:rgba(255,255,255,.14);
+ --v:#8f7dff;--p:#ff7eb6;--c:#6fe3ff;--ok:#5fe3a1;--warn:#ffc65c;--bad:#ff6b7d;--glass:rgba(16,17,27,.78);
+ --spring:cubic-bezier(.32,1.28,.54,1);--ease:cubic-bezier(.2,.8,.2,1)}
+*{box-sizing:border-box;margin:0}
+body{background:var(--bg);color:var(--ink);font:15px/1.55 Manrope,"Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;padding:44px 24px 120px;-webkit-font-smoothing:antialiased}
+main{max-width:1240px;margin:0 auto}
+.eyebrow{font-size:12px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;background:linear-gradient(90deg,var(--v),var(--p));-webkit-background-clip:text;color:transparent}
+h1{font-size:40px;line-height:1.1;font-weight:800;letter-spacing:-.02em;margin:10px 0 12px}
+h2{font-size:26px;font-weight:800;letter-spacing:-.015em;margin:6px 0 8px}
+.lead{color:var(--mute);max-width:720px}
+section{margin-top:76px}
+i[data-ic]{display:inline-flex;width:16px;height:16px;flex:none}i[data-ic] svg{width:100%;height:100%;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+
+/* ---------- scene ---------- */
+.stage{position:relative;aspect-ratio:16/9;border-radius:22px;overflow:hidden;border:1px solid var(--line2);margin-top:26px;box-shadow:0 40px 120px rgba(0,0,0,.6)}
+.scene{position:absolute;left:0;top:0;width:1280px;height:720px;transform-origin:0 0;
+ background:radial-gradient(760px 520px at 16% 108%,#51308f 0,transparent 62%),radial-gradient(700px 520px at 88% 104%,#b0437f 0,transparent 60%),radial-gradient(900px 500px at 60% -10%,#16436e 0,transparent 62%),linear-gradient(#0c0f1c,#131022)}
+.scene::before{content:"";position:absolute;inset:0;background-image:radial-gradient(1.2px 1.2px at 12% 22%,#fff8,transparent),radial-gradient(1px 1px at 34% 12%,#fff6,transparent),radial-gradient(1.4px 1.4px at 71% 18%,#fff7,transparent),radial-gradient(1px 1px at 86% 34%,#fff5,transparent),radial-gradient(1px 1px at 52% 30%,#fff5,transparent),radial-gradient(1.2px 1.2px at 22% 44%,#fff4,transparent)}
+.bgwin{position:absolute;left:96px;top:176px;width:600px;height:400px;border-radius:14px;background:rgba(22,24,36,.7);border:1px solid var(--line2);backdrop-filter:blur(8px);box-shadow:0 30px 80px rgba(0,0,0,.4)}
+.bgwin .tb{height:40px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;padding:0 14px}
+.bgwin .url{flex:1;height:22px;border-radius:11px;background:rgba(255,255,255,.06);font-size:11px;color:var(--dim);display:flex;align-items:center;padding:0 12px}
+.sk{border-radius:8px;background:rgba(255,255,255,.07)}
+.taskbar{position:absolute;left:0;right:0;bottom:0;height:48px;background:rgba(12,13,22,.72);backdrop-filter:blur(20px);border-top:1px solid var(--line);display:flex;align-items:center;justify-content:center;gap:10px}
+.taskbar b{width:28px;height:28px;border-radius:8px;background:rgba(255,255,255,.1)}
+.taskbar b:nth-child(1){background:linear-gradient(135deg,#4aa8ff,#2c6bff)}.taskbar b:nth-child(4){background:linear-gradient(135deg,var(--v),var(--p))}
+.taskbar span{position:absolute;right:18px;font-size:11px;line-height:1.25;text-align:right;color:#c9cde0}
+
+/* island */
+.iw{position:absolute;top:14px;left:50%;translate:-50% 0;width:236px;height:44px;border-radius:22px;z-index:5;
+ transition:width .62s var(--spring),height .62s var(--spring),border-radius .62s var(--spring),box-shadow .5s;box-shadow:0 14px 44px rgba(0,0,0,.55)}
+.ring{position:absolute;inset:-1.5px;border-radius:inherit;padding:1.5px;background:conic-gradient(from var(--a),var(--v),var(--p),var(--c),var(--v));
+ -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;opacity:0;transition:opacity .45s;animation:spin 3.2s linear infinite}
+@keyframes spin{to{--a:360deg}}
+.iw.glow{box-shadow:0 14px 44px rgba(0,0,0,.55),0 0 46px rgba(143,125,255,.42)}.iw.glow .ring{opacity:1}
+.iw.danger{box-shadow:0 14px 44px rgba(0,0,0,.55),0 0 60px rgba(255,107,125,.38)}
+.iw.danger .ring{opacity:1;background:conic-gradient(from var(--a),var(--bad),#ffb36b,var(--bad))}
+.island{position:absolute;inset:0;border-radius:inherit;overflow:hidden;background:#06070b;border:1px solid rgba(255,255,255,.1)}
+.island::after{content:"";position:absolute;inset:0;border-radius:inherit;pointer-events:none;box-shadow:inset 0 1px 0 rgba(255,255,255,.12)}
+.layer{position:absolute;top:0;left:50%;translate:-50% 0;opacity:0;filter:blur(10px);scale:.96;transition:opacity .22s,filter .22s,scale .4s var(--ease);pointer-events:none}
+.layer.on{opacity:1;filter:none;scale:1;transition-delay:.16s;pointer-events:auto}
+.rowl{display:flex;align-items:center;gap:10px;padding:0 8px;font-size:13px;font-weight:600;white-space:nowrap}
+.chip{border-radius:50%;overflow:hidden;flex:none;background:radial-gradient(circle at 50% 30%,#4a4090,#1b1736);box-shadow:0 0 0 1.5px rgba(255,255,255,.14)}
+.sep{width:1px;height:14px;background:var(--line2)}
+.mute{color:var(--mute);font-weight:500}
+.bars{display:flex;align-items:center;gap:3px;height:26px;flex:1}
+.bars u{flex:1;border-radius:2px;background:linear-gradient(var(--c),var(--v) 50%,var(--p));height:20%;animation:bar 1s ease-in-out infinite alternate}
+@keyframes bar{to{height:100%}}
+.shim{background:linear-gradient(90deg,#8d93ab 20%,#fff 50%,#8d93ab 80%);background-size:200% 100%;-webkit-background-clip:text;color:transparent;animation:shim 1.6s linear infinite}
+@keyframes shim{to{background-position:-200% 0}}
+.tool{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:600;color:var(--c);background:rgba(111,227,255,.1);border:1px solid rgba(111,227,255,.25);padding:3px 9px;border-radius:999px}
+.orb{width:16px;height:16px;border-radius:50%;border:2px solid rgba(255,255,255,.15);border-top-color:var(--c);animation:rot .8s linear infinite}
+@keyframes rot{to{rotate:360deg}}
+.say{flex:1;font-size:15px;font-weight:500;line-height:1.35;white-space:normal}
+.say span{opacity:0;animation:word .35s var(--ease) forwards}
+@keyframes word{from{opacity:0;translate:0 5px;filter:blur(4px)}to{opacity:1;translate:0 0;filter:none}}
+.ib{width:36px;height:36px;border-radius:50%;display:grid;place-items:center;background:rgba(255,255,255,.07);border:1px solid var(--line);color:var(--mute);flex:none}
+.ib.on{color:#fff;background:linear-gradient(135deg,rgba(143,125,255,.5),rgba(255,126,182,.35));border-color:transparent}
+
+/* chat panel */
+.l-chat{display:grid;grid-template-columns:290px 1fr;width:860px;height:500px}
+.stagecol{position:relative;overflow:hidden;border-right:1px solid var(--line);background:linear-gradient(180deg,#151331,#0b0b16)}
+.halo{position:absolute;left:50%;top:38%;width:300px;height:300px;translate:-50% -50%;border-radius:50%;background:radial-gradient(circle,rgba(143,125,255,.5),rgba(255,126,182,.18) 45%,transparent 70%);animation:pulse 5s ease-in-out infinite}
+@keyframes pulse{50%{scale:1.12;opacity:.75}}
+.girlbox{position:absolute;left:50%;bottom:40px;width:270px;translate:-50% 0}
+.prev .girlbox{bottom:-4px}
+.plate{position:absolute;left:14px;right:14px;bottom:14px;display:flex;align-items:center;justify-content:space-between;padding:9px 12px;border-radius:14px;background:rgba(8,9,15,.66);backdrop-filter:blur(14px);border:1px solid var(--line);font-size:13px}
+.plate b{font-weight:800}.plate span{display:flex;align-items:center;gap:6px;color:var(--mute);font-size:12px}
+.live{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 10px var(--ok)}
+.chatcol{display:flex;flex-direction:column;min-width:0}
+.cbar{height:54px;display:flex;align-items:center;gap:8px;padding:0 14px;border-bottom:1px solid var(--line)}
+.tg{display:inline-flex;align-items:center;gap:7px;height:30px;padding:0 11px;border-radius:999px;font-size:12px;font-weight:600;color:var(--mute);background:rgba(255,255,255,.04);border:1px solid var(--line)}
+.tg.on{color:#fff;background:linear-gradient(135deg,rgba(143,125,255,.34),rgba(255,126,182,.2));border-color:rgba(143,125,255,.5)}
+.grow{flex:1}
+.msgs{flex:1;display:flex;flex-direction:column;justify-content:flex-end;gap:8px;padding:12px 16px;overflow:hidden;-webkit-mask:linear-gradient(transparent,#000 14%)}
+.bub{max-width:80%;padding:9px 14px;border-radius:18px;font-size:14px;line-height:1.4}
+.bub.u{align-self:flex-end;background:linear-gradient(135deg,var(--v),#6b58e6);border-bottom-right-radius:6px;font-weight:500}
+.bub.a{background:rgba(255,255,255,.06);border:1px solid var(--line);border-bottom-left-radius:6px}
+.stp{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--mute);font-weight:600}.stp i{color:var(--ok);width:13px;height:13px}
+.wx{display:flex;align-items:center;gap:18px;padding:12px 16px;border-radius:18px;max-width:92%;border:1px solid rgba(111,227,255,.2);background:linear-gradient(135deg,rgba(60,120,200,.28),rgba(143,125,255,.16))}
+.wx .t{font-size:38px;font-weight:800;letter-spacing:-.03em;line-height:1}.wx small{display:block;font-size:11.5px;color:#b9c3e6;margin-top:4px}
+.wx .f{display:flex;gap:8px;margin-left:auto}.wx .f div{padding:6px 10px;border-radius:12px;background:rgba(0,0,0,.25);font-size:11px;text-align:center;color:#b9c3e6}.wx .f b{display:block;font-size:14px;color:#fff}
+.vol{display:inline-block;width:90px;height:4px;border-radius:2px;background:rgba(255,255,255,.12);position:relative;margin-left:4px}.vol::after{content:"";position:absolute;inset:0 60% 0 0;border-radius:2px;background:linear-gradient(90deg,var(--v),var(--p))}
+.comp{margin:0 14px 14px;height:46px;border-radius:23px;display:flex;align-items:center;gap:10px;padding:0 6px 0 18px;background:rgba(255,255,255,.05);border:1px solid var(--line2);color:var(--dim);font-size:14px}
+.comp .ib{width:34px;height:34px}
+
+/* confirm */
+.cf{padding:18px 20px;text-align:left}
+.cf .hd{display:flex;align-items:center;gap:9px;font-size:11px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--warn)}
+.cf.red .hd{color:var(--bad)}
+.cf h3{font-size:17px;font-weight:700;margin:10px 0 8px}
+.cf pre{font:12.5px/1.45 "Cascadia Code",Consolas,monospace;color:#cdd3ff;background:rgba(0,0,0,.5);border:1px solid var(--line);border-radius:12px;padding:10px 12px;white-space:pre-wrap;word-break:break-all}
+.cf p{font-size:13px;color:var(--mute);margin:9px 0 13px}
+.acts{display:flex;gap:8px;flex-wrap:wrap}
+.bt{height:36px;padding:0 15px;border-radius:12px;display:inline-flex;align-items:center;gap:7px;font-size:13px;font-weight:700;border:1px solid var(--line2);background:rgba(255,255,255,.05)}
+.bt.pri{border:0;background:linear-gradient(135deg,var(--v),#6b58e6);box-shadow:0 6px 20px rgba(143,125,255,.35)}
+.bt.no{color:var(--bad)}.bt.dis{opacity:.32}
+.vh{margin-top:12px;display:flex;align-items:center;gap:9px;font-size:12px;color:var(--mute)}.vh .bars{flex:none;width:34px;height:14px}
+.vh q{quotes:"«" "»";color:#fff;font-weight:700}
+.l-confirm{width:600px;height:268px}
+.card{border-radius:24px;background:var(--glass);border:1px solid rgba(255,198,92,.3);box-shadow:0 0 60px rgba(255,198,92,.07)}
+.card.red{border-color:rgba(255,107,125,.38);box-shadow:0 0 60px rgba(255,107,125,.1)}
+
+/* companion */
+.cmp{position:absolute;right:54px;bottom:42px;width:300px;translate:0 110%;opacity:0;transition:translate .7s var(--spring),opacity .4s;filter:drop-shadow(0 20px 40px rgba(0,0,0,.5));z-index:3}
+.float .cmp{translate:0 0;opacity:1}
+.float .l-chat{grid-template-columns:1fr;width:600px}.float .stagecol{display:none}
+.bbl{position:absolute;right:270px;bottom:230px;width:260px;padding:12px 15px;border-radius:18px 18px 4px 18px;background:var(--glass);backdrop-filter:blur(16px);border:1px solid var(--line2);font-size:13.5px;line-height:1.4;opacity:0;scale:.9;transform-origin:100% 100%;transition:.35s var(--spring)}
+.bbl.on{opacity:1;scale:1}
+
+/* girl */
+.girl{display:block;width:100%;height:auto;overflow:visible}
+.girl .all{animation:breathe 4.2s ease-in-out infinite}
+@keyframes breathe{50%{transform:translateY(-3px)}}
+.girl .head{transform-origin:200px 300px;animation:tilt 7s ease-in-out infinite}
+@keyframes tilt{0%,100%{transform:rotate(-1.4deg)}50%{transform:rotate(1.6deg)}}
+.girl .bh{transform-origin:150px 80px;animation:sway 5s ease-in-out infinite}
+@keyframes sway{0%,100%{transform:rotate(-1deg)}50%{transform:rotate(1.2deg)}}
+.girl .eye{animation:blink 4.6s infinite}
+@keyframes blink{0%,93%,100%{transform:scaleY(1)}96%{transform:scaleY(.06)}}
+.girl .mt{opacity:0;transform-origin:200px 268px}
+.talking .girl .ms{opacity:0}.talking .girl .mt{opacity:1;animation:lip .95s infinite}
+@keyframes lip{0%,100%{transform:scaleY(.3)}14%{transform:scaleY(1.5)}30%{transform:scaleY(.6)}46%{transform:scaleY(1.8)}62%{transform:scaleY(.4)}78%{transform:scaleY(1.3)}}
+.girl .tl{animation:tail 4.6s ease-in-out infinite}.girl .tr{animation-delay:-2.3s}
+@keyframes tail{0%,100%{transform:rotate(-2.5deg)}50%{transform:rotate(3deg)}}
+.chip .girl .tl{animation:none}
+.girl .cup{animation:cup 2.4s ease-in-out infinite}@keyframes cup{50%{opacity:.45}}
+.chip .girl .all,.chip .girl .head{animation:none}
+
+/* controls */
+.ctl{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:18px}
+.seg{display:inline-flex;padding:4px;border-radius:14px;background:rgba(255,255,255,.04);border:1px solid var(--line)}
+.seg button{all:unset;cursor:pointer;padding:8px 14px;border-radius:10px;font-size:13px;font-weight:700;color:var(--mute);transition:.2s}
+.seg button:hover{color:#fff}.seg button.on{color:#fff;background:linear-gradient(135deg,rgba(143,125,255,.55),rgba(255,126,182,.4))}
+.hint{font-size:13px;color:var(--dim)}
+
+/* grids */
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:26px}
+@media(max-width:980px){.g3{grid-template-columns:1fr}h1{font-size:30px}}
+.how{border-radius:24px;border:1px solid var(--line);background:rgba(255,255,255,.025);padding:20px}
+.how h3{font-size:15px;font-weight:800;margin-bottom:12px}
+.how li{list-style:none;display:flex;gap:12px;padding:11px 0;border-top:1px solid var(--line);font-size:13.5px;color:var(--mute)}
+.how li b{color:#fff;display:block}.how li i{color:var(--v);width:18px;height:18px;margin-top:2px}
+.mode{border-radius:24px;border:1px solid var(--line);background:rgba(255,255,255,.025);padding:18px}
+.mode h3{font-size:15px;font-weight:800;margin:14px 0 4px}.mode p{font-size:13px;color:var(--mute)}
+.mons{height:150px;border-radius:16px;background:radial-gradient(300px 160px at 30% 120%,rgba(143,125,255,.3),transparent),#0c0e18;position:relative;overflow:hidden}
+.mon{position:absolute;border-radius:7px;border:1.5px solid rgba(255,255,255,.2);background:linear-gradient(160deg,#1a1d33,#11121f)}
+.mon.a{left:8%;top:18%;width:50%;height:58%}.mon.b{left:63%;top:28%;width:29%;height:44%}
+.mon::after{content:"";position:absolute;left:42%;right:42%;top:100%;height:9px;background:rgba(255,255,255,.18)}
+.pl{position:absolute;top:5px;left:50%;translate:-50% 0;height:9px;border-radius:5px;background:#05060a;box-shadow:0 0 0 1px rgba(143,125,255,.8),0 0 14px rgba(143,125,255,.8)}
+.wn{position:absolute;inset:14% 12%;border-radius:6px;background:var(--glass);box-shadow:0 0 0 1px rgba(143,125,255,.8),0 0 14px rgba(143,125,255,.6);display:flex}
+.wn::before{content:"";width:34%;background:linear-gradient(var(--v),var(--p));opacity:.55;border-radius:6px 0 0 6px}
+
+/* settings window */
+.app{margin-top:26px;border-radius:20px;border:1px solid var(--line2);background:#0d0e17;overflow:hidden;display:grid;grid-template-columns:220px 1fr;min-height:470px;box-shadow:0 30px 90px rgba(0,0,0,.5)}
+@media(max-width:820px){.app{grid-template-columns:1fr}}
+.side{background:rgba(255,255,255,.025);border-right:1px solid var(--line);padding:18px 12px}
+.side .me{display:flex;align-items:center;gap:10px;padding:4px 8px 16px;font-weight:800}
+.side button{all:unset;cursor:pointer;display:flex;align-items:center;gap:10px;width:100%;box-sizing:border-box;padding:10px 12px;border-radius:12px;font-size:13.5px;font-weight:600;color:var(--mute);margin-bottom:2px}
+.side button.on{color:#fff;background:rgba(143,125,255,.18)}.side button.off{opacity:.45;cursor:default}
+.page{display:none;padding:26px}.page.on{display:block}
+.page h3{font-size:19px;font-weight:800;margin-bottom:4px}.page>p{color:var(--mute);font-size:13.5px;margin-bottom:18px}
+.pers{display:grid;grid-template-columns:240px 1fr;gap:24px}@media(max-width:820px){.pers{grid-template-columns:1fr}}
+.prev{position:relative;height:330px;border-radius:20px;overflow:hidden;background:linear-gradient(180deg,#191640,#0b0b16);border:1px solid var(--line)}
+.lbl{font-size:11px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);margin:16px 0 8px}.lbl:first-child{margin-top:0}
+.fld{height:40px;border-radius:12px;border:1px solid var(--line2);background:rgba(255,255,255,.04);display:flex;align-items:center;padding:0 14px;font-size:14px}
+.chips{display:flex;flex-wrap:wrap;gap:8px}.chips span{padding:7px 13px;border-radius:999px;font-size:13px;font-weight:600;border:1px solid var(--line2);color:var(--mute)}
+.chips span.on{color:#fff;border-color:transparent;background:linear-gradient(135deg,rgba(143,125,255,.55),rgba(255,126,182,.4))}
+.mods{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.mods div{height:86px;border-radius:14px;border:1px solid var(--line2);display:grid;place-items:center;font-size:12px;font-weight:600;color:var(--mute);text-align:center;overflow:hidden;position:relative}
+.mods div.on{border-color:var(--v);box-shadow:0 0 0 3px rgba(143,125,255,.2);color:#fff}
+.sl{height:6px;border-radius:3px;background:rgba(255,255,255,.1);position:relative}.sl::before{content:"";position:absolute;inset:0 30% 0 0;border-radius:3px;background:linear-gradient(90deg,var(--v),var(--p))}.sl::after{content:"";position:absolute;left:70%;top:50%;width:16px;height:16px;border-radius:50%;background:#fff;translate:-50% -50%}
+.prov{display:flex;align-items:center;gap:14px;padding:14px 16px;border-radius:16px;border:1px solid var(--line);background:rgba(255,255,255,.03);margin-bottom:10px}
+.prov .ico{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;background:rgba(143,125,255,.16);color:var(--v)}.prov .ico i{width:19px;height:19px}
+.prov b{display:block;font-size:14px}.prov small{color:var(--mute);font-size:12.5px}
+.lat{margin-left:auto;font-size:12px;font-weight:700;color:var(--ok);background:rgba(95,227,161,.1);padding:5px 10px;border-radius:999px;white-space:nowrap}
+.perm{display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--line);font-size:14px}
+.perm .rk{font-size:10.5px;font-weight:800;letter-spacing:.06em;padding:3px 8px;border-radius:999px}
+.rk.s{color:var(--ok);background:rgba(95,227,161,.1)}.rk.m{color:var(--warn);background:rgba(255,198,92,.1)}.rk.h{color:var(--bad);background:rgba(255,107,125,.12)}
+.perm .seg{margin-left:auto;padding:3px}.perm .seg button{padding:5px 10px;font-size:12px;cursor:default}
+
+/* emotions */
+.emo{display:grid;grid-template-columns:300px 1fr;gap:18px;margin-top:26px}
+.emostage{position:sticky;top:16px;align-self:start;height:460px;border-radius:24px;overflow:hidden;background:linear-gradient(180deg,#191640,#0b0b16);border:1px solid var(--line)}
+.emostage .girlbox{width:min(300px,100%);bottom:34px}
+.emogrid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;align-content:start}
+.emogrid button{all:unset;cursor:pointer;border-radius:18px;border:1px solid var(--line);background:rgba(255,255,255,.03);padding:10px;text-align:center;transition:.2s}
+.emogrid button:hover,.emogrid button.on{border-color:var(--v);background:rgba(143,125,255,.14)}
+.emogrid [data-girl]{border-radius:14px;overflow:hidden;background:radial-gradient(circle at 50% 30%,#3c3478,#18152e);aspect-ratio:1}
+.emogrid b{display:block;font-size:13px;margin-top:8px}.emogrid small{font-size:11.5px;color:var(--mute)}
+@media(max-width:1100px){.emo{grid-template-columns:250px 1fr}.emogrid{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:620px){.emo{grid-template-columns:1fr}}
+.pipe{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:18px}
+.pipe div{border-radius:18px;border:1px solid var(--line);background:rgba(255,255,255,.03);padding:16px}
+.pipe .n{font-size:11px;font-weight:800;color:var(--c);letter-spacing:.1em}
+.pipe b{display:block;font-size:14px;margin:6px 0}.pipe p{font-size:12.5px;color:var(--mute)}
+@media(max-width:900px){.pipe{grid-template-columns:1fr 1fr}}
+.imp{margin-top:18px;border-radius:20px;border:1px solid var(--line2);background:#0d0e17;overflow:hidden}
+.imp .top{display:flex;flex-wrap:wrap;gap:8px 10px;align-items:center;padding:16px 18px;border-bottom:1px solid var(--line)}
+.imp .top b{font-size:15px;margin-right:6px}
+.okc{color:var(--ok);background:rgba(95,227,161,.1);padding:4px 10px;border-radius:999px;font-weight:700;font-size:12px}
+.imp table{width:100%;border-collapse:collapse;font-size:13.5px}
+.imp td,.imp th{padding:10px 18px;text-align:left;border-top:1px solid var(--line)}
+.imp th{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--dim);border-top:0}
+.imp code{font:12.5px Consolas,monospace;color:#cdd3ff;background:rgba(255,255,255,.06);padding:2px 7px;border-radius:6px}
+.st{font-size:11.5px;font-weight:700;padding:3px 9px;border-radius:999px;white-space:nowrap}
+.st.a{color:var(--ok);background:rgba(95,227,161,.1)}.st.m{color:var(--v);background:rgba(143,125,255,.16)}.st.f{color:var(--warn);background:rgba(255,198,92,.1)}
+
+/* tokens */
+.tok{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-top:22px}@media(max-width:820px){.tok{grid-template-columns:repeat(2,1fr)}}
+.sw{height:84px;border-radius:16px;display:flex;align-items:flex-end;padding:10px 12px;font-size:12px;font-weight:700;border:1px solid var(--line)}
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute"><defs>
+ <linearGradient id="gh" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#f7f4ff"/><stop offset="1" stop-color="#d6cdfb"/></linearGradient>
+ <linearGradient id="gt" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ece7ff"/><stop offset=".6" stop-color="#c5baf6"/><stop offset="1" stop-color="#9fe8f7"/></linearGradient>
+ <linearGradient id="gb" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#aca1ea"/><stop offset="1" stop-color="#8477d0"/></linearGradient>
+ <linearGradient id="gs" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff4ee"/><stop offset="1" stop-color="#ffe2d7"/></linearGradient>
+ <linearGradient id="gi" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#4a1a6e"/><stop offset=".55" stop-color="#d0469f"/><stop offset="1" stop-color="#ffc1dc"/></linearGradient>
+ <linearGradient id="gn" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#343a6c"/><stop offset="1" stop-color="#1e2245"/></linearGradient>
+ <clipPath id="cf"><path d="M132 190C130 140 160 104 200 104s70 36 68 86c0 36-14 66-36 84-14 12-24 18-32 18s-18-6-32-18c-22-18-36-48-36-84Z"/></clipPath>
+ <clipPath id="ceL"><ellipse cx="166" cy="214" rx="20" ry="22"/></clipPath><clipPath id="ceR"><ellipse cx="234" cy="214" rx="20" ry="22"/></clipPath>
+</defs></svg>
+
+<main>
+<div class="eyebrow">Концепт интерфейса · версия 2</div>
+<h1>Живой помощник в островке Windows</h1>
+<p class="lead">Имя «Мика» и внешность условные. Рисунок персонажа здесь заглушка: в приложении будет настоящая Live2D-модель, которую можно заменить своей.</p>
+
+<section>
+ <div class="eyebrow">01 · Живой прототип</div>
+ <h2>Островок меняет форму под задачу</h2>
+ <p class="lead">Нажимай на состояния под экраном. Переключатель справа показывает оба варианта размещения аватара.</p>
+ <div class="stage" id="stage"><div class="scene" id="scene">
+   <div class="bgwin"><div class="tb"><span class="sk" style="width:90px;height:20px"></span><div class="url">Погода — сегодня и на 10 дней</div></div>
+     <div style="padding:22px;display:grid;gap:14px"><div class="sk" style="width:220px;height:64px"></div><div class="sk" style="width:340px;height:16px"></div><div style="display:flex;gap:12px"><div class="sk" style="flex:1;height:110px"></div><div class="sk" style="flex:1;height:110px"></div><div class="sk" style="flex:1;height:110px"></div><div class="sk" style="flex:1;height:110px"></div></div><div class="sk" style="height:16px"></div></div></div>
+
+   <div class="iw" id="iw"><div class="ring"></div><div class="island">
+     <div class="layer rowl" data-l="idle" style="width:236px;height:44px"><div class="chip" data-girl="head" style="width:30px;height:30px"></div><span>Мика</span><span class="sep"></span><span class="mute">−10°</span><span class="grow"></span><span class="mute">21:48</span><span style="width:4px"></span></div>
+     <div class="layer rowl" data-l="listen" style="width:340px;height:52px"><div class="chip" data-girl="head" style="width:36px;height:36px"></div><div class="bars" data-bars="26"></div><span style="padding-right:8px">Слушаю</span></div>
+     <div class="layer rowl" data-l="think" style="width:380px;height:52px"><div class="chip" data-girl="head" data-emo="think" style="width:36px;height:36px"></div><span class="shim">Смотрю погоду…</span><span class="grow"></span><span class="tool"><i data-ic="search" style="width:12px;height:12px"></i>поиск</span><span class="orb"></span><span style="width:4px"></span></div>
+     <div class="layer rowl talking" data-l="speak" style="width:620px;height:78px;gap:14px;padding:0 14px"><div class="chip" data-girl="head" style="width:50px;height:50px"></div><p class="say" id="say"></p><div class="ib on"><i data-ic="vol"></i></div></div>
+
+     <div class="layer l-chat" data-l="chat">
+       <div class="stagecol talking"><div class="halo"></div><div class="girlbox" data-girl="full"></div><div class="plate"><b>Мика</b><span><i class="live"></i>говорит</span></div></div>
+       <div class="chatcol">
+         <div class="cbar"><span class="tg on"><i data-ic="vol"></i>Озвучка</span><span class="tg on"><i data-ic="mic"></i>Микрофон</span><span class="tg"><i data-ic="mon"></i>Экран</span><span class="grow"></span><span class="ib" style="width:30px;height:30px"><i data-ic="out"></i></span><span class="ib" style="width:30px;height:30px"><i data-ic="set"></i></span></div>
+         <div class="msgs">
+           <div class="bub u">Какая на улице погода?</div>
+           <div class="stp"><i data-ic="check"></i>Поиск погоды · 0,4 с</div>
+           <div class="wx"><div><div class="t">−10°</div><small>Ощущается −16° · ветер 6 м/с</small></div><div class="f"><div>Завтра<b>−4°</b>снег</div><div>Чт<b>−6°</b>ясно</div><div>Пт<b>−2°</b>облачно</div></div></div>
+           <div class="bub a">Изучила информацию. Сегодня −10 и ветер, оденьтесь потеплее. Завтра потеплеет до −4, пойдёт снег.</div>
+           <div class="bub u">Убавь громкость</div>
+           <div class="stp"><i data-ic="check"></i>Громкость 60 → 40 % <span class="vol"></span></div>
+           <div class="bub a">Готово, сделала тише.</div>
+         </div>
+         <div class="comp"><span class="grow">Напишите или скажите «Мика…»</span><span class="ib"><i data-ic="mic"></i></span><span class="ib on"><i data-ic="up"></i></span></div>
+       </div>
+     </div>
+
+     <div class="layer l-confirm" data-l="confirm"><div class="cf red">
+       <div class="hd"><i data-ic="shield"></i>Опасно · нельзя отменить</div>
+       <h3>Удалить всё из папки «Загрузки»</h3>
+       <pre>Remove-Item "$env:USERPROFILE\Downloads\*" -Recurse -Force</pre>
+       <p>Удалит 214 файлов (3,8 ГБ) мимо корзины. Восстановить не получится.</p>
+       <div class="acts"><span class="bt pri"><i data-ic="check"></i>Разрешить один раз</span><span class="bt dis">Разрешать всегда</span><span class="bt no">Отклонить</span></div>
+       <div class="vh"><div class="bars" data-bars="6"></div>Голосом: повторите <q>удалить загрузки</q> или скажите <q>отмена</q></div>
+     </div></div>
+   </div></div>
+
+   <div class="cmp" id="cmp"><div data-girl="full"></div></div>
+   <div class="bbl" id="bbl"></div>
+   <div class="taskbar"><b></b><b></b><b></b><b></b><b></b><b></b><b></b><span>21:48<br>10.11.2026</span></div>
+ </div></div>
+ <div class="ctl">
+   <div class="seg" id="states"><button data-go="idle">Покой</button><button data-go="listen">Слушает</button><button data-go="think">Думает</button><button data-go="speak">Отвечает</button><button data-go="chat">Чат</button><button data-go="confirm">Подтверждение</button></div>
+   <div class="seg" id="place"><button data-pl="dock" class="on">Аватар в островке</button><button data-pl="float">Аватар на рабочем столе</button></div>
+   <div class="seg"><button id="auto" class="on">▶ Автодемо</button></div>
+ </div>
+</section>
+
+<section>
+ <div class="eyebrow">02 · Эмоции</div>
+ <h2>Десять эмоций на любой модели</h2>
+ <p class="lead">Нажми на эмоцию. Те же десять слотов работают и на встроенной Мике, и на готовой модели из Steam.</p>
+ <div class="emo">
+   <div class="emostage"><div class="halo"></div><div class="girlbox" id="emobig" data-girl="full"></div><div class="plate"><b id="emoname">Спокойная</b><span id="emowhy">ждёт фразу</span></div></div>
+   <div class="emogrid" id="emogrid"></div>
+ </div>
+ <div class="pipe">
+   <div><span class="n">ШАГ 1</span><b>Источник</b><p>Состояние приложения, метка эмоции в ответе LLM или событие: успех, ошибка, опасное действие.</p></div>
+   <div><span class="n">ШАГ 2</span><b>Ядро эмоций</b><p>Выбирает одну эмоцию и её силу. Держит несколько секунд и плавно возвращает к спокойной.</p></div>
+   <div><span class="n">ШАГ 3</span><b>Профиль модели</b><p>Таблица соответствий: каким выражением и движением этой модели показать каждый слот.</p></div>
+   <div><span class="n">ШАГ 4</span><b>Слои на модели</b><p>Дыхание и моргание, взгляд, губы под речь, эмоция, жест. Слои складываются и не мешают друг другу.</p></div>
+ </div>
+ <div class="imp">
+   <div class="top"><b>Импорт модели из Steam</b><span class="okc">Губы под речь работают</span><span class="okc">Моргание и дыхание работают</span><span class="okc">Выражений: 6</span><span class="okc">Движений: 4</span></div>
+   <table><tr><th>Слот эмоции</th><th>Что нашлось в модели</th><th>Как подобрано</th></tr><tr><td>Радость</td><td><code>smile.exp3</code></td><td><span class="st a">авто · по названию</span></td></tr><tr><td>Смущение</td><td><code>face_02.exp3</code></td><td><span class="st m">выбрано вручную</span></td></tr><tr><td>Удивление</td><td><code>surprised.exp3</code></td><td><span class="st a">авто · по названию</span></td></tr><tr><td>Сердится</td><td><code>angry.exp3</code> + движение <code>shake</code></td><td><span class="st a">авто · по названию</span></td></tr><tr><td>Подмигивает</td><td><code>wink.exp3</code></td><td><span class="st a">авто · по названию</span></td></tr><tr><td>Сонная</td><td><code>eyes_half.exp3</code></td><td><span class="st m">выбрано вручную</span></td></tr><tr><td>Грусть</td><td>нет в модели</td><td><span class="st f">запасной вариант · брови и рот</span></td></tr><tr><td>Думает</td><td>нет в модели</td><td><span class="st f">запасной вариант · взгляд вверх</span></td></tr></table>
+ </div>
+</section>
+
+<section>
+ <div class="eyebrow">03 · Безопасность</div>
+ <h2>Каждое действие проверяется на риск</h2>
+ <p class="lead">Обычные действия можно разрешить один раз или навсегда. Опасные она спрашивает каждый раз.</p>
+ <div class="g3">
+   <div class="card"><div class="cf">
+     <div class="hd"><i data-ic="term"></i>Нужно подтверждение</div>
+     <h3>Выполнить команду в PowerShell</h3>
+     <pre>Get-ChildItem "$env:USERPROFILE\Downloads" | Sort-Object Length -Descending | Select-Object -First 10</pre>
+     <p>Только читает список файлов. Ничего не меняет.</p>
+     <div class="acts"><span class="bt pri"><i data-ic="check"></i>Один раз</span><span class="bt">Всегда</span><span class="bt no">Отклонить</span></div>
+     <div class="vh"><div class="bars" data-bars="6"></div>Или скажите <q>подтверждаю</q></div>
+   </div></div>
+   <div class="card red"><div class="cf red">
+     <div class="hd"><i data-ic="shield"></i>Опасно · нельзя отменить</div>
+     <h3>Перезагрузить компьютер</h3>
+     <pre>Restart-Computer -Force</pre>
+     <p>Открыто 3 несохранённых документа. Изменения в них пропадут.</p>
+     <div class="acts"><span class="bt pri"><i data-ic="check"></i>Один раз</span><span class="bt dis">Всегда</span><span class="bt no">Отклонить</span></div>
+     <div class="vh"><div class="bars" data-bars="6"></div>Голосом: повторите <q>перезагрузить</q></div>
+   </div></div>
+   <div class="how"><h3>Три способа ответить</h3><ul>
+     <li><i data-ic="check"></i><span><b>Кнопкой</b>В карточке островка или в чате.</span></li>
+     <li><i data-ic="up"></i><span><b>В чате</b>Написать «да», «разреши всегда» или «отмена».</span></li>
+     <li><i data-ic="mic"></i><span><b>Голосом</b>Обычное действие: «подтверждаю». Опасное: повторить его название.</span></li>
+     <li><i data-ic="shield"></i><span><b>Моё предложение</b>Опасные действия нельзя разрешить навсегда.</span></li>
+   </ul></div>
+ </div>
+</section>
+
+<section>
+ <div class="eyebrow">04 · Окно</div>
+ <h2>Три режима окна</h2>
+ <p class="lead">Кнопка «Открепить» в шапке чата переключает режим. Положение запоминается для каждого монитора.</p>
+ <div class="g3">
+   <div class="mode"><div class="mons"><div class="mon a"><div class="pl" style="width:34%"></div></div><div class="mon b"></div></div><h3>Закреплён сверху</h3><p>Режим по умолчанию. Островок поверх всех окон на основном мониторе.</p></div>
+   <div class="mode"><div class="mons"><div class="mon a"></div><div class="mon b"><div class="pl" style="width:48%"></div></div></div><h3>Островок на втором мониторе</h3><p>Перетаскивается мышью и прилипает к верхнему краю любого монитора.</p></div>
+   <div class="mode"><div class="mons"><div class="mon a"></div><div class="mon b"><div class="wn"></div></div></div><h3>Обычное окно</h3><p>Свободный размер. Аватар и чат масштабируются вместе с окном.</p></div>
+ </div>
+</section>
+
+<section>
+ <div class="eyebrow">05 · Настройки</div>
+ <h2>Персонаж, провайдеры, разрешения</h2>
+ <p class="lead">Вкладки слева переключаются.</p>
+ <div class="app">
+   <div class="side"><div class="me"><div class="chip" data-girl="head" style="width:32px;height:32px"></div>Мика</div>
+     <button data-pg="pers" class="on"><i data-ic="star"></i>Персонаж</button><button data-pg="prov"><i data-ic="plug"></i>Провайдеры</button><button data-pg="perm"><i data-ic="shield"></i>Разрешения</button>
+     <button class="off"><i data-ic="mic"></i>Голос</button><button class="off"><i data-ic="mon"></i>Островок</button><button class="off"><i data-ic="set"></i>Память</button></div>
+   <div>
+     <div class="page on" id="pg-pers"><h3>Персонаж</h3><p>Внешность, характер и фраза, на которую она откликается.</p>
+       <div class="pers"><div class="prev"><div class="halo"></div><div class="girlbox" data-girl="full" style="width:250px"></div></div>
+       <div><div class="lbl">Имя и активационная фраза</div><div class="fld">Мика</div>
+         <div class="lbl">Модель аватара</div><div class="mods"><div class="on">Мика<br>по умолчанию</div><div>Модель<br>из Steam</div><div>+ Загрузить</div></div>
+         <div class="lbl">Характер</div><div class="chips"><span class="on">Заботливая</span><span>Весёлая</span><span>Спокойная</span><span>Дерзкая</span><span>Свой промпт</span></div>
+         <div class="lbl">Движение губ под речь</div><div class="sl"></div>
+         <div class="lbl">Где показывать</div><div class="chips"><span class="on">В островке</span><span class="on">На рабочем столе</span></div></div></div></div>
+     <div class="page" id="pg-prov"><h3>Провайдеры</h3><p>Любой сервис подключается по адресу и ключу. Цифры задержки на макете условные.</p>
+       <div class="prov"><div class="ico"><i data-ic="star"></i></div><div><b>Ответы</b><small>Любой OpenAI-совместимый адрес · Anthropic · Ollama</small></div><span class="lat">первое слово 0,3 с</span></div>
+       <div class="prov"><div class="ico"><i data-ic="mic"></i></div><div><b>Распознавание речи</b><small>Локальная модель или облако</small></div><span class="lat">0,2 с</span></div>
+       <div class="prov"><div class="ico"><i data-ic="vol"></i></div><div><b>Синтез речи</b><small>Локальный голос или облако</small></div><span class="lat">0,25 с</span></div>
+       <div class="prov"><div class="ico"><i data-ic="mon"></i></div><div><b>Картинки</b><small>Любой провайдер генерации</small></div><span class="lat" style="color:var(--mute);background:rgba(255,255,255,.06)">не подключено</span></div></div>
+     <div class="page" id="pg-perm"><h3>Разрешения</h3><p>Правила, которые ты дал кнопкой «Разрешать всегда». Любое можно отозвать.</p>
+       <div class="perm"><span class="rk s">НИЗКИЙ</span>Громкость и яркость<div class="seg"><button class="on">Всегда</button><button>Спрашивать</button><button>Запретить</button></div></div>
+       <div class="perm"><span class="rk s">НИЗКИЙ</span>Открывать ссылки и программы<div class="seg"><button class="on">Всегда</button><button>Спрашивать</button><button>Запретить</button></div></div>
+       <div class="perm"><span class="rk m">СРЕДНИЙ</span>PowerShell: команды чтения<div class="seg"><button class="on">Всегда</button><button>Спрашивать</button><button>Запретить</button></div></div>
+       <div class="perm"><span class="rk m">СРЕДНИЙ</span>Создавать и менять файлы<div class="seg"><button>Всегда</button><button class="on">Спрашивать</button><button>Запретить</button></div></div>
+       <div class="perm"><span class="rk h">ВЫСОКИЙ</span>Удалять файлы<div class="seg"><button class="on">Спрашивать</button><button>Запретить</button></div></div>
+       <div class="perm"><span class="rk h">ВЫСОКИЙ</span>Перезагрузка и выключение<div class="seg"><button class="on">Спрашивать</button><button>Запретить</button></div></div></div>
+   </div>
+ </div>
+</section>
+
+<section>
+ <div class="eyebrow">06 · Стиль</div>
+ <h2>Палитра и движение</h2>
+ <p class="lead">Тёмное стекло, три акцентных цвета, пружинные переходы. Островок всегда чёрный, цвет появляется только как сигнал состояния.</p>
+ <div class="tok">
+   <div class="sw" style="background:#06070b">Островок</div><div class="sw" style="background:var(--v);color:#120c33">Акцент · слушает</div><div class="sw" style="background:#d9d0ff;color:#2a2060">Персонаж</div><div class="sw" style="background:var(--c);color:#06303a">Инструменты</div><div class="sw" style="background:var(--bad);color:#3a0a12">Опасность</div>
+ </div>
+</section>
+</main>
+
+<script>
+const IC={vol:'<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M19 5a10 10 0 0 1 0 14"/>',
+mic:'<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><path d="M12 19v3"/>',
+mon:'<rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8M12 17v4"/>',
+out:'<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+set:'<path d="M21 4h-7M10 4H3M21 12h-9M8 12H3M21 20h-5M12 20H3M14 2v4M8 10v4M16 18v4"/>',
+up:'<path d="m5 12 7-7 7 7"/><path d="M12 19V5"/>',check:'<path d="M20 6 9 17l-5-5"/>',search:'<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+term:'<path d="m4 17 6-6-6-6"/><path d="M12 19h8"/>',
+shield:'<path d="M20 13c0 5-3.5 7.5-7.7 9a1 1 0 0 1-.6 0C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.500-1.200 6.200-2.700a1.200 1.200 0 0 1 1.600 0C14.500 3.800 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4M12 16h.01"/>',
+star:'<path d="M12 3l2.200 5.600L20 9.300l-4.400 3.900L17 19l-5-3-5 3 1.400-5.800L4 9.300l5.800-.700z"/>',
+plug:'<path d="M12 22v-5M9 8V2M15 8V2M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/>'};
+document.querySelectorAll('i[data-ic]').forEach(e=>e.innerHTML=`<svg viewBox="0 0 24 24">${IC[e.dataset.ic]}</svg>`);
+
+const EM={
+ neutral:{n:'Спокойная',w:'ждёт фразу',m:'smile',b:.3},
+ joy:{n:'Радость',w:'задача выполнена',L:'up',R:'up',bi:-4,bo:-4,m:'open',b:.6,fx:'spark'},
+ shy:{n:'Смущение',w:'её похвалили',c:.22,gx:-4,gy:5,bi:-5,bo:4,m:'wavy',b:1,hatch:1,fx:'heart'},
+ surprise:{n:'Удивление',w:'неожиданный вопрос',ir:.74,s:1.08,bi:-11,bo:-10,m:'o',b:.18,fx:'bang'},
+ sad:{n:'Грусть',w:'не получилось',c:.2,gy:4,bi:-8,bo:7,m:'frown',b:.12,tear:1},
+ angry:{n:'Сердится',w:'её ругают',c:.24,bi:10,bo:-6,m:'shout',b:.5,fx:'vein'},
+ think:{n:'Думает',w:'ищет ответ',gx:5,gy:-6,bi:-8,bo:-6,m:'side',b:.2,fx:'dots'},
+ wink:{n:'Подмигивает',w:'шутит',R:'up',bi:-3,bo:-3,m:'cat',b:.45,fx:'star'},
+ sleepy:{n:'Сонная',w:'долго без дела',c:.55,gy:5,bi:3,bo:5,m:'smallo',b:.2,fx:'zzz'},
+ worry:{n:'Тревога',w:'опасное действие',ir:.88,bi:-9,bo:6,m:'wavy',b:.1,fx:'sweat'}};
+const LN='stroke="#b8566e" stroke-width="2.4" fill="none" stroke-linecap="round" stroke-linejoin="round"';
+const MO={smile:`<path d="M190 265q10 8 20 0" ${LN}/>`,
+ open:'<path d="M185 261q15 5 30 0q-1 21-15 21t-15-21Z" fill="#b83d5c" stroke="#8c2c46" stroke-width="1.5" stroke-linejoin="round"/><path d="M192 277q8-5 16 0q-3 5-8 5t-8-5Z" fill="#ff8fa8"/>',
+ o:'<ellipse cx="200" cy="269" rx="5.5" ry="7.5" fill="#a53d55"/>',smallo:'<ellipse cx="200" cy="268" rx="3.5" ry="3" fill="#a53d55"/>',
+ frown:`<path d="M191 271q9-8 18 0" ${LN}/>`,shout:'<path d="M191 263h18l-9 12Z" fill="#a53d55" stroke="#8c2c46" stroke-width="1.5" stroke-linejoin="round"/>',
+ wavy:`<path d="M188 268q4-5 8 0t8 0t8 0" ${LN}/>`,side:`<path d="M197 268q6 2 11-2" ${LN}/>`,cat:`<path d="M188 264q6 8 12 0q6 8 12 0" ${LN}/>`};
+const FX={spark:'<path d="M318 80l4 12 12 4-12 4-4 12-4-12-12-4 12-4Z" fill="#ffd76a"/><path d="M86 92l3 8 8 3-8 3-3 8-3-8-8-3 8-3Z" fill="#ff9fd2"/>',
+ heart:'<path d="M320 92c-8-12-24-2-14 12l14 14 14-14c10-14-6-24-14-12Z" fill="#ff7eb6"/>',
+ bang:'<g stroke="#ffd76a" stroke-width="6" stroke-linecap="round"><path d="M316 72l-3 24M334 80l-9 22M311 110v.1M321 116v.1"/></g>',
+ vein:'<g stroke="#ff5a6e" stroke-width="4.5" fill="none" stroke-linecap="round"><path d="M304 92q8 2 8-8M324 84q0 8 8 8M332 104q-8-2-8 8M312 112q0-8-8-8"/></g>',
+ dots:'<g fill="#cfc8ff"><circle cx="306" cy="112" r="4"/><circle cx="320" cy="96" r="5.5"/><circle cx="338" cy="78" r="7.5"/></g>',
+ star:'<path d="M300 132l5 13 14 1-11 9 4 14-12-8-12 8 4-14-11-9 14-1Z" fill="#ffd76a"/>',
+ zzz:'<g fill="none" stroke="#cfc8ff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"><path d="M300 102h15l-15 17h15"/><path d="M326 74h11l-11 13h11"/></g>',
+ sweat:'<path d="M298 124c-10 15-10 27 0 27s10-12 0-27Z" fill="#9fe4ff" stroke="#5fb8e0" stroke-width="1.5"/>'};
+const eye=(cx,d,e,mode)=>{const cy=214,c=e.c||0,y=cy-12+c*30,q=cy-30+c*46;
+ if(mode==='up')return `<path d="M${cx-18} ${cy+6}Q${cx} ${cy-16} ${cx+18} ${cy+6}" stroke="#3a2748" stroke-width="5" fill="none" stroke-linecap="round"/><path d="M${cx+d*18} ${cy+6}l${d*6} -4" stroke="#3a2748" stroke-width="3" stroke-linecap="round"/>`;
+ return `<g class="eye" style="transform-origin:${cx}px ${cy+12}px"><g transform="translate(${cx} ${cy}) scale(${e.s||1}) translate(${-cx} ${-cy})">
+ <g clip-path="url(#${d<0?'ceL':'ceR'})"><rect x="${cx-22}" y="${cy-24}" width="44" height="48" fill="#fff"/><ellipse cx="${cx}" cy="${cy-21}" rx="24" ry="11" fill="#d6cfee"/>
+ <g transform="translate(${cx+(e.gx||0)} ${cy+(e.gy||0)}) scale(${e.ir||1}) translate(${-cx} ${-cy})">
+ <ellipse cx="${cx}" cy="${cy+2}" rx="15.5" ry="20" fill="url(#gi)" stroke="#3a1450" stroke-width="1.6"/><ellipse cx="${cx}" cy="${cy-9}" rx="15" ry="10" fill="#2a0f48" opacity=".45"/>
+ <ellipse cx="${cx}" cy="${cy+3}" rx="6" ry="9" fill="#2a0f3e"/><ellipse cx="${cx}" cy="${cy+15}" rx="9" ry="4.5" fill="#ffe3f1" opacity=".8"/>
+ <circle cx="${cx-6}" cy="${cy-9}" r="5.5" fill="#fff"/><circle cx="${cx+7}" cy="${cy+10}" r="2.6" fill="#fff"/></g>
+ ${c?`<path d="M${cx-23} ${cy-26}H${cx+23}V${y}Q${cx} ${q} ${cx-23} ${y}Z" fill="#f8d6cb"/>`:''}</g>
+ <path d="M${cx-d*18} ${y}Q${cx+d} ${q} ${cx+d*21} ${y+3}" stroke="#3a2748" stroke-width="5.5" fill="none" stroke-linecap="round"/>
+ <path d="M${cx+d*21} ${y+3}l${d*7} -6M${cx+d*19} ${y+8}l${d*7} -2" stroke="#3a2748" stroke-width="2.8" stroke-linecap="round"/>
+ <path d="M${cx-d*10} ${cy+21}Q${cx+d*3} ${cy+25} ${cx+d*15} ${cy+18}" stroke="#8a5870" stroke-width="1.6" fill="none" stroke-linecap="round"/></g></g>`};
+const brow=(cx,d,bi,bo)=>`<path d="M${cx-d*15} ${172+bi}Q${cx+d} ${164+(bi+bo)/2} ${cx+d*18} ${173+bo}" stroke="#8d80cf" stroke-width="3.2" fill="none" stroke-linecap="round"/>`;
+const bow=(x,y)=>`<g fill="#ff7eb6" stroke="#d94f93" stroke-width="1.2" stroke-linejoin="round"><path d="M${x} ${y}l-17-12q-5 12 0 24Z"/><path d="M${x} ${y}l17-12q5 12 0 24Z"/><circle cx="${x}" cy="${y}" r="5.5"/></g>`;
+const HS='stroke="#8478c9" stroke-width="1.4" stroke-linejoin="round"';
+const girl=(vb,k)=>{const e=EM[k]||EM.neutral,bi=e.bi||0,bo=e.bo||0;return `<svg class="girl" viewBox="${vb}"><g class="all">
+<g class="tl" style="transform-origin:128px 128px"><path d="M126 110C70 116 34 190 36 290c2 80 20 150 48 210 2-30 8-52 14-68 4 24 10 46 20 64-2-66 4-126 8-176 6-70 8-130 12-180Z" fill="url(#gt)" ${HS}/><path d="M70 190c-16 60-14 140 6 210" stroke="#fff" stroke-opacity=".6" stroke-width="5" fill="none" stroke-linecap="round"/><path d="M112 200c-6 80-8 150-2 220" stroke="#8f82d8" stroke-opacity=".5" stroke-width="2" fill="none"/></g>
+<g class="tl tr" style="transform-origin:272px 128px"><path d="M274 110C330 116 366 190 364 290c-2 80-20 150-48 210-2-30-8-52-14-68-4 24-10 46-20 64 2-66-4-126-8-176-6-70-8-130-12-180Z" fill="url(#gt)" ${HS}/><path d="M330 190c16 60 14 140-6 210" stroke="#fff" stroke-opacity=".6" stroke-width="5" fill="none" stroke-linecap="round"/><path d="M288 200c6 80 8 150 2 220" stroke="#8f82d8" stroke-opacity=".5" stroke-width="2" fill="none"/></g>
+<path d="M110 200C96 110 150 66 200 66s104 44 90 134c6 50 2 100-10 140H120c-12-40-16-90-10-140Z" fill="url(#gb)"/>
+<path d="M184 276v44l-6 4 22 56 22-56-6-4v-44Z" fill="#ffe4d9"/><path d="M184 286q16 22 32 0v-10h-32Z" fill="#f1c0b5"/>
+<path d="M178 320C152 332 124 346 112 372c-12 28-16 88-18 148h212c-2-60-6-120-18-148-12-26-40-40-66-52l-22 56Z" fill="#f8f6ff" stroke="#b9b3da" stroke-width="1.4"/>
+<path d="M126 404q-6 60-4 116M274 404q6 60 4 116" stroke="#cfcae6" stroke-width="2" fill="none"/>
+<path d="M184 316L120 354q8 38 26 60l54-28 54 28q18-22 26-60l-64-38-16 58Z" fill="url(#gn)" stroke="#161a36" stroke-width="1.4" stroke-linejoin="round"/>
+<path d="M131 360q8 28 20 44l49-26 49 26q12-16 20-44" stroke="#7fe3f5" stroke-width="2.4" fill="none" stroke-linejoin="round"/>
+<g stroke="#d94f93" stroke-width="1.4" stroke-linejoin="round" fill="#ff7eb6"><path d="M200 390l-34-16q-6 18 2 36Z"/><path d="M200 390l34-16q6 18-2 36Z"/><path d="M196 398l-10 38 14-8 14 8-10-38Z"/><rect x="192" y="382" width="16" height="16" rx="5"/></g>
+<g class="head">
+<path d="M132 190C130 140 160 104 200 104s70 36 68 86c0 36-14 66-36 84-14 12-24 18-32 18s-18-6-32-18c-22-18-36-48-36-84Z" fill="url(#gs)" stroke="#d59a8e" stroke-width="1.3"/>
+<g clip-path="url(#cf)"><path d="M120 110H280V196l-10 4-12-20-14 28-14-30-10 20-12-22-8 38-10-38-12 22-10-20-14 30-12-28-12 20-10-4Z" fill="#f2beb4" opacity=".7"/></g>
+<ellipse cx="158" cy="247" rx="15" ry="7" fill="#ff8fae" opacity="${(e.b||0)*.6}"/><ellipse cx="242" cy="247" rx="15" ry="7" fill="#ff8fae" opacity="${(e.b||0)*.6}"/>
+${e.hatch?'<path d="M148 242l-4 9M157 242l-4 9M166 242l-4 9M238 242l-4 9M247 242l-4 9M256 242l-4 9" stroke="#ff5f93" stroke-width="1.7" stroke-linecap="round"/>':''}
+${eye(166,-1,e,e.L)}${eye(234,1,e,e.R)}
+${e.tear?'<path d="M148 238c-6 9-6 16 0 16s6-7 0-16Z" fill="#9fe4ff" stroke="#5fb8e0" stroke-width="1.2"/>':''}
+<path d="M200 244l-3 6" stroke="#dc9f92" stroke-width="1.8" stroke-linecap="round"/>
+<g class="ms">${MO[e.m]}</g><ellipse class="mt" cx="200" cy="268" rx="6" ry="4.5" fill="#a53d55"/>
+<path d="M128 168c-12 60-10 130 6 186 8-32 12-70 10-112 0-28-2-50-4-72Z" fill="url(#gh)" ${HS}/><path d="M272 168c12 60 10 130-6 186-8-32-12-70-10-112 0-28 2-50 4-72Z" fill="url(#gh)" ${HS}/>
+<path d="M112 210C98 120 150 70 200 70s102 50 88 140Q286 180 278 160 278 178 270 190 264 168 256 152 254 180 244 198 238 170 230 150 228 174 220 188 214 164 208 148 206 184 200 204 196 170 190 148 188 172 178 188 174 164 168 150 164 180 154 198 148 172 142 154 138 176 130 190 124 174 120 162 114 182 112 210Z" fill="url(#gh)" ${HS}/>
+<path d="M256 152q-6-32-20-56M230 150q-4-30-14-58M190 148q0-30 6-58M168 150q0-30 10-54M142 154q0-30 14-54" stroke="#9a8ede" stroke-width="1.5" fill="none" stroke-opacity=".8"/>
+<path d="M136 128q14-20 30-6 18-18 34-2 16-16 34 2 16-14 30 6-14-10-30 4-18-16-34 0-16-16-34 0-16-14-30-4Z" fill="#fff" opacity=".8"/>
+<path d="M200 72c-16-30 8-48 30-36-16 2-24 16-20 36Z" fill="url(#gh)" ${HS}/>
+${bow(126,122)}${bow(274,122)}
+<path d="M146 146l14 10M158 144l-10 14" stroke="#6fe3ff" stroke-width="4" stroke-linecap="round"/>
+${brow(166,-1,bi,bo)}${brow(234,1,bi,bo)}
+${FX[e.fx]||''}
+</g></g></svg>`};
+const VB={head:'96 92 208 208',full:'0 0 400 520'};
+const draw=(el,emo)=>{if(emo)el.dataset.emo=emo;el.innerHTML=girl(VB[el.dataset.girl]||VB.full,el.dataset.emo||'neutral')};
+const eg=document.getElementById('emogrid');
+eg.innerHTML=Object.keys(EM).map(k=>`<button data-e="${k}"${k==='neutral'?' class="on"':''}><div data-girl="head" data-emo="${k}"></div><b>${EM[k].n}</b><small>${EM[k].w}</small></button>`).join('');
+document.querySelectorAll('[data-girl]').forEach(e=>draw(e));
+eg.querySelectorAll('button').forEach(b=>b.onclick=()=>{eg.querySelectorAll('button').forEach(x=>x.classList.toggle('on',x===b));const k=b.dataset.e;draw(document.getElementById('emobig'),k);document.getElementById('emoname').textContent=EM[k].n;document.getElementById('emowhy').textContent=EM[k].w});
+const EMO={idle:'neutral',listen:'neutral',think:'think',speak:'neutral',chat:'joy',confirm:'worry'};
+document.querySelectorAll('[data-bars]').forEach(e=>{let h='';for(let i=0;i<+e.dataset.bars;i++)h+=`<u style="animation-duration:${(.45+Math.random()*.7).toFixed(2)}s;animation-delay:-${Math.random().toFixed(2)}s"></u>`;e.innerHTML=h});
+
+const scene=document.getElementById('scene'),stage=document.getElementById('stage'),iw=document.getElementById('iw'),bbl=document.getElementById('bbl'),cmp=document.getElementById('cmp'),say=document.getElementById('say');
+const fit=()=>scene.style.transform=`scale(${stage.clientWidth/1280})`;addEventListener('resize',fit);fit();
+const SZ={idle:[236,44,22],listen:[340,52,26],think:[380,52,26],speak:[620,78,30],chat:[860,500,34],confirm:[600,268,30]};
+const TXT='Изучила информацию. Сегодня −10 и ветер, оденьтесь потеплее. Завтра потеплеет до −4, пойдёт снег.';
+const BB={speak:TXT,listen:'Слушаю…',think:'Секунду, смотрю погоду…',confirm:'Это удалит файлы навсегда. Подтвердите, пожалуйста.',chat:'Готово, сделала тише.'};
+let cur='idle';
+function go(s){cur=s;const fl=scene.classList.contains('float');let[w,h,r]=SZ[s];if(s==='chat'&&fl)w=600;
+ iw.style.cssText=`width:${w}px;height:${h}px;border-radius:${r}px`;
+ iw.classList.toggle('glow',s==='listen'||s==='think');iw.classList.toggle('danger',s==='confirm');
+ document.querySelectorAll('.layer').forEach(l=>l.classList.toggle('on',l.dataset.l===s));
+ document.querySelectorAll('#states button').forEach(b=>b.classList.toggle('on',b.dataset.go===s));
+ if(s==='speak')say.innerHTML=TXT.split(' ').map((w,i)=>`<span style="animation-delay:${.3+i*.11}s">${w} </span>`).join('');
+ document.querySelectorAll('#cmp [data-girl],.stagecol [data-girl]').forEach(e=>draw(e,EMO[s]));bbl.textContent=BB[s]||'';bbl.classList.toggle('on',fl&&!!BB[s]);cmp.classList.toggle('talking',['speak','chat','confirm'].includes(s));}
+const SEQ=[['idle',1700],['listen',2300],['think',1900],['speak',4300],['chat',4600],['confirm',4200]];let ti=0,tm=null,autoBtn=document.getElementById('auto');
+function tick(){const[s,d]=SEQ[ti%SEQ.length];go(s);ti++;tm=setTimeout(tick,d)}
+function stop(){clearTimeout(tm);tm=null;autoBtn.classList.remove('on')}
+autoBtn.onclick=()=>{if(tm)stop();else{autoBtn.classList.add('on');tick()}};
+document.querySelectorAll('#states button').forEach(b=>b.onclick=()=>{stop();go(b.dataset.go)});
+document.querySelectorAll('#place button').forEach(b=>b.onclick=()=>{scene.classList.toggle('float',b.dataset.pl==='float');document.querySelectorAll('#place button').forEach(x=>x.classList.toggle('on',x===b));go(cur)});
+document.querySelectorAll('.side button[data-pg]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.side button').forEach(x=>x.classList.toggle('on',x===b));document.querySelectorAll('.page').forEach(p=>p.classList.toggle('on',p.id==='pg-'+b.dataset.pg))});
+tick();
+</script>
+</body>
+</html>

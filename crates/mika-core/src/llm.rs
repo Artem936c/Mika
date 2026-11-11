@@ -1,0 +1,136 @@
+//! Provider-neutral LLM types.
+
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: Role,
+    pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    fn plain(role: Role, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::plain(Role::System, content)
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::plain(Role::User, content)
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self::plain(Role::Assistant, content)
+    }
+
+    pub fn assistant_with_calls(content: impl Into<String>, calls: Vec<ToolCall>) -> Self {
+        Self {
+            tool_calls: calls,
+            ..Self::plain(Role::Assistant, content)
+        }
+    }
+
+    pub fn tool_result(id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            tool_call_id: Some(id.into()),
+            ..Self::plain(Role::Tool, content)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema of the arguments object.
+    pub parameters: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LlmRequest {
+    pub messages: Vec<ChatMessage>,
+    pub tools: Vec<ToolSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LlmChunk {
+    Text(String),
+    ToolCall(ToolCall),
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum LlmError {
+    #[error("нет связи с провайдером: {0}")]
+    Network(String),
+    #[error("провайдер ответил {status}: {body}")]
+    Http { status: u16, body: String },
+    #[error("непонятный ответ провайдера: {0}")]
+    Protocol(String),
+    #[error("остановлено")]
+    Cancelled,
+    #[error("провайдер не настроен: {0}")]
+    NotConfigured(String),
+}
+
+pub type LlmStream = BoxStream<'static, Result<LlmChunk, LlmError>>;
+
+#[async_trait]
+pub trait LlmProvider: Send + Sync {
+    fn name(&self) -> &str;
+    async fn stream(&self, req: LlmRequest) -> Result<LlmStream, LlmError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_message_serde_roundtrip() {
+        let msgs = vec![
+            ChatMessage::user("привет"),
+            ChatMessage::assistant_with_calls(
+                "",
+                vec![ToolCall {
+                    id: "c1".into(),
+                    name: "get_time".into(),
+                    arguments: serde_json::json!({}),
+                }],
+            ),
+            ChatMessage::tool_result("c1", "12:00"),
+        ];
+        let json = serde_json::to_string(&msgs).unwrap();
+        let back: Vec<ChatMessage> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, msgs);
+        assert!(!json.contains("tool_call_id\":null"));
+    }
+}

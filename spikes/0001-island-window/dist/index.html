@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>spike-island</title>
+<style>
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden;
+    font: 600 13px "Segoe UI", system-ui, sans-serif; color: #f3f4fa; user-select: none; }
+  #island { position: absolute; left: 50%; top: 14px; transform: translateX(-50%);
+    width: 236px; height: 44px; border-radius: 22px; background: #06070b;
+    border: 1px solid rgba(255,255,255,.1); box-sizing: border-box;
+    display: flex; align-items: center; justify-content: center; cursor: pointer;
+    box-shadow: 0 0 0 1px rgba(143,125,255,.35), 0 0 28px rgba(143,125,255,.35);
+    transition: width 620ms cubic-bezier(.32,1.28,.54,1), height 620ms cubic-bezier(.32,1.28,.54,1),
+                border-radius 620ms cubic-bezier(.32,1.28,.54,1); }
+  body.resize #island { left: 0; top: 0; transform: none; width: 100%; height: 100%; transition: none; }
+</style>
+</head>
+<body>
+<div id="island">Жду</div>
+<script>
+const { invoke } = window.__TAURI__.core;
+const SHAPES = {
+  idle: [236, 44, 22, 'Жду'], listening: [340, 52, 26, 'Слушаю'], thinking: [380, 52, 26, 'Думаю'],
+  speaking: [620, 78, 30, 'Отвечаю'], awaiting_confirm: [600, 268, 30, 'Нужно подтверждение'],
+};
+const ORDER = Object.keys(SHAPES);
+const el = document.getElementById('island');
+let mode = 'canvas', cur = 'idle';
+
+function rectOf(state) {
+  const [w, h] = SHAPES[state];
+  return { x: (innerWidth - w) / 2, y: 14, w, h };
+}
+function union(a, b) {
+  const x = Math.min(a.x, b.x), y = Math.min(a.y, b.y);
+  return { x, y, w: Math.max(a.x + a.w, b.x + b.w) - x, h: Math.max(a.y + a.h, b.y + b.h) - y };
+}
+
+// Track worst frame gap during a transition.
+function watchFrames(ms, label) {
+  let last = performance.now(), worst = 0, frames = 0;
+  const end = last + ms;
+  function tick(t) {
+    worst = Math.max(worst, t - last); last = t; frames++;
+    if (t < end) requestAnimationFrame(tick);
+    else invoke('report', { msg: `${label} frames=${frames} worst_gap_ms=${worst.toFixed(1)}` });
+  }
+  requestAnimationFrame(tick);
+}
+
+const spring = t => 1 - Math.pow(1 - t, 3) * Math.cos(t * Math.PI * 0.55); // overshoot-ish ease
+
+function go(next) {
+  const prev = cur; cur = next;
+  const [w, h, r, label] = SHAPES[next];
+  el.textContent = label;
+  if (mode === 'canvas') {
+    invoke('set_island_rect', { rect: union(rectOf(prev), rectOf(next)) });
+    el.style.width = w + 'px'; el.style.height = h + 'px'; el.style.borderRadius = r + 'px';
+    setTimeout(() => invoke('set_island_rect', { rect: rectOf(next) }), 700);
+    watchFrames(700, `canvas ${prev}->${next}`);
+  } else {
+    const [w0, h0] = SHAPES[prev], t0 = performance.now();
+    el.style.borderRadius = r + 'px';
+    let calls = 0, slowest = 0;
+    (function step(t) {
+      const k = Math.min(1, (t - t0) / 620), e = spring(k);
+      const cw = Math.round(w0 + (w - w0) * e), ch = Math.round(h0 + (h - h0) * e);
+      const s = performance.now();
+      invoke('resize_window', { w: cw, h: ch }).then(() => {
+        slowest = Math.max(slowest, performance.now() - s);
+        if (k === 1) invoke('report', { msg: `resize ${prev}->${next} calls=${calls} slowest_invoke_ms=${slowest.toFixed(1)}` });
+      });
+      calls++;
+      if (k < 1) requestAnimationFrame(step);
+    })(t0);
+    watchFrames(700, `resize ${prev}->${next}`);
+  }
+}
+
+el.addEventListener('click', () => {
+  invoke('report', { msg: `island clicked in state=${cur}` });
+  go(ORDER[(ORDER.indexOf(cur) + 1) % ORDER.length]);
+});
+addEventListener('keydown', e => {
+  const i = Number(e.key) - 1;
+  if (i >= 0 && i < ORDER.length) go(ORDER[i]);
+});
+
+invoke('get_mode').then(m => {
+  mode = m;
+  if (mode === 'resize') { document.body.classList.add('resize'); invoke('resize_window', { w: 236, h: 44 }); }
+  else invoke('set_island_rect', { rect: rectOf('idle') });
+  invoke('report', { msg: `page ready mode=${mode} dpr=${devicePixelRatio} viewport=${innerWidth}x${innerHeight}` });
+  watchFrames(10000, 'idle 10s');
+});
+</script>
+</body>
+</html>
