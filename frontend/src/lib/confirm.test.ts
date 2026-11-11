@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { RISK_LABELS, reducePending, secondsLeft, type Pending } from './confirm';
+import { alwaysTitle, confirmHead, reducePending, secondsLeft, type Pending } from './confirm';
+import { isMessageKey } from './i18n';
 
 const assessment = { level: 'medium', summary: 'Открыть', target: 'notepad', reason: 'запуск', scope: 'notepad' };
 const req = { type: 'confirm_requested', id: 7, tool: 'open_app', assessment, allow_always: true, timeout_s: 60 };
@@ -42,8 +43,24 @@ describe('secondsLeft', () => {
   });
 });
 
-describe('RISK_LABELS', () => {
-  it('is Russian', () => {
-    expect(RISK_LABELS).toEqual({ low: 'низкий', medium: 'средний', high: 'высокий' });
+describe('card texts', () => {
+  const pending = (level: 'low' | 'medium' | 'high', allowAlways: boolean): Pending => ({
+    id: 1,
+    tool: 't',
+    assessment: { level, summary: 's', target: 't', reason: 'r', scope: '*' },
+    allowAlways,
+    deadline: 0,
+  });
+
+  it('every risk level has a heading', () => {
+    for (const level of ['low', 'medium', 'high'] as const) {
+      expect(isMessageKey(confirmHead(level)), level).toBe(true);
+    }
+  });
+
+  it('explains why "always" is not offered', () => {
+    expect(alwaysTitle(pending('low', true))).toBe('confirm.always_title');
+    expect(alwaysTitle(pending('high', false))).toBe('confirm.always_high');
+    expect(alwaysTitle(pending('medium', false))).toBe('confirm.always_wide');
   });
 });

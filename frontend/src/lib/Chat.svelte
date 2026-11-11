@@ -1,10 +1,14 @@
 <script lang="ts">
   import { tick } from 'svelte';
-  import type { ChatItem } from './chat';
-  import type { AssistantState } from './island';
-  import { STATE_LABELS } from './island';
+  import Avatar from './Avatar.svelte';
   import ConfirmCard from './ConfirmCard.svelte';
+  import Icon from './Icon.svelte';
+  import WeatherCard from './WeatherCard.svelte';
+  import type { Emotion } from './avatar';
+  import { formatSeconds, inlineMarkup, type ChatItem } from './chat';
   import type { Pending } from './confirm';
+  import { t } from './i18n';
+  import { AVATAR_COLUMN, stateLabel, type AssistantState } from './island';
 
   let {
     items,
@@ -12,6 +16,8 @@
     name,
     speak,
     pending,
+    emotion,
+    wide,
     needsSetup = false,
     onanswer,
     onsend,
@@ -26,6 +32,9 @@
     name: string;
     speak: boolean;
     pending: Pending | null;
+    emotion: Emotion;
+    /** Show the avatar column on the left. */
+    wide: boolean;
     needsSetup?: boolean;
     onanswer: (a: 'once' | 'always' | 'deny') => void;
     onsend: (text: string) => void;
@@ -44,11 +53,20 @@
   $effect(() => {
     void items.length;
     void items[items.length - 1]?.text;
+    void pending;
     tick().then(() => list?.scrollTo({ top: list.scrollHeight }));
   });
 
   $effect(() => {
     input?.focus();
+  });
+
+  // The field grows with the text up to four lines.
+  $effect(() => {
+    void draft;
+    if (!input) return;
+    input.style.height = 'auto';
+    input.style.height = `${Math.min(input.scrollHeight, 84)}px`;
   });
 
   function submit() {
@@ -68,203 +86,255 @@
   }
 </script>
 
-<div class="chat">
-  <header>
-    <div class="who">
-      <span class="orb"></span>
-      <b>{name}</b>
-      <span class="status" class:busy>{STATE_LABELS[status]}</span>
-    </div>
-    <div class="tools">
-      <button class="tg" class:on={speak} title="Озвучивать ответы" onclick={() => onspeak(!speak)}>Озвучка</button>
-      <button class="tg" disabled title="Голос появится в эпике 5. Сейчас микрофон выключен">Микрофон</button>
-      <button class="tg" disabled title="Просмотр экрана выключен">Экран</button>
-      <button class="ib" title="Новый разговор: Мика забудет этот чат" aria-label="Новый разговор" onclick={onnew}>＋</button>
-      <button class="ib" title="Настройки" aria-label="Настройки" onclick={onsettings}>⚙</button>
-      <button class="ib" title="Свернуть (Esc)" aria-label="Свернуть" onclick={onclose}>✕</button>
-    </div>
-  </header>
-
-  {#if needsSetup}
-    <div class="setup">
-      <span>Чтобы Мика отвечала, укажи провайдера и ключ.</span>
-      <button onclick={onsettings}>Настроить</button>
+<div class="chat" class:wide style:--avatar-column="{AVATAR_COLUMN}px">
+  {#if wide}
+    <div class="stagecol">
+      <div class="halo"></div>
+      <div class="girlbox"><Avatar view="full" {emotion} talking={status === 'speaking'} /></div>
+      <div class="plate">
+        <b>{name}</b>
+        <span><i class="live" class:busy></i>{t(stateLabel(status)).toLowerCase()}</span>
+      </div>
     </div>
   {/if}
 
-  <div class="msgs" bind:this={list}>
-    {#if items.length === 0}
-      <p class="empty">Напиши, что сделать. Например: «который час?»</p>
-    {/if}
-    {#each items as it, i (i)}
-      {#if it.kind === 'user'}
-        <div class="bub u">{it.text}</div>
-      {:else if it.kind === 'assistant'}
-        <div class="bub a" class:pending={it.pending}>{it.text}</div>
-      {:else if it.kind === 'tool'}
-        <div class="step" class:fail={it.ok === false} class:run={it.pending}>
-          <span class="dot"></span>
-          <span class="tname">{it.text}</span>
-          <span class="meta">{it.name}{#if it.ms !== undefined} · {it.ms} мс{/if}</span>
-        </div>
-      {:else}
-        <div class="err">{it.text}</div>
+  <div class="chatcol">
+    <header class="cbar">
+      {#if !wide}
+        <span title={t(stateLabel(status))}><Avatar view="head" {emotion} size={30} talking={status === 'speaking'} /></span>
       {/if}
-    {/each}
-  </div>
+      <button class="tg" class:on={speak} title={t('chat.speak_title')} aria-pressed={speak} onclick={() => onspeak(!speak)}>
+        <Icon name={speak ? 'vol' : 'mute'} size={14} />{t('chat.speak')}
+      </button>
+      <button class="tg" disabled title={t('chat.mic_title')}><Icon name="mic" size={14} />{t('chat.mic')}</button>
+      <button class="tg" disabled title={t('chat.screen_title')}><Icon name="mon" size={14} />{t('chat.screen')}</button>
+      <span class="grow"></span>
+      <button class="ib" title={t('chat.new_title')} aria-label={t('chat.new')} onclick={onnew}><Icon name="plus" /></button>
+      <button class="ib" disabled title={t('chat.unpin_title')} aria-label={t('chat.unpin')}><Icon name="out" /></button>
+      <button class="ib" title={t('chat.settings')} aria-label={t('chat.settings')} onclick={onsettings}><Icon name="set" /></button>
+      <button class="ib" title={t('chat.close_title')} aria-label={t('chat.close')} onclick={onclose}><Icon name="x" /></button>
+    </header>
 
-  {#if pending}
-    <ConfirmCard {pending} {onanswer} compact />
-  {/if}
-
-  <div class="comp">
-    <textarea
-      bind:this={input}
-      bind:value={draft}
-      onkeydown={onkey}
-      rows="1"
-      placeholder="Сообщение для {name}…"
-      aria-label="Сообщение"
-    ></textarea>
-    {#if busy && !draft.trim()}
-      <button class="send stop" onclick={onstop} title="Остановить" aria-label="Остановить">■</button>
-    {:else}
-      <button class="send" onclick={submit} disabled={!draft.trim()} title="Отправить (Enter)" aria-label="Отправить">↑</button>
+    {#if needsSetup}
+      <div class="setup">
+        <span>{t('chat.setup', { name })}</span>
+        <button class="bt pri" onclick={onsettings}>{t('chat.setup_button')}</button>
+      </div>
     {/if}
+
+    <div class="msgs" bind:this={list}>
+      <div class="flow">
+        {#if items.length === 0}
+          <p class="empty">{t('chat.empty')}</p>
+        {/if}
+        {#each items as it, i (i)}
+          {#if it.kind === 'user'}
+            <div class="bub u">{it.text}</div>
+          {:else if it.kind === 'assistant'}
+            <!-- One line: the bubble keeps whitespace (pre-wrap). -->
+            <div class="bub a" class:pending={it.pending}>{#each inlineMarkup(it.text) as s, j (j)}{#if s.kind === 'code'}<code>{s.text}</code>{:else if s.kind === 'bold'}<b>{s.text}</b>{:else}{s.text}{/if}{/each}</div>
+          {:else if it.kind === 'tool'}
+            <div class="stp" class:fail={it.ok === false} title={it.name}>
+              {#if it.pending}
+                <span class="orb"></span>
+              {:else}
+                <Icon name={it.ok === false ? 'x' : 'check'} size={13} />
+              {/if}
+              {#if it.data?.kind === 'volume'}
+                <span>{t('chat.volume', { was: it.data.was, level: it.data.level })}</span>
+                <span class="vol"><i style:width="{it.data.level}%"></i></span>
+              {:else}
+                <span class="what">{it.text}</span>
+              {/if}
+              {#if it.ms !== undefined}<span class="ms">· {t('chat.seconds', { value: formatSeconds(it.ms) })}</span>{/if}
+            </div>
+            {#if it.data?.kind === 'weather'}
+              <WeatherCard data={it.data} />
+            {/if}
+          {:else}
+            <div class="err"><Icon name="alert" size={14} /><span>{it.text}</span></div>
+          {/if}
+        {/each}
+      </div>
+    </div>
+
+    {#if pending}
+      <ConfirmCard {pending} {onanswer} compact />
+    {/if}
+
+    <div class="comp">
+      <textarea
+        bind:this={input}
+        bind:value={draft}
+        onkeydown={onkey}
+        rows="1"
+        placeholder={t('chat.placeholder')}
+        aria-label={t('chat.message')}
+      ></textarea>
+      <button class="ib" disabled title={t('chat.voice_input')} aria-label={t('chat.voice_input')}><Icon name="mic" /></button>
+      {#if busy && !draft.trim()}
+        <button class="ib stop" onclick={onstop} title={t('chat.stop')} aria-label={t('chat.stop')}><Icon name="stop" /></button>
+      {:else}
+        <button class="ib on" onclick={submit} disabled={!draft.trim()} title={t('chat.send_title')} aria-label={t('chat.send')}>
+          <Icon name="up" />
+        </button>
+      {/if}
+    </div>
   </div>
 </div>
 
 <style>
   .chat {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-columns: 1fr;
     width: 100%;
     height: 100%;
-    animation: fade 0.35s var(--ease);
+    text-align: left;
   }
-  @keyframes fade {
-    from {
-      opacity: 0;
-      filter: blur(8px);
-    }
+  .chat.wide {
+    grid-template-columns: var(--avatar-column) 1fr;
   }
-  header {
-    height: 54px;
-    flex: none;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0 12px 0 16px;
-    border-bottom: 1px solid var(--line);
+
+  /* ---- avatar column ---- */
+  .stagecol {
+    position: relative;
+    overflow: hidden;
+    border-right: 1px solid var(--line);
+    background: linear-gradient(180deg, #151331, #0b0b16);
   }
-  .who {
-    display: flex;
-    align-items: center;
-    gap: 9px;
-    font-size: 14px;
+  .girlbox {
+    position: absolute;
+    left: 50%;
+    bottom: 40px;
+    width: 270px;
+    translate: -50% 0;
   }
-  .orb {
-    width: 22px;
-    height: 22px;
-    border-radius: 50%;
-    background: radial-gradient(circle at 35% 30%, #fff8, transparent 40%), linear-gradient(135deg, var(--v), var(--p));
-  }
-  .status {
-    font-size: 12px;
-    color: var(--mute);
-  }
-  .status.busy {
-    color: var(--c);
-  }
-  .tools {
-    display: flex;
-    gap: 6px;
-    align-items: center;
-  }
-  .tg {
-    height: 28px;
-    padding: 0 10px;
-    border-radius: 999px;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--mute);
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid var(--line);
-    cursor: pointer;
-  }
-  .tg.on {
-    color: var(--ink);
-    border-color: rgba(143, 125, 255, 0.5);
-    background: rgba(143, 125, 255, 0.16);
-  }
-  .tg:disabled {
-    opacity: 0.4;
-    cursor: default;
-  }
-  .ib {
-    width: 30px;
-    height: 30px;
-    border-radius: 50%;
-    display: grid;
-    place-items: center;
-    background: rgba(255, 255, 255, 0.07);
-    border: 1px solid var(--line);
-    color: var(--mute);
-    cursor: pointer;
-  }
-  .ib:hover {
-    color: var(--ink);
-  }
-  .setup {
-    margin: 10px 12px 0;
-    padding: 10px 12px;
-    border-radius: 14px;
+  .plate {
+    position: absolute;
+    left: 14px;
+    right: 14px;
+    bottom: 14px;
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 10px;
-    font-size: 12.5px;
-    background: rgba(143, 125, 255, 0.12);
-    border: 1px solid rgba(143, 125, 255, 0.35);
+    padding: 9px 12px;
+    border-radius: 14px;
+    background: rgba(8, 9, 15, 0.66);
+    backdrop-filter: blur(14px);
+    border: 1px solid var(--line);
+    font-size: 13px;
   }
-  .setup button {
-    border: 0;
-    border-radius: 10px;
-    padding: 6px 12px;
-    font-weight: 700;
-    background: linear-gradient(135deg, var(--v), #6b58e6);
-    cursor: pointer;
+  .plate b {
+    font-weight: 800;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .plate span {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--mute);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .live {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--ok);
+    box-shadow: 0 0 10px var(--ok);
+  }
+  .live.busy {
+    background: var(--c);
+    box-shadow: 0 0 10px var(--c);
+  }
+
+  /* ---- chat column ---- */
+  .chatcol {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+  }
+  .cbar {
+    height: 54px;
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .grow {
+    flex: 1;
+  }
+  .setup {
+    margin: 10px 14px 0;
+    padding: 10px 10px 10px 14px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    border-radius: 16px;
+    border: 1px solid rgba(143, 125, 255, 0.35);
+    background: rgba(143, 125, 255, 0.1);
+    font-size: 13px;
   }
   .msgs {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
+    padding: 0 16px;
+    display: flex;
+    -webkit-mask: linear-gradient(transparent, #000 18px);
+    mask: linear-gradient(transparent, #000 18px);
+  }
+  /* Messages stick to the bottom while the list is short. */
+  .flow {
+    margin-top: auto;
+    width: 100%;
     display: flex;
     flex-direction: column;
     gap: 8px;
-    padding: 14px 16px;
-    user-select: text;
+    padding: 14px 0 12px;
   }
   .empty {
-    margin: auto;
+    margin: 0 auto 150px;
     color: var(--dim);
+    text-align: center;
   }
   .bub {
-    max-width: 82%;
-    padding: 9px 13px;
-    border-radius: 16px;
+    max-width: 80%;
+    padding: 9px 14px;
+    border-radius: 18px;
+    font-size: 14px;
+    line-height: 1.4;
     white-space: pre-wrap;
     word-break: break-word;
+    user-select: text;
   }
   .bub.u {
     align-self: flex-end;
     background: linear-gradient(135deg, var(--v), #6b58e6);
     border-bottom-right-radius: 6px;
+    font-weight: 500;
   }
   .bub.a {
     align-self: flex-start;
     background: rgba(255, 255, 255, 0.06);
     border: 1px solid var(--line);
     border-bottom-left-radius: 6px;
+    font-weight: 400;
+  }
+  .bub.a code {
+    font-family: var(--mono);
+    font-size: 0.92em;
+    padding: 1px 5px;
+    border-radius: 5px;
+    background: rgba(255, 255, 255, 0.08);
   }
   .bub.a.pending::after {
     content: '▍';
@@ -276,77 +346,114 @@
       opacity: 0;
     }
   }
-  .step {
+  .stp {
     display: flex;
     align-items: center;
-    gap: 8px;
-    font-size: 12px;
+    gap: 7px;
+    font-size: 11.5px;
     color: var(--mute);
     font-weight: 600;
   }
-  .dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--ok);
+  .stp :global(.icon) {
+    color: var(--ok);
+  }
+  .stp.fail :global(.icon) {
+    color: var(--bad);
+  }
+  .stp .what {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .stp .ms {
     flex: none;
+    font-variant-numeric: tabular-nums;
   }
-  .step.run .dot {
-    background: var(--c);
-    animation: blink 0.8s steps(2) infinite;
+  .orb {
+    flex: none;
+    width: 11px;
+    height: 11px;
+    box-sizing: border-box;
+    border-radius: 50%;
+    border: 2px solid rgba(255, 255, 255, 0.15);
+    border-top-color: var(--c);
+    animation: rot 0.8s linear infinite;
   }
-  .step.fail .dot {
-    background: var(--bad);
+  @keyframes rot {
+    to {
+      rotate: 360deg;
+    }
   }
-  .meta {
-    color: var(--dim);
-    font-weight: 500;
+  .vol {
+    flex: none;
+    width: 90px;
+    height: 4px;
+    border-radius: 2px;
+    background: rgba(255, 255, 255, 0.12);
+    overflow: hidden;
+  }
+  .vol i {
+    display: block;
+    height: 100%;
+    border-radius: 2px;
+    background: linear-gradient(90deg, var(--v), var(--p));
   }
   .err {
-    align-self: stretch;
-    padding: 8px 12px;
-    border-radius: 12px;
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    padding: 9px 12px;
+    border-radius: 14px;
+    font-size: 13px;
+    color: #ffd0d6;
+    background: rgba(255, 107, 125, 0.1);
+    border: 1px solid rgba(255, 107, 125, 0.3);
+    user-select: text;
+  }
+  .err :global(.icon) {
     color: var(--bad);
-    background: rgba(255, 107, 125, 0.08);
-    border: 1px solid rgba(255, 107, 125, 0.25);
+    margin-top: 2px;
   }
   .comp {
-    margin: 0 12px 12px;
+    flex: none;
+    margin: 0 14px 14px;
     min-height: 46px;
+    box-sizing: border-box;
     border-radius: 23px;
     display: flex;
-    align-items: center;
+    align-items: flex-end;
     gap: 8px;
-    padding: 4px 6px 4px 16px;
+    padding: 5px 6px 5px 18px;
     background: rgba(255, 255, 255, 0.05);
     border: 1px solid var(--line2);
   }
+  .comp:focus-within {
+    border-color: rgba(143, 125, 255, 0.55);
+  }
   textarea {
     flex: 1;
-    resize: none;
+    min-width: 0;
+    align-self: center;
     border: 0;
     outline: 0;
+    resize: none;
     background: transparent;
-    max-height: 90px;
     font-size: 14px;
+    line-height: 1.5;
+    padding: 0;
+    user-select: text;
   }
-  .send {
-    width: 36px;
-    height: 36px;
-    border-radius: 50%;
-    border: 0;
-    background: linear-gradient(135deg, var(--v), #6b58e6);
-    font-size: 16px;
-    font-weight: 800;
-    cursor: pointer;
+  textarea::placeholder {
+    color: var(--dim);
   }
-  .send:disabled {
-    opacity: 0.35;
-    cursor: default;
+  .comp .ib {
+    width: 34px;
+    height: 34px;
   }
-  .send.stop {
-    background: rgba(255, 107, 125, 0.2);
+  .ib.stop {
     color: var(--bad);
-    font-size: 12px;
+    border-color: rgba(255, 107, 125, 0.4);
+    background: rgba(255, 107, 125, 0.12);
   }
 </style>

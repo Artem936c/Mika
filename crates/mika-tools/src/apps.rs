@@ -82,6 +82,16 @@ impl OpenAppTool {
         if let Some((_, target)) = ALIASES.iter().find(|(a, _)| *a == n) {
             return Some((n.clone(), (*target).to_string()));
         }
+        // Models often pass the file name: "explorer.exe" means "проводник".
+        // Only known programs; an arbitrary .exe name is not launched.
+        let exe = if n.ends_with(".exe") {
+            n.clone()
+        } else {
+            format!("{n}.exe")
+        };
+        if let Some((alias, target)) = ALIASES.iter().find(|(_, t)| *t == exe) {
+            return Some(((*alias).to_string(), (*target).to_string()));
+        }
         let wanted = SHORTCUT_HINTS
             .iter()
             .find(|(a, _)| *a == n)
@@ -364,6 +374,27 @@ mod tests {
             f.opened.lock()[0].0,
             d.path().join("Telegram.lnk").display().to_string()
         );
+    }
+
+    #[test]
+    fn open_app_accepts_file_names_of_known_programs() {
+        let (t, _d, _f) = tool_with_shortcuts(&[]);
+        for name in ["explorer.exe", "Explorer.EXE", "calc"] {
+            let a = t.assess(&json!({ "name": name })).unwrap();
+            assert_eq!(a.level, RiskLevel::Low, "{name}");
+        }
+        let by_file = t.assess(&json!({"name": "explorer.exe"})).unwrap();
+        let by_name = t.assess(&json!({"name": "проводник"})).unwrap();
+        assert_eq!(by_file.target, "explorer.exe");
+        // Same scope, so one permanent rule covers both spellings.
+        assert_eq!(by_file.scope, by_name.scope);
+        assert_eq!(by_file.summary, "Запустить «проводник»");
+    }
+
+    #[test]
+    fn open_app_does_not_run_arbitrary_exe_names() {
+        let (t, _d, _f) = tool_with_shortcuts(&[]);
+        assert!(t.assess(&json!({"name": "evil.exe"})).is_err());
     }
 
     #[test]

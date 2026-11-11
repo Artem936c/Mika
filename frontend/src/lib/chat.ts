@@ -1,6 +1,6 @@
 // Chat items folded from bus events. Pure functions.
 
-import { shapeFor, type AssistantState, type IslandShape } from './island';
+import type { MessageKey } from './i18n';
 
 export interface ChatItem {
   kind: 'user' | 'assistant' | 'tool' | 'error';
@@ -13,16 +13,62 @@ export interface ChatItem {
   ms?: number;
   /** Assistant text still arriving, or tool still running. */
   pending?: boolean;
+  /** Card drawn under a finished tool row. */
+  data?: CardData;
 }
 
-export type View = 'island' | 'chat';
+export interface WeatherDay {
+  date: string;
+  min: number;
+  max: number;
+  text: string;
+}
 
-export const CHAT_SHAPE: IslandShape = { width: 600, height: 500, radius: 28 };
+export interface WeatherData {
+  kind: 'weather';
+  city: string;
+  temp: number;
+  feels: number;
+  wind: number;
+  text: string;
+  days: WeatherDay[];
+}
 
-/** Island shape for the window view and assistant state. The open chat wins, except the confirm card. */
-export function viewShape(view: View, state: AssistantState): IslandShape {
-  if (view === 'chat') return CHAT_SHAPE;
-  return shapeFor(state);
+export interface VolumeData {
+  kind: 'volume';
+  level: number;
+  was: number;
+}
+
+export type CardData = WeatherData | VolumeData;
+
+const num = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+function isWeatherDay(v: unknown): v is WeatherDay {
+  const d = obj(v);
+  return !!d && typeof d.date === 'string' && num(d.min) && num(d.max) && typeof d.text === 'string';
+}
+
+/** Card data from a tool, or nothing when the shape is not one the chat can draw. */
+export function cardData(v: unknown): CardData | undefined {
+  const d = obj(v);
+  if (!d) return undefined;
+  if (d.kind === 'volume' && num(d.level) && num(d.was)) {
+    return { kind: 'volume', level: d.level, was: d.was };
+  }
+  if (
+    d.kind === 'weather' &&
+    typeof d.city === 'string' &&
+    num(d.temp) &&
+    num(d.feels) &&
+    num(d.wind) &&
+    typeof d.text === 'string' &&
+    Array.isArray(d.days) &&
+    d.days.every(isWeatherDay)
+  ) {
+    return { kind: 'weather', city: d.city, temp: d.temp, feels: d.feels, wind: d.wind, text: d.text, days: d.days };
+  }
+  return undefined;
 }
 
 function obj(e: unknown): Record<string, unknown> | null {
@@ -75,10 +121,10 @@ export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
       const ms = typeof e.elapsed_ms === 'number' ? e.elapsed_ms : undefined;
       const idx = items.findIndex((it) => it.kind === 'tool' && it.id === id);
       if (idx < 0) {
-        return [...items, { kind: 'tool', id, name, text: str(e.output) ?? name, ok, ms }];
+        return [...items, { kind: 'tool', id, name, text: str(e.output) ?? name, ok, ms, data: ok ? cardData(e.data) : undefined }];
       }
       const next = items.slice();
-      next[idx] = { ...next[idx], ok, ms, pending: false, text: next[idx].text };
+      next[idx] = { ...next[idx], ok, ms, pending: false, data: ok ? cardData(e.data) : undefined };
       return next;
     }
     case 'error': {
@@ -90,7 +136,78 @@ export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
   }
 }
 
-/** Last words of the reply for the "speaking" island. */
+/** Seconds for a tool row: `0,4`, `3,8`, `19`. The unit comes from the locale file. */
+export function formatSeconds(ms: number): string {
+  if (ms <= 0) return '0';
+  const digits = ms < 95 ? 2 : ms < 9950 ? 1 : 0;
+  return (ms / 1000).toFixed(digits).replace('.', ',');
+}
+
+export interface SpokenWord {
+  /** Index of the word from the start of the reply: a stable key, so only new words animate in. */
+  i: number;
+  word: string;
+}
+
+/** Last words of the reply that fit `maxChars`, for the "speaking" island. */
+export function speakWords(text: string, maxChars: number): SpokenWord[] {
+  const words = text.split(/\s+/).filter(Boolean);
+  let from = words.length;
+  let size = 0;
+  while (from > 0) {
+    const next = size + words[from - 1].length + (size ? 1 : 0);
+    if (next > maxChars && size > 0) break;
+    size = next;
+    from -= 1;
+  }
+  return words.slice(from).map((word, k) => ({ i: from + k, word }));
+}
+
+const TOOL_GROUPS: Record<string, MessageKey> = {
+  open_app: 'tool.app',
+  close_app: 'tool.app',
+  list_windows: 'tool.window',
+  focus_window: 'tool.window',
+  find_files: 'tool.files',
+  read_file: 'tool.files',
+  write_file: 'tool.files',
+  move_path: 'tool.files',
+  create_folder: 'tool.files',
+  delete_to_trash: 'tool.files',
+  open_path: 'tool.files',
+  note_create: 'tool.notes',
+  note_search: 'tool.notes',
+  note_read: 'tool.notes',
+  rdp_list: 'tool.rdp',
+  rdp_open: 'tool.rdp',
+  run_shell: 'tool.shell',
+  volume: 'tool.volume',
+  power: 'tool.power',
+  clipboard: 'tool.clipboard',
+  system_info: 'tool.system',
+  list_processes: 'tool.system',
+  kill_process: 'tool.system',
+  open_url: 'tool.web',
+  fetch_page: 'tool.web',
+  web_search: 'tool.search',
+  get_weather: 'tool.weather',
+  get_time: 'tool.time',
+};
+
+/** Short label of the tool group for the pill in the "thinking" island. */
+export function toolLabel(name: string): MessageKey {
+  return Object.prototype.hasOwnProperty.call(TOOL_GROUPS, name) ? TOOL_GROUPS[name] : 'tool.other';
+}
+
+/** Short weekday of an ISO date, capitalised; empty for a bad date. */
+export function weekdayShort(date: string): string {
+  const d = new Date(`${date}T12:00:00`);
+  if (Number.isNaN(d.getTime())) return '';
+  const w = d.toLocaleDateString('ru-RU', { weekday: 'short' });
+  return w.charAt(0).toUpperCase() + w.slice(1);
+}
+
+/** Last words of the reply as one string, for the speech bubble. */
 export function tailWords(text: string, maxChars: number): string {
   const t = text.replace(/\s+/g, ' ').trim();
   if (t.length <= maxChars) return t;
@@ -99,15 +216,31 @@ export function tailWords(text: string, maxChars: number): string {
   return '…' + (space >= 0 ? cut.slice(space + 1) : cut);
 }
 
-export interface HistoryItem {
-  role: 'user' | 'assistant';
-  text: string;
-}
-
 export function fromHistory(history: unknown): ChatItem[] {
   if (!Array.isArray(history)) return [];
   return history
     .map(obj)
     .filter((h): h is Record<string, unknown> => !!h && (h.role === 'user' || h.role === 'assistant') && typeof h.text === 'string')
     .map((h) => ({ kind: h.role as 'user' | 'assistant', text: h.text as string }));
+}
+
+export interface Segment {
+  kind: 'text' | 'code' | 'bold';
+  text: string;
+}
+
+const MARKUP = /`([^`\n]+)`|\*\*([^*\n]+)\*\*/g;
+
+/** Inline code and bold from a model reply; everything else stays plain text (rendered escaped). */
+export function inlineMarkup(text: string): Segment[] {
+  const out: Segment[] = [];
+  let last = 0;
+  for (const m of text.matchAll(MARKUP)) {
+    const at = m.index ?? 0;
+    if (at > last) out.push({ kind: 'text', text: text.slice(last, at) });
+    out.push(m[1] !== undefined ? { kind: 'code', text: m[1] } : { kind: 'bold', text: m[2] });
+    last = at + m[0].length;
+  }
+  if (last < text.length || out.length === 0) out.push({ kind: 'text', text: text.slice(last) });
+  return out;
 }

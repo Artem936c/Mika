@@ -1,6 +1,17 @@
 import { describe, expect, it } from 'vitest';
-import { CHAT_SHAPE, fromHistory, reduceChat, tailWords, viewShape, type ChatItem } from './chat';
-import { ISLAND_SHAPES } from './island';
+import {
+  cardData,
+  formatSeconds,
+  fromHistory,
+  inlineMarkup,
+  reduceChat,
+  speakWords,
+  tailWords,
+  toolLabel,
+  weekdayShort,
+  type ChatItem,
+} from './chat';
+import { isMessageKey } from './i18n';
 
 const run = (events: unknown[], start: ChatItem[] = []) => events.reduce<ChatItem[]>(reduceChat, start);
 
@@ -64,12 +75,87 @@ describe('reduceChat', () => {
   });
 });
 
-describe('viewShape', () => {
-  it('open chat uses the chat shape', () => {
-    expect(viewShape('chat', 'thinking')).toEqual(CHAT_SHAPE);
+describe('cardData', () => {
+  const weather = {
+    kind: 'weather',
+    city: 'Пермь',
+    temp: 1,
+    feels: -3,
+    wind: 6,
+    text: 'дождь',
+    days: [{ date: '2026-11-12', min: -4, max: 0, text: 'снег' }],
+  };
+
+  it('accepts weather and volume', () => {
+    expect(cardData(weather)).toEqual(weather);
+    expect(cardData({ kind: 'volume', level: 40, was: 60 })).toEqual({ kind: 'volume', level: 40, was: 60 });
   });
-  it('island follows the assistant state', () => {
-    expect(viewShape('island', 'speaking')).toEqual(ISLAND_SHAPES.speaking);
+
+  it('rejects unknown kinds and broken shapes', () => {
+    expect(cardData(undefined)).toBeUndefined();
+    expect(cardData({ kind: 'stock', price: 1 })).toBeUndefined();
+    expect(cardData({ kind: 'volume', level: '40', was: 60 })).toBeUndefined();
+    expect(cardData({ ...weather, temp: null })).toBeUndefined();
+    expect(cardData({ ...weather, days: [{ date: 5 }] })).toBeUndefined();
+    expect(cardData({ ...weather, days: 'no' })).toBeUndefined();
+  });
+
+  it('tool_finished keeps the card data of a successful tool', () => {
+    const items = run([
+      { type: 'tool_started', id: 'c1', name: 'volume', summary: 'Громкость 40%' },
+      { type: 'tool_finished', id: 'c1', name: 'volume', ok: true, output: 'x', elapsed_ms: 5, data: { kind: 'volume', level: 40, was: 60 } },
+      { type: 'tool_started', id: 'c2', name: 'volume', summary: 'Громкость 10%' },
+      { type: 'tool_finished', id: 'c2', name: 'volume', ok: false, output: 'x', elapsed_ms: 5, data: { kind: 'volume', level: 10, was: 40 } },
+      { type: 'tool_started', id: 'c3', name: 'get_time', summary: 'Время' },
+      { type: 'tool_finished', id: 'c3', name: 'get_time', ok: true, output: 'x', elapsed_ms: 5, data: { kind: 'bogus' } },
+    ]);
+    expect(items.map((it) => it.data)).toEqual([{ kind: 'volume', level: 40, was: 60 }, undefined, undefined]);
+  });
+});
+
+describe('formatSeconds', () => {
+  it('uses a comma and fewer digits for longer times', () => {
+    expect(formatSeconds(400)).toBe('0,4');
+    expect(formatSeconds(3849)).toBe('3,8');
+    expect(formatSeconds(19090)).toBe('19');
+    expect(formatSeconds(27)).toBe('0,03');
+    expect(formatSeconds(0)).toBe('0');
+  });
+});
+
+describe('speakWords', () => {
+  it('numbers words from the start of the reply', () => {
+    expect(speakWords('  раз два  три ', 100)).toEqual([
+      { i: 0, word: 'раз' },
+      { i: 1, word: 'два' },
+      { i: 2, word: 'три' },
+    ]);
+  });
+  it('keeps only the tail that fits, with the same numbers', () => {
+    expect(speakWords('один два три четыре', 10)).toEqual([
+      { i: 2, word: 'три' },
+      { i: 3, word: 'четыре' },
+    ]);
+    expect(speakWords('', 10)).toEqual([]);
+  });
+});
+
+describe('toolLabel', () => {
+  it('names a group for known tools and falls back for others', () => {
+    expect(toolLabel('get_weather')).toBe('tool.weather');
+    expect(toolLabel('run_shell')).toBe('tool.shell');
+    expect(toolLabel('brand_new_tool')).toBe('tool.other');
+    for (const name of ['open_app', 'find_files', 'note_create', 'rdp_open', 'volume', 'web_search', 'get_time']) {
+      expect(isMessageKey(toolLabel(name)), name).toBe(true);
+      expect(toolLabel(name)).not.toBe('tool.other');
+    }
+  });
+});
+
+describe('weekdayShort', () => {
+  it('gives a capitalised short weekday', () => {
+    expect(weekdayShort('2026-11-12')).toBe('Чт');
+    expect(weekdayShort('nonsense')).toBe('');
   });
 });
 
@@ -89,5 +175,25 @@ describe('fromHistory', () => {
       { kind: 'assistant', text: 'b' },
     ]);
     expect(fromHistory(null)).toEqual([]);
+  });
+});
+
+describe('inlineMarkup', () => {
+  it('plain text is one text segment', () => {
+    expect(inlineMarkup('Привет')).toEqual([{ kind: 'text', text: 'Привет' }]);
+  });
+
+  it('splits inline code and bold out of the text', () => {
+    expect(inlineMarkup('Создала `text.txt` в **Загрузках**.')).toEqual([
+      { kind: 'text', text: 'Создала ' },
+      { kind: 'code', text: 'text.txt' },
+      { kind: 'text', text: ' в ' },
+      { kind: 'bold', text: 'Загрузках' },
+      { kind: 'text', text: '.' },
+    ]);
+  });
+
+  it('leaves an unclosed marker as text while the reply streams', () => {
+    expect(inlineMarkup('файл `text.t')).toEqual([{ kind: 'text', text: 'файл `text.t' }]);
   });
 });

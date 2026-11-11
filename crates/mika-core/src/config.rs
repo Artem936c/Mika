@@ -13,6 +13,7 @@ pub struct Config {
     pub privacy: PrivacyConfig,
     pub llm: LlmConfig,
     pub tools: ToolsConfig,
+    pub avatar: AvatarConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -20,6 +21,9 @@ pub struct Config {
 pub struct AssistantConfig {
     pub name: String,
     pub wake_phrase: String,
+    pub persona: Persona,
+    /// Used when `persona` is `custom`.
+    pub custom_prompt: String,
 }
 
 impl Default for AssistantConfig {
@@ -27,6 +31,66 @@ impl Default for AssistantConfig {
         Self {
             name: "Мика".into(),
             wake_phrase: "Мика".into(),
+            persona: Persona::default(),
+            custom_prompt: String::new(),
+        }
+    }
+}
+
+/// Character preset; its text goes into the system prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Persona {
+    #[default]
+    Caring,
+    Cheerful,
+    Calm,
+    Bold,
+    Custom,
+}
+
+/// Longest custom character text that goes into the system prompt, characters.
+pub const MAX_CUSTOM_PROMPT: usize = 1000;
+
+impl AssistantConfig {
+    /// One paragraph about the character for the system prompt.
+    pub fn persona_prompt(&self) -> String {
+        let custom = self.custom_prompt.trim();
+        match self.persona {
+            Persona::Custom if !custom.is_empty() => {
+                custom.chars().take(MAX_CUSTOM_PROMPT).collect()
+            }
+            Persona::Caring | Persona::Custom => "Характер: заботливая и внимательная. \
+Замечаешь, когда собеседнику тяжело, и поддерживаешь его."
+                .into(),
+            Persona::Cheerful => "Характер: весёлая и игривая. \
+Любишь лёгкие шутки, но делу они не мешают."
+                .into(),
+            Persona::Calm => "Характер: спокойная и собранная. \
+Говоришь ровно и по делу, без восклицаний."
+                .into(),
+            Persona::Bold => "Характер: дерзкая и остроумная. \
+Можешь по-дружески поддеть, но без грубости, и всегда помогаешь."
+                .into(),
+        }
+    }
+}
+
+/// Where the avatar is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AvatarConfig {
+    /// Left column of the open chat.
+    pub in_island: bool,
+    /// Separate click-through window in the corner of the desktop.
+    pub on_desktop: bool,
+}
+
+impl Default for AvatarConfig {
+    fn default() -> Self {
+        Self {
+            in_island: true,
+            on_desktop: false,
         }
     }
 }
@@ -303,5 +367,38 @@ mod tests {
             std::fs::read_to_string(d.path().join("config.broken.toml")).unwrap(),
             "[assistant\nname = "
         );
+    }
+
+    #[test]
+    fn old_config_without_persona_and_avatar_loads() {
+        let (_d, p) = tmp();
+        std::fs::write(&p, "[assistant]\nname = \"Айри\"\nwake_phrase = \"Айри\"\n").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.assistant.persona, Persona::Caring);
+        assert_eq!(c.assistant.custom_prompt, "");
+        assert!(c.avatar.in_island && !c.avatar.on_desktop);
+    }
+
+    #[test]
+    fn persona_is_stored_in_snake_case() {
+        let (_d, p) = tmp();
+        let mut c = Config::default();
+        c.assistant.persona = Persona::Bold;
+        c.avatar.on_desktop = true;
+        c.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("persona = \"bold\""), "{text}");
+        assert_eq!(Config::load(&p).unwrap(), c);
+    }
+
+    #[test]
+    fn empty_custom_persona_falls_back_to_caring() {
+        let mut a = AssistantConfig {
+            persona: Persona::Custom,
+            ..Default::default()
+        };
+        assert!(a.persona_prompt().contains("заботливая"));
+        a.custom_prompt = "я".repeat(MAX_CUSTOM_PROMPT + 50);
+        assert_eq!(a.persona_prompt().chars().count(), MAX_CUSTOM_PROMPT);
     }
 }

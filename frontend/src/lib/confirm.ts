@@ -1,5 +1,7 @@
 // Open confirmation request folded from bus events. Pure functions.
 
+import type { MessageKey } from './i18n';
+
 export type RiskLevel = 'low' | 'medium' | 'high';
 
 export interface Assessment {
@@ -19,11 +21,16 @@ export interface Pending {
   deadline: number;
 }
 
-export const RISK_LABELS: Record<RiskLevel, string> = {
-  low: 'низкий',
-  medium: 'средний',
-  high: 'высокий',
-};
+/** Heading of the confirmation card for a risk level. */
+export function confirmHead(level: RiskLevel): MessageKey {
+  return `confirm.head_${level}`;
+}
+
+/** Why "allow always" is offered or not, as a tooltip. */
+export function alwaysTitle(p: Pending): MessageKey {
+  if (p.allowAlways) return 'confirm.always_title';
+  return p.assessment.level === 'high' ? 'confirm.always_high' : 'confirm.always_wide';
+}
 
 function isAssessment(v: unknown): v is Assessment {
   if (typeof v !== 'object' || v === null) return false;

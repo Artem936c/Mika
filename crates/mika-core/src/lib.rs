@@ -3,6 +3,7 @@
 pub mod agent;
 pub mod config;
 pub mod confirm;
+pub mod emotion;
 pub mod events;
 pub mod gate;
 pub mod llm;
@@ -14,5 +15,6 @@ pub mod state;
 pub mod storage;
 pub mod tools;
 
+pub use emotion::Emotion;
 pub use events::{Event, EventBus};
 pub use state::{AssistantState, StateHandle};

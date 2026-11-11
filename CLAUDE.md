@@ -9,6 +9,7 @@
 - Пошаговые планы эпиков: `docs/superpowers/plans/`.
 - Решения по итогам пробных сборок: `docs/decisions/`.
 - Макет интерфейса: `docs/design/island-mockup.html`.
+- Тексты интерфейса: `frontend/src/locales/ru.json`. Их читает и Rust (меню значка).
 - Пробные сборки: `spikes/`. Код оттуда в продукт не переносится.
 
 ## Порядок работы
@@ -59,7 +60,7 @@ cargo fmt --all --check
 cargo run -p mika-cli
 npm --prefix frontend test
 npm --prefix frontend run check
-npm --prefix frontend run dev   # предпросмотр: http://localhost:5173/?mock=chat
+npm --prefix frontend run dev   # предпросмотр: http://localhost:5173/?mock=chat, сценарии в frontend/src/dev/mock.ts
 cargo tauri dev            # из crates/mika-gui
 ```
 

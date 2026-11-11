@@ -1,12 +1,19 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { RISK_LABELS, secondsLeft, type Pending } from './confirm';
+  import Icon from './Icon.svelte';
+  import { alwaysTitle, confirmHead, secondsLeft, type Pending } from './confirm';
+  import { t } from './i18n';
 
   let {
     pending,
     onanswer,
     compact = false,
-  }: { pending: Pending; onanswer: (a: 'once' | 'always' | 'deny') => void; compact?: boolean } = $props();
+  }: {
+    pending: Pending;
+    onanswer: (a: 'once' | 'always' | 'deny') => void;
+    /** Card inside the chat: it takes its own height and has a frame. */
+    compact?: boolean;
+  } = $props();
 
   let now = $state(Date.now());
   onMount(() => {
@@ -19,89 +26,90 @@
 
 <div class="cf lvl-{level}" class:compact>
   <div class="hd">
-    <span class="badge">Риск: {RISK_LABELS[level]}</span>
-    <span class="timer" title="Без ответа действие будет отклонено">{left} с</span>
+    <Icon name={level === 'high' ? 'shield' : 'term'} />
+    <span>{t(confirmHead(level))}</span>
+    <span class="timer" title={t('confirm.timer_title')}>{t('chat.seconds', { value: left })}</span>
   </div>
-  <div class="what">{pending.assessment.summary}</div>
+  <h3>{pending.assessment.summary}</h3>
   <pre>{pending.assessment.target}</pre>
   <p class="why">{pending.assessment.reason}</p>
-  <div class="row">
-    <button class="bt pri" onclick={() => onanswer('once')}>Разрешить один раз</button>
-    <button
-      class="bt"
-      disabled={!pending.allowAlways}
-      title={pending.allowAlways
-        ? 'Больше не спрашивать для этого действия'
-        : level === 'high'
-          ? 'Действие высокого риска нельзя разрешить навсегда'
-          : 'В цели есть «*»: постоянное правило охватило бы лишнее'}
-      onclick={() => onanswer('always')}>Разрешать всегда</button
-    >
-    <button class="bt no" onclick={() => onanswer('deny')}>Отклонить</button>
+  <div class="acts">
+    <button class="bt pri" onclick={() => onanswer('once')}><Icon name="check" />{t('confirm.once')}</button>
+    <button class="bt" disabled={!pending.allowAlways} title={t(alwaysTitle(pending))} onclick={() => onanswer('always')}>
+      {t('confirm.always')}
+    </button>
+    <button class="bt no" onclick={() => onanswer('deny')}>{t('confirm.deny')}</button>
   </div>
-  <p class="hint">
-    Можно ответить в чате: «да»,
-    {#if pending.allowAlways}«разреши всегда»,{/if}
-    «нет».
-  </p>
+  {#if !compact}
+    <p class="hint">{t(pending.allowAlways ? 'confirm.hint' : 'confirm.hint_no_always')}</p>
+  {/if}
 </div>
 
 <style>
   .cf {
-    padding: 16px 18px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
     height: 100%;
     box-sizing: border-box;
-    animation: in 0.35s var(--ease);
+    padding: 18px 20px;
+    display: flex;
+    flex-direction: column;
+    text-align: left;
+    overflow: hidden;
   }
   .cf.compact {
     height: auto;
-    margin: 0 12px 10px;
-    border-radius: 18px;
+    flex: none;
+    margin: 0 14px 10px;
+    padding: 14px 16px;
+    border-radius: 20px;
+    background: var(--glass);
     border: 1px solid rgba(255, 198, 92, 0.3);
-    background: rgba(255, 198, 92, 0.05);
+    box-shadow: 0 0 60px rgba(255, 198, 92, 0.07);
   }
   .cf.compact.lvl-high {
-    border-color: rgba(255, 107, 125, 0.4);
-    background: rgba(255, 107, 125, 0.06);
-  }
-  @keyframes in {
-    from {
-      opacity: 0;
-      transform: translateY(6px);
-    }
+    border-color: rgba(255, 107, 125, 0.38);
+    box-shadow: 0 0 60px rgba(255, 107, 125, 0.1);
   }
   .hd {
+    flex: none;
     display: flex;
-    justify-content: space-between;
     align-items: center;
+    gap: 9px;
     font-size: 11px;
     font-weight: 800;
     letter-spacing: 0.1em;
     text-transform: uppercase;
-  }
-  .badge {
     color: var(--warn);
   }
-  .lvl-low .badge {
+  .lvl-low .hd {
     color: var(--ok);
   }
-  .lvl-high .badge {
+  .lvl-high .hd {
     color: var(--bad);
   }
   .timer {
+    margin-left: auto;
     color: var(--mute);
+    letter-spacing: 0.04em;
     font-variant-numeric: tabular-nums;
   }
-  .what {
-    font-size: 16px;
+  h3 {
+    flex: none;
+    margin: 10px 0 8px;
+    font-size: 17px;
     font-weight: 700;
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
+  /* The exact command or path. It scrolls, so the buttons never leave the card. */
   pre {
+    flex: 0 1 auto;
+    min-height: 36px;
+    max-height: 72px;
+    box-sizing: border-box;
     margin: 0;
-    font: 12.5px/1.45 'Cascadia Code', Consolas, monospace;
+    font: 12.5px/1.45 var(--mono);
     color: #cdd3ff;
     background: rgba(0, 0, 0, 0.5);
     border: 1px solid var(--line);
@@ -109,44 +117,36 @@
     padding: 8px 12px;
     white-space: pre-wrap;
     word-break: break-all;
-    max-height: 72px;
     overflow: auto;
     user-select: text;
   }
   .why {
-    margin: 2px 0 6px;
-    font-size: 12.5px;
+    flex: none;
+    margin: 9px 0 13px;
+    font-size: 13px;
     color: var(--mute);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
   }
-  .row {
+  .compact .why {
+    margin: 8px 0 11px;
+  }
+  .acts {
+    flex: none;
     display: flex;
     gap: 8px;
-  }
-  .bt {
-    height: 34px;
-    padding: 0 14px;
-    border-radius: 11px;
-    font-size: 13px;
-    font-weight: 700;
-    border: 1px solid var(--line2);
-    background: rgba(255, 255, 255, 0.05);
-    cursor: pointer;
-  }
-  .bt.pri {
-    border: 0;
-    background: linear-gradient(135deg, var(--v), #6b58e6);
-    box-shadow: 0 6px 20px rgba(143, 125, 255, 0.35);
-  }
-  .bt.no {
-    color: var(--bad);
-  }
-  .bt:disabled {
-    opacity: 0.32;
-    cursor: not-allowed;
+    flex-wrap: wrap;
   }
   .hint {
-    margin: 4px 0 0;
-    font-size: 11.5px;
-    color: var(--dim);
+    flex: none;
+    margin: 12px 0 0;
+    font-size: 12px;
+    color: var(--mute);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 </style>

@@ -1,96 +1,164 @@
 <script lang="ts">
+  // Content of the four small island forms: idle, listening, thinking, speaking.
   import { onMount } from 'svelte';
-  import { STATE_LABELS, type AssistantState } from './island';
-  import { tailWords } from './chat';
+  import Avatar from './Avatar.svelte';
+  import Bars from './Bars.svelte';
+  import Icon from './Icon.svelte';
+  import type { Emotion } from './avatar';
+  import { speakWords, toolLabel } from './chat';
+  import { t } from './i18n';
+  import { stateLabel, type AssistantState } from './island';
 
-  let { status, name, reply, work }: { status: AssistantState; name: string; reply: string; work: string } = $props();
+  let {
+    status,
+    name,
+    reply,
+    work,
+    tool,
+    emotion,
+    speak,
+    onspeak,
+  }: {
+    status: AssistantState;
+    name: string;
+    /** Reply text so far. */
+    reply: string;
+    /** What the running tool does, in plain words. */
+    work: string;
+    /** Name of the running tool, empty when none. */
+    tool: string;
+    emotion: Emotion;
+    speak: boolean;
+    onspeak: (v: boolean) => void;
+  } = $props();
 
   let clock = $state('');
   onMount(() => {
-    const t = () => (clock = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }));
-    t();
-    const id = setInterval(t, 10_000);
+    const tick = () => (clock = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }));
+    tick();
+    const id = setInterval(tick, 10_000);
     return () => clearInterval(id);
   });
+
+  // Two lines of 15 px text fit about 110 characters in the 620 px form.
+  const words = $derived(speakWords(reply, 110));
 </script>
 
-{#key status}
-  <div class="face">
-    {#if status === 'idle'}
-      <span class="orb"></span>
-      <b>{name}</b>
-      <span class="sep"></span>
-      <span class="mute">{clock}</span>
-    {:else if status === 'listening'}
-      <span class="bars"><u></u><u></u><u></u><u></u><u></u></span>
-      <span>{STATE_LABELS.listening}</span>
-    {:else if status === 'thinking'}
-      <span class="spin"></span>
-      <span class="work">{work || STATE_LABELS.thinking}</span>
-    {:else if status === 'speaking'}
-      <span class="orb"></span>
-      <span class="say">{tailWords(reply, 70) || STATE_LABELS.speaking}</span>
-    {:else}
-      <span class="warn">{STATE_LABELS.awaiting_confirm}</span>
-    {/if}
+{#if status === 'idle'}
+  <div class="rowl">
+    <Avatar view="head" {emotion} size={30} />
+    <span class="name">{name}</span>
+    <span class="grow"></span>
+    <span class="mute">{clock}</span>
+    <span class="pad"></span>
   </div>
-{/key}
+{:else if status === 'listening'}
+  <div class="rowl">
+    <Avatar view="head" {emotion} size={36} />
+    <Bars count={26} />
+    <span class="end">{t(stateLabel('listening'))}</span>
+  </div>
+{:else if status === 'thinking'}
+  <div class="rowl">
+    <Avatar view="head" {emotion} size={36} />
+    <span class="shim">{work || t('face.thinking')}</span>
+    <span class="grow"></span>
+    {#if tool}
+      <span class="tool"><Icon name="wrench" size={12} />{t(toolLabel(tool))}</span>
+    {/if}
+    <span class="orb"></span>
+    <span class="pad"></span>
+  </div>
+{:else if status === 'speaking'}
+  <div class="rowl speak">
+    <Avatar view="head" {emotion} size={50} talking />
+    <p class="say">
+      {#each words as w (w.i)}<span>{`${w.word} `}</span>{:else}{t(stateLabel('speaking'))}{/each}
+    </p>
+    <button
+      class="ib"
+      class:on={speak}
+      title={t('chat.speak_title')}
+      aria-label={t('chat.speak_title')}
+      aria-pressed={speak}
+      onclick={() => onspeak(!speak)}
+    >
+      <Icon name={speak ? 'vol' : 'mute'} />
+    </button>
+  </div>
+{/if}
 
 <style>
-  .face {
+  .rowl {
+    width: 100%;
     height: 100%;
+    box-sizing: border-box;
     display: flex;
     align-items: center;
-    justify-content: center;
-    gap: 9px;
-    padding: 0 18px;
+    gap: 10px;
+    padding: 0 8px;
+    font-size: 13px;
+    font-weight: 600;
     white-space: nowrap;
     cursor: pointer;
-    animation: in 0.3s var(--ease);
   }
-  @keyframes in {
-    from {
-      opacity: 0;
-      filter: blur(6px);
-    }
+  .speak {
+    gap: 14px;
+    padding: 0 14px;
   }
-  .orb {
-    width: 22px;
-    height: 22px;
-    flex: none;
-    border-radius: 50%;
-    background: radial-gradient(circle at 35% 30%, #fff8, transparent 40%), linear-gradient(135deg, var(--v), var(--p));
+  .grow {
+    flex: 1;
   }
-  b {
-    font-weight: 700;
+  .name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
-  .sep {
-    width: 1px;
-    height: 14px;
-    background: var(--line2);
+  .pad {
+    width: 4px;
+  }
+  .end {
+    padding-right: 8px;
   }
   .mute {
     color: var(--mute);
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
   }
-  .work {
-    color: var(--c);
+  .shim {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    background: linear-gradient(90deg, #8d93ab 20%, #fff 50%, #8d93ab 80%);
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: shim 1.6s linear infinite;
+  }
+  @keyframes shim {
+    to {
+      background-position: -200% 0;
+    }
+  }
+  .tool {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
     font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    color: var(--c);
+    background: rgba(111, 227, 255, 0.1);
+    border: 1px solid rgba(111, 227, 255, 0.25);
+    padding: 3px 9px;
+    border-radius: 999px;
   }
-  .say {
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    font-size: 14px;
-  }
-  .warn {
-    color: var(--warn);
-    font-weight: 700;
-  }
-  .spin {
+  .orb {
+    flex: none;
     width: 16px;
     height: 16px;
+    box-sizing: border-box;
     border-radius: 50%;
     border: 2px solid rgba(255, 255, 255, 0.15);
     border-top-color: var(--c);
@@ -98,34 +166,42 @@
   }
   @keyframes rot {
     to {
-      transform: rotate(360deg);
+      rotate: 360deg;
     }
   }
-  .bars {
-    display: flex;
-    gap: 3px;
-    height: 18px;
-    align-items: center;
+  .say {
+    flex: 1;
+    min-width: 0;
+    margin: 0;
+    max-height: 2.7em;
+    overflow: hidden;
+    font-size: 15px;
+    font-weight: 500;
+    line-height: 1.35;
+    white-space: normal;
   }
-  .bars u {
-    width: 3px;
-    height: 40%;
-    border-radius: 2px;
-    background: linear-gradient(var(--c), var(--v));
-    animation: bar 0.9s ease-in-out infinite alternate;
+  .say span {
+    animation: word 0.35s var(--ease) backwards;
   }
-  .bars u:nth-child(2) {
-    animation-delay: 0.15s;
+  @keyframes word {
+    from {
+      opacity: 0;
+      translate: 0 5px;
+      filter: blur(4px);
+    }
   }
-  .bars u:nth-child(3) {
-    animation-delay: 0.3s;
+  .ib {
+    width: 36px;
+    height: 36px;
   }
-  .bars u:nth-child(4) {
-    animation-delay: 0.45s;
-  }
-  @keyframes bar {
-    to {
-      height: 100%;
+  @media (prefers-reduced-motion: reduce) {
+    .shim,
+    .orb,
+    .say span {
+      animation: none;
+    }
+    .shim {
+      color: var(--ink);
     }
   }
 </style>

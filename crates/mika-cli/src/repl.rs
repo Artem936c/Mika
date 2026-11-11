@@ -69,6 +69,9 @@ impl Renderer {
             Event::ConfirmResolved { answer, by, .. } => {
                 format!("[confirm] {answer:?} ({})", by.as_str()).to_lowercase()
             }
+            Event::EmotionCue { emotion } | Event::EmotionChanged { emotion } => {
+                format!("[emotion] {}", emotion.as_str())
+            }
             Event::AssistantDelta { .. } | Event::AssistantText { .. } => unreachable!(),
         };
         let lead = if self.in_reply { "\n" } else { "" };
@@ -181,7 +184,8 @@ mod tests {
                 name: "get_time".into(),
                 ok: true,
                 output: "12:00".into(),
-                elapsed_ms: 3
+                elapsed_ms: 3,
+                data: None,
             }),
             "\n[tool] get_time ok 3ms: 12:00\n"
         );

@@ -1,5 +1,18 @@
 import { describe, expect, it } from 'vitest';
-import { ISLAND_SHAPES, STATE_LABELS, islandRect, reduceState, shapeFor, unionRect } from './island';
+import {
+  CHAT_NARROW,
+  CHAT_WIDE,
+  ISLAND_SHAPES,
+  SETTINGS_SHAPE,
+  islandRect,
+  opensChat,
+  reduceState,
+  shapeFor,
+  stateLabel,
+  unionRect,
+  viewShape,
+} from './island';
+import { isMessageKey } from './i18n';
 
 describe('islandRect', () => {
   it('centres the island on the canvas', () => {
@@ -42,15 +55,29 @@ describe('shapeFor', () => {
   });
 });
 
-describe('STATE_LABELS', () => {
-  it('has a Russian label for every state', () => {
-    expect(STATE_LABELS).toEqual({
-      idle: 'Жду',
-      listening: 'Слушаю',
-      thinking: 'Думаю',
-      speaking: 'Отвечаю',
-      awaiting_confirm: 'Нужно подтверждение',
-    });
+describe('stateLabel', () => {
+  it('has a text for every state', () => {
+    for (const state of Object.keys(ISLAND_SHAPES)) {
+      expect(isMessageKey(stateLabel(state as keyof typeof ISLAND_SHAPES)), state).toBe(true);
+    }
+  });
+});
+
+describe('viewShape', () => {
+  it('sizes match the design', () => {
+    expect(viewShape('chat', 'thinking', true)).toEqual({ width: 860, height: 500, radius: 34 });
+    expect(viewShape('chat', 'thinking', false)).toEqual({ width: 600, height: 500, radius: 34 });
+    expect(viewShape('settings', 'idle', false)).toEqual({ width: 860, height: 500, radius: 34 });
+    expect([CHAT_WIDE, CHAT_NARROW, SETTINGS_SHAPE].every((s) => s.height === 500)).toBe(true);
+  });
+  it('island follows the assistant state', () => {
+    expect(viewShape('island', 'speaking', true)).toEqual(ISLAND_SHAPES.speaking);
+  });
+  it('every shape fits the 1000 x 600 canvas below the top margin', () => {
+    for (const s of [...Object.values(ISLAND_SHAPES), CHAT_WIDE, SETTINGS_SHAPE]) {
+      expect(s.width).toBeLessThanOrEqual(1000 - 2 * 20);
+      expect(14 + s.height).toBeLessThanOrEqual(600 - 20);
+    }
   });
 });
 
@@ -65,5 +92,21 @@ describe('reduceState', () => {
     expect(reduceState('thinking', { type: 'state_changed', to: 'bogus' })).toBe('thinking');
     expect(reduceState('thinking', null)).toBe('thinking');
     expect(reduceState('thinking', 'state_changed')).toBe('thinking');
+  });
+});
+
+describe('opensChat', () => {
+  const at = (hit: boolean) => ({ closest: () => (hit ? {} : null) });
+
+  it('opens on a click on the island body', () => {
+    expect(opensChat(at(false))).toBe(true);
+  });
+
+  it('ignores clicks that started on a control inside the island', () => {
+    expect(opensChat(at(true))).toBe(false);
+  });
+
+  it('treats a missing target as a click on the body', () => {
+    expect(opensChat(null)).toBe(true);
   });
 });

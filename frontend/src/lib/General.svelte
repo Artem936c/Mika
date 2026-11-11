@@ -1,6 +1,10 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
+  import Switch from './Switch.svelte';
+  import { t } from './i18n';
+
+  let { name }: { name: string } = $props();
 
   interface General {
     version: string;
@@ -46,113 +50,90 @@
 </script>
 
 {#if g}
-  <div class="general">
-    <label class="switch">
-      <input type="checkbox" checked={g.autostart} onchange={(e) => setAutostart(e.currentTarget.checked)} />
-      <span><b>Запускать вместе с Windows</b>Мика появится островком после входа в систему.</span>
-    </label>
+  <Switch
+    checked={g.autostart}
+    title={t('general.autostart')}
+    sub={t('general.autostart_sub', { name })}
+    onchange={setAutostart}
+  />
 
-    <div class="row"><span>Открыть чат с клавиатуры</span><kbd>{g.shortcut}</kbd></div>
+  <div class="rows">
+    <div class="row"><span>{t('general.shortcut')}</span><kbd>{g.shortcut}</kbd></div>
     <div class="row">
-      <span>Данные</span>
-      <button class="link" title={g.data_dir} onclick={() => invoke('open_folder', { which: 'data' })}>Открыть папку</button>
+      <span>{t('general.data')}</span>
+      <button class="link" title={g.data_dir} onclick={() => invoke('open_folder', { which: 'data' })}>{t('general.open')}</button>
     </div>
     <div class="row">
-      <span>Журнал</span>
-      <button class="link" title={g.logs_dir} onclick={() => invoke('open_folder', { which: 'logs' })}>Открыть папку</button>
+      <span>{t('general.log')}</span>
+      <button class="link" title={g.logs_dir} onclick={() => invoke('open_folder', { which: 'logs' })}>{t('general.open')}</button>
     </div>
-    <div class="row"><span>Версия</span><span class="mute">{g.version}</span></div>
+    <div class="row"><span>{t('general.version')}</span><span class="mute">{g.version}</span></div>
+  </div>
 
-    <div class="danger">
-      <p>
-        Удалить всё: ключи из диспетчера учётных данных, настройки, историю, заметки, правила, журнал и автозапуск. Мика
-        закроется.
-      </p>
-      <button class="bt no" onclick={wipe}>{confirmWipe ? 'Точно удалить всё' : 'Удалить все данные'}</button>
-      {#if confirmWipe}<button class="bt" onclick={() => (confirmWipe = false)}>Отмена</button>{/if}
+  <div class="danger">
+    <p>{t('general.wipe_text')}</p>
+    <div class="acts">
+      <button class="bt no" onclick={wipe}>{t(confirmWipe ? 'general.wipe_sure' : 'general.wipe')}</button>
+      {#if confirmWipe}<button class="bt" onclick={() => (confirmWipe = false)}>{t('general.cancel')}</button>{/if}
     </div>
   </div>
 {/if}
 {#if error}<p class="err">{error}</p>{/if}
 
 <style>
-  .general {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-  }
-  .switch {
-    display: flex;
-    gap: 12px;
-    align-items: flex-start;
-    padding: 12px 14px;
-    border-radius: 12px;
-    border: 1px solid var(--line);
-    background: rgba(255, 255, 255, 0.03);
-    font-size: 12.5px;
-    color: var(--mute);
-    line-height: 1.5;
-  }
-  .switch input {
-    width: 18px;
-    height: 18px;
-    margin-top: 2px;
-    accent-color: var(--v);
-  }
-  .switch b {
-    display: block;
-    color: var(--ink);
-    font-size: 13.5px;
+  .rows {
+    margin: 12px 0;
   }
   .row {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    font-size: 13px;
-    padding: 0 2px;
+    justify-content: space-between;
+    padding: 11px 2px;
+    border-top: 1px solid var(--line);
+    font-size: 14px;
+  }
+  .row:first-child {
+    border-top: 0;
   }
   kbd {
-    font: 12px 'Cascadia Code', Consolas, monospace;
-    padding: 3px 8px;
-    border-radius: 6px;
+    font: 600 12px var(--mono);
+    padding: 3px 9px;
+    border-radius: 8px;
     border: 1px solid var(--line2);
     background: rgba(255, 255, 255, 0.05);
-  }
-  .link {
-    all: unset;
-    cursor: pointer;
-    color: var(--c);
-    font-weight: 600;
   }
   .mute {
     color: var(--mute);
   }
+  .link {
+    all: unset;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--v);
+  }
+  .link:hover {
+    text-decoration: underline;
+  }
   .danger {
-    margin-top: 6px;
-    padding: 12px 14px;
-    border-radius: 12px;
-    border: 1px solid rgba(255, 107, 125, 0.3);
+    padding: 14px 16px;
+    border-radius: 16px;
+    border: 1px solid rgba(255, 107, 125, 0.28);
     background: rgba(255, 107, 125, 0.05);
   }
   .danger p {
-    margin: 0 0 10px;
+    margin: 0 0 12px;
     font-size: 12.5px;
+    line-height: 1.5;
     color: var(--mute);
   }
-  .bt {
-    height: 32px;
-    padding: 0 14px;
-    border-radius: 10px;
-    font-size: 13px;
-    font-weight: 700;
-    border: 1px solid var(--line2);
-    background: rgba(255, 255, 255, 0.05);
-    cursor: pointer;
-  }
-  .bt.no {
-    color: var(--bad);
+  .acts {
+    display: flex;
+    gap: 8px;
   }
   .err {
+    margin: 10px 0 0;
+    font-size: 12.5px;
     color: var(--bad);
   }
 </style>

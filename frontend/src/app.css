@@ -1,3 +1,9 @@
+@property --a {
+  syntax: '<angle>';
+  inherits: false;
+  initial-value: 0deg;
+}
+
 :root {
   --ink: #f3f4fa;
   --mute: #8d93ab;
@@ -11,8 +17,10 @@
   --warn: #ffc65c;
   --bad: #ff6b7d;
   --island: #06070b;
+  --glass: rgba(16, 17, 27, 0.78);
   --spring: cubic-bezier(0.32, 1.28, 0.54, 1);
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --mono: 'Cascadia Code', 'Cascadia Mono', Consolas, monospace;
 }
 
 html,
@@ -21,9 +29,10 @@ body {
   height: 100%;
   background: transparent;
   overflow: hidden;
-  font: 500 13px/1.45 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+  font: 500 13px/1.45 'Manrope Variable', 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
   color: var(--ink);
   -webkit-font-smoothing: antialiased;
+  user-select: none;
 }
 
 #app {
@@ -39,10 +48,226 @@ textarea {
   color: inherit;
 }
 
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid rgba(143, 125, 255, 0.7);
+  outline-offset: 1px;
+}
+
 ::-webkit-scrollbar {
   width: 8px;
 }
 ::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.12);
   border-radius: 4px;
+}
+
+/* ---- shared controls, as in the mockup ---- */
+
+/* Round icon button. */
+.ib {
+  all: unset;
+  box-sizing: border-box;
+  width: 30px;
+  height: 30px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--mute);
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--line);
+  cursor: pointer;
+  transition:
+    color 0.2s,
+    background 0.2s;
+}
+.ib:hover:not(:disabled) {
+  color: #fff;
+}
+.ib.on {
+  color: #fff;
+  background: linear-gradient(135deg, rgba(143, 125, 255, 0.5), rgba(255, 126, 182, 0.35));
+  border-color: transparent;
+}
+.ib:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Toggle pill. */
+.tg {
+  all: unset;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 11px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--mute);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tg.on {
+  color: #fff;
+  background: linear-gradient(135deg, rgba(143, 125, 255, 0.34), rgba(255, 126, 182, 0.2));
+  border-color: rgba(143, 125, 255, 0.5);
+}
+.tg:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Button. */
+.bt {
+  all: unset;
+  box-sizing: border-box;
+  height: 36px;
+  padding: 0 15px;
+  border-radius: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 700;
+  border: 1px solid var(--line2);
+  background: rgba(255, 255, 255, 0.05);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.bt:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.09);
+}
+.bt.pri {
+  border: 0;
+  background: linear-gradient(135deg, var(--v), #6b58e6);
+  box-shadow: 0 6px 20px rgba(143, 125, 255, 0.35);
+}
+.bt.pri:hover:not(:disabled) {
+  background: linear-gradient(135deg, #9d8dff, #7663ee);
+}
+.bt.no {
+  color: var(--bad);
+}
+.bt:disabled {
+  opacity: 0.32;
+  cursor: default;
+}
+
+/* Segmented control. */
+.seg {
+  display: inline-flex;
+  padding: 4px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--line);
+}
+.seg button {
+  all: unset;
+  cursor: pointer;
+  padding: 7px 13px;
+  border-radius: 10px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--mute);
+  transition: 0.2s;
+  white-space: nowrap;
+}
+.seg button:hover {
+  color: #fff;
+}
+.seg button.on {
+  color: #fff;
+  background: linear-gradient(135deg, rgba(143, 125, 255, 0.55), rgba(255, 126, 182, 0.4));
+}
+
+/* Small caps label above a field. */
+.lbl {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin: 16px 0 8px;
+}
+.lbl:first-child {
+  margin-top: 0;
+}
+
+/* Text field. */
+.fld {
+  box-sizing: border-box;
+  width: 100%;
+  height: 40px;
+  border-radius: 12px;
+  border: 1px solid var(--line2);
+  background: rgba(255, 255, 255, 0.04);
+  padding: 0 14px;
+  font-size: 14px;
+  outline: none;
+  user-select: text;
+}
+.fld:focus {
+  border-color: rgba(143, 125, 255, 0.6);
+}
+textarea.fld {
+  height: auto;
+  padding: 10px 14px;
+  resize: none;
+  line-height: 1.45;
+}
+
+/* Risk badge. */
+.rk {
+  flex: none;
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 999px;
+}
+.rk.low {
+  color: var(--ok);
+  background: rgba(95, 227, 161, 0.1);
+}
+.rk.medium {
+  color: var(--warn);
+  background: rgba(255, 198, 92, 0.1);
+}
+.rk.high {
+  color: var(--bad);
+  background: rgba(255, 107, 125, 0.12);
+}
+
+/* Glow behind a full-size avatar. */
+.halo {
+  position: absolute;
+  left: 50%;
+  top: 38%;
+  width: 300px;
+  height: 300px;
+  translate: -50% -50%;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(143, 125, 255, 0.5), rgba(255, 126, 182, 0.18) 45%, transparent 70%);
+  animation: halo-pulse 5s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes halo-pulse {
+  50% {
+    scale: 1.12;
+    opacity: 0.75;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .halo {
+    animation: none;
+  }
 }

@@ -26,6 +26,76 @@ pub fn canvas_position(
     (x.max(monitor_x as i64) as i32, monitor_y)
 }
 
+pub const AVATAR_LABEL: &str = "avatar";
+/// Desktop avatar window, logical pixels: the speech bubble on the left, the figure on the right.
+pub const AVATAR_WIDTH: f64 = 560.0;
+pub const AVATAR_HEIGHT: f64 = 470.0;
+const AVATAR_RIGHT: f64 = 24.0;
+/// Leaves room for the taskbar.
+const AVATAR_BOTTOM: f64 = 64.0;
+
+/// Top-left corner of the avatar window in physical pixels: bottom-right corner of the monitor.
+pub fn avatar_position(
+    monitor_x: i32,
+    monitor_y: i32,
+    monitor_width: u32,
+    monitor_height: u32,
+    scale: f64,
+) -> (i32, i32) {
+    let w = ((AVATAR_WIDTH + AVATAR_RIGHT) * scale).round() as i64;
+    let h = ((AVATAR_HEIGHT + AVATAR_BOTTOM) * scale).round() as i64;
+    let x = monitor_x as i64 + monitor_width as i64 - w;
+    let y = monitor_y as i64 + monitor_height as i64 - h;
+    (
+        x.max(monitor_x as i64) as i32,
+        y.max(monitor_y as i64) as i32,
+    )
+}
+
+/// Creates and shows the desktop avatar window, or closes it.
+/// The window passes every click through: it only shows the character.
+pub fn set_desktop_avatar(app: &tauri::AppHandle, on: bool) -> tauri::Result<()> {
+    use tauri::Manager;
+    let existing = app.get_webview_window(AVATAR_LABEL);
+    if !on {
+        if let Some(w) = existing {
+            w.close()?;
+        }
+        return Ok(());
+    }
+    let window = match existing {
+        Some(w) => w,
+        None => tauri::WebviewWindowBuilder::new(
+            app,
+            AVATAR_LABEL,
+            tauri::WebviewUrl::App("index.html?view=avatar".into()),
+        )
+        .title("Mika avatar")
+        .inner_size(AVATAR_WIDTH, AVATAR_HEIGHT)
+        .decorations(false)
+        .transparent(true)
+        .shadow(false)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .focused(false)
+        .visible(false)
+        .build()?,
+    };
+    if let Some(m) = window.primary_monitor()? {
+        let (x, y) = avatar_position(
+            m.position().x,
+            m.position().y,
+            m.size().width,
+            m.size().height,
+            m.scale_factor(),
+        );
+        window.set_position(PhysicalPosition::new(x, y))?;
+    }
+    window.set_ignore_cursor_events(true)?;
+    show_without_activation(&window)
+}
+
 /// Island rectangle in logical pixels relative to the canvas top-left corner.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize)]
 pub struct IslandRect {
@@ -138,13 +208,23 @@ fn cursor_position() -> Option<(i32, i32)> {
     ok.then_some((p.x, p.y))
 }
 
-/// Shows the window without taking focus from the current foreground window.
+/// Shows the window and hands the keyboard focus back to the window that had it.
+///
+/// Must go through `WebviewWindow::show`: tao keeps its own visibility flag, and
+/// every later style change (each click-through toggle) runs `ShowWindow(SW_HIDE)`
+/// when that flag says hidden. A raw `ShowWindow` left the flag false, so the
+/// island vanished and half-ignored clicks.
 pub fn show_without_activation(window: &WebviewWindow) -> tauri::Result<()> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE};
-    let hwnd = window.hwnd()?;
-    // SAFETY: hwnd belongs to a live window owned by this process.
-    unsafe {
-        ShowWindow(hwnd.0 as _, SW_SHOWNOACTIVATE);
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+    // SAFETY: plain query of the current foreground window.
+    let previous = unsafe { GetForegroundWindow() };
+    window.show()?;
+    let own = window.hwnd()?.0 as windows_sys::Win32::Foundation::HWND;
+    if !previous.is_null() && previous != own {
+        // SAFETY: `previous` was a valid window handle a moment ago; a stale one makes the call fail.
+        unsafe {
+            SetForegroundWindow(previous);
+        }
     }
     Ok(())
 }
@@ -161,6 +241,14 @@ mod tests {
     #[test]
     fn respects_scale_and_monitor_origin() {
         assert_eq!(canvas_position(1920, 0, 2560, 1.5), (2450, 0));
+    }
+
+    #[test]
+    fn avatar_window_sits_in_bottom_right_corner() {
+        assert_eq!(avatar_position(0, 0, 1920, 1080, 1.0), (1336, 546));
+        assert_eq!(avatar_position(0, 0, 2560, 1440, 1.25), (1830, 772));
+        // A monitor smaller than the window: stay on it.
+        assert_eq!(avatar_position(100, 50, 400, 300, 1.0), (100, 50));
     }
 
     #[test]

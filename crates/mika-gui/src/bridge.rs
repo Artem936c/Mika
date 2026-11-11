@@ -208,6 +208,10 @@ pub struct UiSettings {
     speak_replies: bool,
     microphone_enabled: bool,
     screen_enabled: bool,
+    persona: mika_core::config::Persona,
+    custom_prompt: String,
+    avatar_in_island: bool,
+    avatar_on_desktop: bool,
 }
 
 #[tauri::command]
@@ -219,7 +223,90 @@ pub fn get_ui_settings(ctx: CtxState<'_>) -> UiSettings {
         speak_replies: c.voice.speak_replies,
         microphone_enabled: c.privacy.microphone_enabled,
         screen_enabled: c.privacy.screen_enabled,
+        persona: c.assistant.persona,
+        custom_prompt: c.assistant.custom_prompt.clone(),
+        avatar_in_island: c.avatar.in_island,
+        avatar_on_desktop: c.avatar.on_desktop,
     }
+}
+
+/// Longest assistant name, characters.
+pub const MAX_NAME: usize = 24;
+
+/// Trimmed name, or the reason it cannot be used.
+pub fn clean_name(value: &str) -> Result<String, String> {
+    let name = value.trim();
+    match name.chars().count() {
+        0 => Err(crate::strings::tr("error.name_empty")),
+        n if n > MAX_NAME => Err(crate::strings::tr("error.name_long")),
+        _ => Ok(name.to_string()),
+    }
+}
+
+/// Tells every window to read the settings again.
+fn settings_changed(app: &AppHandle) {
+    let _ = app.emit(
+        crate::tray::UI_CHANNEL,
+        serde_json::json!({ "action": "settings_changed" }),
+    );
+}
+
+#[tauri::command]
+pub fn set_assistant_name(app: AppHandle, ctx: CtxState<'_>, value: String) -> Result<(), String> {
+    let name = clean_name(&value)?;
+    ctx.config.lock().assistant.name = name;
+    ctx.save_config()?;
+    ctx.refresh_prompt();
+    settings_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_persona(
+    app: AppHandle,
+    ctx: CtxState<'_>,
+    persona: mika_core::config::Persona,
+    custom_prompt: String,
+) -> Result<(), String> {
+    {
+        let mut cfg = ctx.config.lock();
+        cfg.assistant.persona = persona;
+        cfg.assistant.custom_prompt = custom_prompt
+            .trim()
+            .chars()
+            .take(mika_core::config::MAX_CUSTOM_PROMPT)
+            .collect();
+    }
+    ctx.save_config()?;
+    ctx.refresh_prompt();
+    settings_changed(&app);
+    Ok(())
+}
+
+/// Async: a window must not be created from a synchronous command on Windows.
+#[tauri::command]
+pub async fn set_avatar_placement(
+    app: AppHandle,
+    ctx: tauri::State<'_, Arc<crate::app::Ctx>>,
+    in_island: bool,
+    on_desktop: bool,
+) -> Result<(), String> {
+    {
+        let mut cfg = ctx.config.lock();
+        cfg.avatar.in_island = in_island;
+        cfg.avatar.on_desktop = on_desktop;
+    }
+    ctx.save_config()?;
+    crate::window::set_desktop_avatar(&app, on_desktop).map_err(|e| e.to_string())?;
+    settings_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_emotion(
+    emotion: tauri::State<'_, mika_core::emotion::EmotionHandle>,
+) -> mika_core::Emotion {
+    emotion.get()
 }
 
 #[tauri::command]
@@ -247,7 +334,7 @@ pub fn focus_island(window: tauri::WebviewWindow) {
 pub struct GeneralSettings {
     version: &'static str,
     autostart: bool,
-    shortcut: &'static str,
+    shortcut: String,
     data_dir: String,
     logs_dir: String,
 }
@@ -290,4 +377,17 @@ pub fn wipe_all_data(app: AppHandle, ctx: CtxState<'_>) -> Result<(), String> {
     log::info!("all data wiped, exiting");
     app.exit(0);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn name_is_trimmed_and_limited() {
+        assert_eq!(clean_name("  Айри \n"), Ok("Айри".into()));
+        assert_eq!(clean_name(&"я".repeat(MAX_NAME)), Ok("я".repeat(MAX_NAME)));
+        assert!(clean_name("   ").is_err());
+        assert!(clean_name(&"я".repeat(MAX_NAME + 1)).is_err());
+    }
 }

@@ -97,9 +97,10 @@ impl Tool for VolumeTool {
         if muted && target > 0 {
             self.0.set_mute(false).map_err(failed)?;
         }
-        Ok(ToolOutput::new(format!(
-            "Громкость {target}% (была {level}%)."
-        )))
+        Ok(
+            ToolOutput::new(format!("Громкость {target}% (была {level}%)."))
+                .with_data(serde_json::json!({ "kind": "volume", "level": target, "was": level })),
+        )
     }
 }
 
@@ -425,10 +426,16 @@ mod tests {
         let out = run(&t, json!({"action": "up"})).await.unwrap();
         assert_eq!(*f.volume.lock(), (100, false));
         assert!(out.text.contains("100%"));
-        run(&t, json!({"action": "set", "level": 30}))
+        let out = run(&t, json!({"action": "set", "level": 30}))
             .await
             .unwrap();
         assert_eq!(f.volume.lock().0, 30);
+        assert_eq!(
+            out.data,
+            Some(json!({"kind": "volume", "level": 30, "was": 100}))
+        );
+        let read = run(&t, json!({"action": "get"})).await.unwrap();
+        assert_eq!(read.data, None, "reading the level draws no card");
         run(&t, json!({"action": "down"})).await.unwrap();
         assert_eq!(f.volume.lock().0, 20);
     }

@@ -64,7 +64,7 @@ impl Ctx {
             gate,
             bus.clone(),
             state,
-            system_prompt(&config.assistant.name),
+            system_prompt(&config.assistant),
         )
         .with_history(history)
         .with_store(db.clone(), CONVERSATION);
@@ -89,6 +89,12 @@ impl Ctx {
                 &cfg,
                 self.secrets.as_ref(),
             ));
+    }
+
+    /// Puts the current name and character into the system prompt.
+    pub fn refresh_prompt(&self) {
+        let prompt = system_prompt(&self.config.lock().assistant);
+        self.session.agent.set_system_prompt(prompt);
     }
 
     pub fn save_config(&self) -> Result<(), String> {

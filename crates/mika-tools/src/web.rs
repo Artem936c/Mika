@@ -317,7 +317,7 @@ impl Tool for WeatherTool {
                     "https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}\
 &current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,relative_humidity_2m\
 &daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max\
-&wind_speed_unit=ms&timezone=auto&forecast_days=3"
+&wind_speed_unit=ms&timezone=auto&forecast_days=4"
                 ))
                 .await
                 .map_err(failed)?,
@@ -332,20 +332,39 @@ impl Tool for WeatherTool {
             c["wind_speed_10m"].as_f64().unwrap_or_default(),
             c["relative_humidity_2m"].as_f64().unwrap_or_default(),
         );
+        let whole = |v: &Value| v.as_f64().unwrap_or_default().round() as i64;
         let d = &f["daily"];
+        let mut card_days = Vec::new();
         if let Some(days) = d["time"].as_array() {
             for (i, day) in days.iter().enumerate() {
+                let sky = weather_code(d["weather_code"][i].as_i64().unwrap_or(-1));
                 text.push_str(&format!(
                     "\n{}: от {:+.0} до {:+.0}°C, {}, осадки {}%",
                     day.as_str().unwrap_or(""),
                     d["temperature_2m_min"][i].as_f64().unwrap_or_default(),
                     d["temperature_2m_max"][i].as_f64().unwrap_or_default(),
-                    weather_code(d["weather_code"][i].as_i64().unwrap_or(-1)),
+                    sky,
                     d["precipitation_probability_max"][i].as_i64().unwrap_or(0),
                 ));
+                card_days.push(serde_json::json!({
+                    "date": day.as_str().unwrap_or(""),
+                    "min": whole(&d["temperature_2m_min"][i]),
+                    "max": whole(&d["temperature_2m_max"][i]),
+                    "text": sky,
+                }));
             }
         }
-        Ok(ToolOutput::new(text))
+        // The chat card shows the same numbers the LLM gets.
+        let card = serde_json::json!({
+            "kind": "weather",
+            "city": name,
+            "temp": whole(&c["temperature_2m"]),
+            "feels": whole(&c["apparent_temperature"]),
+            "wind": whole(&c["wind_speed_10m"]),
+            "text": weather_code(c["weather_code"].as_i64().unwrap_or(-1)),
+            "days": card_days,
+        });
+        Ok(ToolOutput::new(text).with_data(card))
     }
 }
 
@@ -409,8 +428,16 @@ mod tests {
             json!({"city": "москва"}),
         )
         .await
-        .unwrap()
-        .text;
+        .unwrap();
+        assert_eq!(
+            out.data,
+            Some(json!({
+                "kind": "weather", "city": "Москва", "temp": -3, "feels": -8, "wind": 4,
+                "text": "небольшой снег",
+                "days": [{"date": "2026-11-11", "min": -6, "max": -1, "text": "пасмурно"}],
+            }))
+        );
+        let out = out.text;
         assert!(
             out.starts_with("Москва, Россия. Сейчас -3°C, ощущается как -8°C, небольшой снег"),
             "{out}"

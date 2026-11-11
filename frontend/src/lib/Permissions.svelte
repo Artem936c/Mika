@@ -1,6 +1,9 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
+  import { isMessageKey, t } from './i18n';
+
+  let { name }: { name: string } = $props();
 
   interface Rule {
     id: number;
@@ -18,21 +21,6 @@
     decided_by: string;
   }
 
-  const DECISIONS: Record<string, string> = {
-    allow: 'разрешено правилом',
-    allow_once: 'разрешено один раз',
-    allow_always: 'разрешено навсегда',
-    deny: 'отклонено',
-    timeout: 'нет ответа',
-  };
-  const BY: Record<string, string> = {
-    rule: 'правило',
-    button: 'кнопка',
-    chat: 'чат',
-    timeout: 'таймер',
-    policy: 'остановка',
-  };
-
   let rules = $state<Rule[]>([]);
   let audit = $state<AuditEntry[]>([]);
   let error = $state('');
@@ -46,64 +34,112 @@
     }
   }
 
-  async function revoke(id: number) {
-    await invoke('remove_rule', { id });
+  // "Ask" removes the rule: without a rule the assistant asks every time.
+  async function ask(id: number) {
+    try {
+      await invoke('remove_rule', { id });
+    } catch (e) {
+      error = String(e);
+    }
     await load();
   }
 
   const time = (s: string) => s.replace('T', ' ').slice(0, 16);
+  /** Text for a code from the backend, or the code itself when it is new. */
+  const label = (prefix: string, code: string) => {
+    const key = `${prefix}.${code}`;
+    return isMessageKey(key) ? t(key) : code;
+  };
 
   onMount(load);
 </script>
 
-<div class="perm">
-  <h3>Постоянные правила</h3>
-  {#if rules.length === 0}
-    <p class="empty">Правил нет: Мика спрашивает перед каждым действием.</p>
-  {:else}
-    <ul>
-      {#each rules as r (r.id)}
-        <li>
-          <span class="dec {r.decision}">{r.decision === 'allow' ? 'Разрешено' : 'Запрещено'}</span>
-          <span class="tool">{r.tool}</span>
-          <code>{r.pattern}</code>
-          <button class="bt" onclick={() => revoke(r.id)}>Отозвать</button>
-        </li>
-      {/each}
-    </ul>
-  {/if}
+{#if rules.length === 0}
+  <p class="empty">{t('permissions.none', { name })}</p>
+{:else}
+  {#each rules as r (r.id)}
+    <div class="perm">
+      <span class="tool">{r.tool}</span>
+      <code title={r.pattern}>{r.pattern}</code>
+      <div class="seg">
+        {#if r.decision === 'allow'}
+          <button class="on">{t('permissions.always')}</button>
+          <button onclick={() => ask(r.id)}>{t('permissions.ask')}</button>
+        {:else}
+          <button onclick={() => ask(r.id)}>{t('permissions.ask')}</button>
+          <button class="on">{t('permissions.deny')}</button>
+        {/if}
+      </div>
+    </div>
+  {/each}
+{/if}
 
-  <h3>Журнал действий</h3>
-  {#if audit.length === 0}
-    <p class="empty">Пока пусто.</p>
-  {:else}
-    <ul class="log">
-      {#each audit as a, i (i)}
-        <li>
-          <span class="at">{time(a.at)}</span>
-          <span class="tool">{a.tool}</span>
-          <code title={a.target}>{a.target}</code>
-          <span class="d {a.decision}">{DECISIONS[a.decision] ?? a.decision}</span>
-          <span class="by">{BY[a.decided_by] ?? a.decided_by}</span>
-        </li>
-      {/each}
-    </ul>
-  {/if}
-  {#if error}<p class="err">{error}</p>{/if}
-</div>
+<div class="lbl">{t('permissions.log')}</div>
+{#if audit.length === 0}
+  <p class="empty">{t('permissions.log_empty')}</p>
+{:else}
+  <ul>
+    {#each audit as a, i (i)}
+      <li>
+        <span class="at">{time(a.at)}</span>
+        <span class="rk {a.risk}">{label('risk', a.risk)}</span>
+        <span class="tool">{a.tool}</span>
+        <code title={a.target}>{a.target}</code>
+        <span class="d {a.decision}">{label('decision', a.decision)}</span>
+        <span class="by">{label('by', a.decided_by)}</span>
+      </li>
+    {/each}
+  </ul>
+{/if}
+{#if error}<p class="err">{error}</p>{/if}
 
 <style>
+  .empty {
+    margin: 0;
+    color: var(--mute);
+    font-size: 13px;
+  }
   .perm {
     display: flex;
-    flex-direction: column;
-    gap: 8px;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 0;
+    border-top: 1px solid var(--line);
+    font-size: 14px;
   }
-  h3 {
-    margin: 6px 0 0;
+  .perm:first-child {
+    border-top: 0;
+    padding-top: 0;
+  }
+  .perm .seg {
+    margin-left: auto;
+    flex: none;
+    padding: 3px;
+  }
+  .perm .seg button {
+    padding: 5px 10px;
     font-size: 12px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--mute);
+  }
+  .perm .seg button.on {
+    cursor: default;
+  }
+  .tool {
+    flex: none;
+    font-weight: 700;
+    font-size: 13px;
+  }
+  code {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font: 12px var(--mono);
+    color: #cdd3ff;
+    user-select: text;
+  }
+  .lbl {
+    margin-top: 22px;
   }
   ul {
     list-style: none;
@@ -116,59 +152,34 @@
   li {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 7px 10px;
-    border-radius: 10px;
-    background: rgba(255, 255, 255, 0.03);
+    gap: 10px;
+    padding: 8px 12px;
+    border-radius: 12px;
     border: 1px solid var(--line);
-    font-size: 12.5px;
-    min-width: 0;
+    background: rgba(255, 255, 255, 0.03);
+    font-size: 12px;
   }
-  code {
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font: 12px 'Cascadia Code', Consolas, monospace;
-    color: #cdd3ff;
+  .at {
+    flex: none;
+    color: var(--dim);
+    font-variant-numeric: tabular-nums;
   }
-  .tool {
+  .d {
+    flex: none;
     font-weight: 700;
-  }
-  .dec.allow,
-  .d.allow,
-  .d.allow_once,
-  .d.allow_always {
     color: var(--ok);
   }
-  .dec.deny,
   .d.deny,
   .d.timeout {
     color: var(--bad);
   }
-  .at,
   .by {
+    flex: none;
     color: var(--dim);
-    white-space: nowrap;
-  }
-  .bt {
-    height: 26px;
-    padding: 0 10px;
-    border-radius: 8px;
-    border: 1px solid var(--line2);
-    background: rgba(255, 255, 255, 0.05);
-    color: var(--bad);
-    font-size: 12px;
-    font-weight: 700;
-    cursor: pointer;
-  }
-  .empty {
-    margin: 0;
-    color: var(--dim);
-    font-size: 12.5px;
   }
   .err {
+    margin: 10px 0 0;
+    font-size: 12.5px;
     color: var(--bad);
   }
 </style>

@@ -76,7 +76,7 @@ async fn run() {
         Arc::new(gate),
         bus.clone(),
         state,
-        system_prompt(&config.assistant.name),
+        system_prompt(&config.assistant),
     );
     let session = Session::new(Arc::new(agent), confirms, bus.clone());
 

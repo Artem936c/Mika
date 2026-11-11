@@ -1,5 +1,7 @@
 // Island shapes and event folding. Pure functions, no Tauri calls.
 
+import type { MessageKey } from './i18n';
+
 export type AssistantState = 'idle' | 'listening' | 'thinking' | 'speaking' | 'awaiting_confirm';
 
 export interface IslandShape {
@@ -8,6 +10,7 @@ export interface IslandShape {
   radius: number;
 }
 
+/** Sizes from the design, section 10. */
 export const ISLAND_SHAPES: Record<AssistantState, IslandShape> = {
   idle: { width: 236, height: 44, radius: 22 },
   listening: { width: 340, height: 52, radius: 26 },
@@ -16,26 +19,32 @@ export const ISLAND_SHAPES: Record<AssistantState, IslandShape> = {
   awaiting_confirm: { width: 600, height: 268, radius: 30 },
 };
 
-export const STATE_LABELS: Record<AssistantState, string> = {
-  idle: 'Жду',
-  listening: 'Слушаю',
-  thinking: 'Думаю',
-  speaking: 'Отвечаю',
-  awaiting_confirm: 'Нужно подтверждение',
-};
+/** Open chat with the avatar column, and without it. */
+export const CHAT_WIDE: IslandShape = { width: 860, height: 500, radius: 34 };
+export const CHAT_NARROW: IslandShape = { width: 600, height: 500, radius: 34 };
+export const SETTINGS_SHAPE: IslandShape = { width: 860, height: 500, radius: 34 };
+/** Width of the avatar column in the wide chat. */
+export const AVATAR_COLUMN = 290;
 
-export type MikaEvent =
-  | { type: 'state_changed'; from: AssistantState; to: AssistantState }
-  | { type: 'user_text'; text: string }
-  | { type: 'assistant_text'; text: string }
-  | { type: 'error'; message: string };
+export type View = 'island' | 'chat' | 'settings';
 
 export function isAssistantState(value: unknown): value is AssistantState {
   return typeof value === 'string' && Object.prototype.hasOwnProperty.call(ISLAND_SHAPES, value);
 }
 
+export function stateLabel(state: AssistantState): MessageKey {
+  return `state.${state}`;
+}
+
 export function shapeFor(state: unknown): IslandShape {
   return isAssistantState(state) ? ISLAND_SHAPES[state] : ISLAND_SHAPES.idle;
+}
+
+/** Island shape for the open panel and the assistant state. An open panel wins over the state. */
+export function viewShape(view: View, state: AssistantState, wide: boolean): IslandShape {
+  if (view === 'settings') return SETTINGS_SHAPE;
+  if (view === 'chat') return wide ? CHAT_WIDE : CHAT_NARROW;
+  return shapeFor(state);
 }
 
 export function reduceState(current: AssistantState, event: unknown): AssistantState {
@@ -71,4 +80,15 @@ export function unionRect(a: Rect, b: Rect): Rect {
     w: Math.max(a.x + a.w, b.x + b.w) - x,
     h: Math.max(a.y + a.h, b.y + b.h) - y,
   };
+}
+
+/** Elements inside the island that handle their own clicks. */
+const CONTROLS = 'button, a, input, textarea, select, label, [role="button"]';
+
+/**
+ * Whether a click on the island should open the chat. A click on a button inside
+ * the island bubbles up too; by then the button may already have closed the chat.
+ */
+export function opensChat(target: { closest(selector: string): unknown } | null): boolean {
+  return !target?.closest(CONTROLS);
 }

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 use crate::confirm::{Answer, DecidedBy};
+use crate::emotion::Emotion;
 use crate::state::AssistantState;
 use crate::tools::Assessment;
 
@@ -37,6 +38,9 @@ pub enum Event {
         ok: bool,
         output: String,
         elapsed_ms: u64,
+        /// Structured result for a chat card: weather, volume.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        data: Option<serde_json::Value>,
     },
     ConfirmRequested {
         id: u64,
@@ -49,6 +53,14 @@ pub enum Event {
         id: u64,
         answer: Answer,
         by: DecidedBy,
+    },
+    /// Emotion tag found in the reply, already cut out of the text.
+    EmotionCue {
+        emotion: Emotion,
+    },
+    /// The face to show now, chosen by the emotion core.
+    EmotionChanged {
+        emotion: Emotion,
     },
     Error {
         message: String,
@@ -138,5 +150,25 @@ mod tests {
             serde_json::to_value(&e).unwrap(),
             serde_json::json!({ "type": "state_changed", "from": "idle", "to": "awaiting_confirm" })
         );
+    }
+
+    #[test]
+    fn tool_finished_without_data_has_no_field() {
+        let mut e = Event::ToolFinished {
+            id: "1".into(),
+            name: "t".into(),
+            ok: true,
+            output: "o".into(),
+            elapsed_ms: 5,
+            data: None,
+        };
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(v.get("data").is_none(), "{v}");
+        assert_eq!(serde_json::from_value::<Event>(v).unwrap(), e);
+
+        if let Event::ToolFinished { data, .. } = &mut e {
+            *data = Some(serde_json::json!({"kind": "volume", "level": 40}));
+        }
+        assert_eq!(serde_json::to_value(&e).unwrap()["data"]["level"], 40);
     }
 }

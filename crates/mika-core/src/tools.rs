@@ -77,11 +77,21 @@ impl Assessment {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolOutput {
     pub text: String,
+    /// Structured result for a chat card. The LLM gets only `text`.
+    pub data: Option<serde_json::Value>,
 }
 
 impl ToolOutput {
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        Self {
+            text: text.into(),
+            data: None,
+        }
+    }
+
+    pub fn with_data(mut self, data: serde_json::Value) -> Self {
+        self.data = Some(data);
+        self
     }
 }
 
