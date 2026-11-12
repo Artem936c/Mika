@@ -51,6 +51,16 @@ jobs:
           "tag=$tag" >> $env:GITHUB_OUTPUT
           "notes=$notes" >> $env:GITHUB_OUTPUT
           "pre=$($version.Contains('-').ToString().ToLower())" >> $env:GITHUB_OUTPUT
+      - name: Point updates/latest.json at this release
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force updates | Out-Null
+          Copy-Item out/latest.json updates/latest.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add updates/latest.json
+          git commit -m "chore: update manifest for ${{ steps.pack.outputs.tag }}"
+          git push
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.pack.outputs.tag }}
