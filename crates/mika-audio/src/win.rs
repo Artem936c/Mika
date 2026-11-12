@@ -113,6 +113,19 @@ pub struct WindowsVoice {
     observer: Observer,
     /// True until the first sentence after a stop is queued.
     fresh: AtomicBool,
+    /// Sentences queued and not yet said or dropped.
+    pending: Arc<AtomicUsize>,
+}
+
+/// Counts a sentence as done when the worker lets go of it.
+struct Said<'a>(&'a AtomicUsize);
+
+impl Drop for Said<'_> {
+    fn drop(&mut self) {
+        let _ = self
+            .0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+    }
 }
 
 /// Content type of a sound file by its first bytes.
@@ -137,9 +150,11 @@ impl WindowsVoice {
         let watching = observer.clone();
         let prefetch = Arc::new(Prefetch::default());
         let ahead = prefetch.clone();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let queue = pending.clone();
         std::thread::Builder::new()
             .name("voice".into())
-            .spawn(move || worker(rx, seen, watching, ahead))
+            .spawn(move || worker(rx, seen, watching, ahead, queue))
             .expect("spawn voice thread");
         Self {
             tx: Mutex::new(tx),
@@ -148,6 +163,7 @@ impl WindowsVoice {
             prefetch,
             observer,
             fresh: AtomicBool::new(true),
+            pending,
         }
     }
 }
@@ -310,6 +326,7 @@ fn worker(
     generation: Arc<AtomicU64>,
     observer: Observer,
     prefetch: Arc<Prefetch>,
+    pending: Arc<AtomicUsize>,
 ) {
     // SAFETY: COM is initialised for this thread, which lives as long as the channel.
     unsafe {
@@ -318,6 +335,7 @@ fn worker(
     let mut engine: Option<Engine> = None;
     let mut settings = (String::new(), 1.0f32);
     while let Ok(cmd) = rx.recv() {
+        let _said = matches!(cmd, Cmd::Speak(_)).then(|| Said(&pending));
         // The engine starts with the first sentence: a silent assistant never touches audio.
         let cmd = match cmd {
             Cmd::Configure(voice, rate) if engine.is_none() => {
@@ -425,6 +443,7 @@ impl Voice for WindowsVoice {
             });
             rx
         });
+        self.pending.fetch_add(1, Ordering::Relaxed);
         let _ = self.tx.lock().send(Cmd::Speak(Sentence {
             text: text.to_string(),
             generation: gen,
@@ -436,6 +455,10 @@ impl Voice for WindowsVoice {
 
     fn set_observer(&self, observer: Option<FirstSound>) {
         *self.observer.lock() = observer;
+    }
+
+    fn busy(&self) -> bool {
+        self.pending.load(Ordering::Relaxed) > 0
     }
 
     fn set_remote(&self, remote: Option<RemoteSynth>) {

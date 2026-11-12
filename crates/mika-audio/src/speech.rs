@@ -38,6 +38,10 @@ pub trait Voice: Send + Sync {
     /// Called with the milliseconds from "say this" to the first sound, once for
     /// the first sentence after each `stop`.
     fn set_observer(&self, _observer: Option<FirstSound>) {}
+    /// True while queued sentences are still to be said.
+    fn busy(&self) -> bool {
+        false
+    }
 }
 
 /// Gets the time to the first sound of a spoken answer.

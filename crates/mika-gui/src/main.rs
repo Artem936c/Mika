@@ -8,6 +8,7 @@ mod settings;
 mod strings;
 mod tray;
 mod update;
+mod vosk;
 mod window;
 
 use std::sync::Arc;
@@ -177,6 +178,11 @@ fn main() {
             settings::get_voice_settings,
             settings::set_voice,
             settings::test_voice,
+            settings::set_tts_cache,
+            settings::clear_speech_cache,
+            settings::install_vosk,
+            settings::set_follow_up,
+            settings::remove_vosk,
             settings::save_speech_settings,
             settings::set_microphone_enabled,
             settings::voice_listen,

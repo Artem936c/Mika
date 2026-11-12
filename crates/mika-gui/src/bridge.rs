@@ -54,6 +54,7 @@ type CtxState<'a> = tauri::State<'a, Arc<crate::app::Ctx>>;
 /// Answers an open question or starts a reply in the background.
 #[tauri::command]
 pub fn send_message(ctx: CtxState<'_>, text: String) {
+    ctx.end_voice_dialog();
     let session = ctx.session.clone();
     // Session::submit spawns on tokio; run it inside the Tauri runtime.
     tauri::async_runtime::spawn(async move {
@@ -76,6 +77,7 @@ pub fn poke_avatar(ctx: CtxState<'_>) {
 /// Stops the running reply, drops queued ones and denies an open question.
 #[tauri::command]
 pub fn stop(ctx: CtxState<'_>) {
+    ctx.end_voice_dialog();
     ctx.session.stop();
     ctx.voice.stop();
 }

@@ -76,12 +76,16 @@ pub struct Ctx {
     /// Set while a phrase is being recorded.
     recording: Mutex<Option<Arc<MicControl>>>,
     live: Live,
+    /// Sound of phrases the provider already made.
+    pub speech_cache: Arc<mika_core::speech_cache::SpeechCache>,
     state: StateHandle,
     /// Set in `setup`: wake phrase and shortcuts bring the windows to the front.
     pub app: std::sync::OnceLock<tauri::AppHandle>,
     wake: Mutex<Option<mika_audio::wake::WakeHandle>>,
     /// `off`, `on`, or why the wake phrase cannot listen.
     pub wake_status: Mutex<String>,
+    /// Set while the user talks to her by voice: she listens again after answering.
+    follow_up: AtomicBool,
     /// What she has said in the current reply, to tell her own voice from the user.
     speaking: Mutex<String>,
     /// A newer version found by the last check.
@@ -160,7 +164,11 @@ impl Ctx {
         let llm = config.llm.clone();
         let config = Arc::new(Mutex::new(config));
 
-        let live = Live::new(config.clone(), secrets.clone());
+        let speech_cache = Arc::new(mika_core::speech_cache::SpeechCache::new(
+            mika_core::paths::speech_cache_dir(),
+        ));
+        let live =
+            Live::new(config.clone(), secrets.clone()).with_speech_cache(speech_cache.clone());
         let speech = live.clone();
         let voice_state = state.clone();
         let memory = Memory::new(db.clone(), Some(Arc::new(live.clone())));
@@ -236,10 +244,12 @@ impl Ctx {
             system_mic,
             recording: Mutex::new(None),
             live: speech,
+            speech_cache,
             state: voice_state,
             app: std::sync::OnceLock::new(),
             wake: Mutex::new(None),
             wake_status: Mutex::new("off".into()),
+            follow_up: AtomicBool::new(false),
             speaking: Mutex::new(String::new()),
             update: Mutex::new(None),
         })
@@ -248,6 +258,7 @@ impl Ctx {
     /// Starts the scheduler, the MCP servers and the Telegram bridge.
     /// Must run inside the async runtime.
     pub fn start_background(self: &Arc<Self>) {
+        self.watch_voice_dialog();
         let session = self.session.clone();
         let notes = self.session.clone();
         tauri::async_runtime::spawn(run_scheduler(
@@ -425,6 +436,13 @@ impl Ctx {
 
     /// Starts or stops the wake phrase as the settings say: it listens only while
     /// the microphone is allowed and the wake phrase is on.
+    /// Stops the wake phrase and waits until its thread let go of Vosk.
+    pub fn stop_wake(&self) {
+        if let Some(handle) = self.wake.lock().take() {
+            handle.stop_and_wait();
+        }
+    }
+
     pub fn restart_wake(self: &Arc<Self>) {
         // Dropping the old handle stops its listener.
         self.wake.lock().take();
@@ -444,15 +462,21 @@ impl Ctx {
         *self.wake_status.lock() = "starting".into();
         let me = Arc::downgrade(self);
         let status = Arc::downgrade(self);
-        let handle = mika_audio::wake::start_wake(
-            &speech_locale(&language),
+        let engine = crate::vosk::engine().unwrap_or(mika_audio::wake::WakeEngine::Windows {
+            language: speech_locale(&language),
+        });
+        let local = matches!(engine, mika_audio::wake::WakeEngine::Vosk { .. });
+        let handle = mika_audio::wake::start_wake(mika_audio::wake::WakeSetup {
+            engine,
+            name,
             phrases,
-            Arc::new(move |heard| {
+            mic: self.system_mic.clone(),
+            on_wake: Arc::new(move |heard| {
                 if let Some(ctx) = me.upgrade() {
                     ctx.on_wake(&heard);
                 }
             }),
-            Arc::new(move |result| {
+            on_status: Arc::new(move |result| {
                 if let Some(ctx) = status.upgrade() {
                     *ctx.wake_status.lock() = match result {
                         Ok(()) => "on".into(),
@@ -460,9 +484,12 @@ impl Ctx {
                     };
                 }
             }),
-        );
+        });
         *self.wake.lock() = Some(handle);
-        *self.wake_status.lock() = "on".into();
+        // Vosk reports `on` itself once the model is loaded, which takes seconds.
+        if !local {
+            *self.wake_status.lock() = "on".into();
+        }
     }
 
     /// The wake phrase was heard: stop talking, come forward, listen.
@@ -585,16 +612,90 @@ impl Ctx {
     /// Records a phrase and hands it to the assistant as a voice message.
     /// Problems go to the chat as an error line.
     pub async fn listen_and_submit(&self) {
+        self.listen_once(false).await;
+    }
+
+    /// Records one phrase and sends it. After a spoken question she listens
+    /// again once her answer is said; silence then ends the conversation quietly.
+    async fn listen_once(&self, follow_up: bool) {
         match self.hear().await {
             Ok(Heard::Text(text)) => {
+                self.follow_up.store(true, Ordering::Relaxed);
                 self.session.submit_from(&text, Origin::Voice);
             }
             Ok(Heard::Finished) => {}
             Err(message) if message.is_empty() => {}
+            Err(_) if follow_up => {
+                self.follow_up.store(false, Ordering::Relaxed);
+            }
             Err(message) => {
                 self.bus.publish(mika_core::Event::Error { message });
             }
         }
+    }
+
+    /// The conversation by voice is over: typed text, «Стоп», an error.
+    pub fn end_voice_dialog(&self) {
+        self.follow_up.store(false, Ordering::Relaxed);
+    }
+
+    /// After an answer to a spoken question: waits until she has said it all,
+    /// then listens for the next question, as smart speakers do.
+    async fn listen_after_answer(self: Arc<Self>, at: AssistantState) {
+        // The last sentences reach the voice a moment after the turn ends.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        while self.voice.busy() && std::time::Instant::now() < deadline {
+            if self.state.get() != at || !self.follow_up.load(Ordering::Relaxed) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // The tail of her voice must not reach the microphone.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let wanted = {
+            let c = self.config.lock();
+            c.voice.follow_up
+                && c.privacy.microphone_enabled
+                && !c.voice.stt_model.trim().is_empty()
+        };
+        if !wanted {
+            self.end_voice_dialog();
+            return;
+        }
+        if !self.follow_up.load(Ordering::Relaxed) || self.state.get() != at || self.is_recording()
+        {
+            return;
+        }
+        self.listen_once(true).await;
+    }
+
+    /// Starts listening after each answer to a spoken question.
+    fn watch_voice_dialog(self: &Arc<Self>) {
+        use mika_core::Event;
+        use tokio::sync::broadcast::error::RecvError;
+        let me = Arc::downgrade(self);
+        let mut events = self.bus.subscribe();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                let event = match events.recv().await {
+                    Ok(e) => e,
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                };
+                let Some(ctx) = me.upgrade() else { break };
+                match event {
+                    Event::Error { .. } => ctx.end_voice_dialog(),
+                    Event::StateChanged { to, .. }
+                        if matches!(to, AssistantState::Idle | AssistantState::AwaitingConfirm)
+                            && ctx.follow_up.load(Ordering::Relaxed) =>
+                    {
+                        tauri::async_runtime::spawn(ctx.listen_after_answer(to));
+                    }
+                    _ => {}
+                }
+            }
+        });
     }
 
     /// Rebuilds the LLM provider from the current config and secrets.

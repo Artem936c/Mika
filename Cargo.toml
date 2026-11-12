@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.2.0-pre.1"
+version = "0.2.0-pre.2"
 edition = "2021"
 publish = false
 
@@ -55,9 +55,11 @@ windows = { version = "0.62", features = [
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_Storage_Xps",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
     "Win32_System_Variant",
     "Win32_System_Power",
     "Win32_System_Shutdown",

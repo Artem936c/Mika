@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "mika-audio"
-version = "0.2.0-pre.1"
+version = "0.2.0-pre.2"
 dependencies = [
  "cpal",
  "log",
@@ -2471,6 +2471,8 @@ dependencies = [
  "parking_lot",
  "regex",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "windows 0.62.2",
@@ -2479,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "mika-cli"
-version = "0.2.0-pre.1"
+version = "0.2.0-pre.2"
 dependencies = [
  "chrono",
  "env_logger",
@@ -2495,7 +2497,7 @@ dependencies = [
 
 [[package]]
 name = "mika-core"
-version = "0.2.0-pre.1"
+version = "0.2.0-pre.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2507,6 +2509,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -2516,7 +2519,7 @@ dependencies = [
 
 [[package]]
 name = "mika-gui"
-version = "0.2.0-pre.1"
+version = "0.2.0-pre.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2535,6 +2538,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-global-shortcut",
  "tauri-plugin-notification",
+ "tempfile",
  "tokio",
  "tokio-util",
  "windows-sys 0.59.0",
@@ -2543,7 +2547,7 @@ dependencies = [
 
 [[package]]
 name = "mika-providers"
-version = "0.2.0-pre.1"
+version = "0.2.0-pre.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2561,7 +2565,7 @@ dependencies = [
 
 [[package]]
 name = "mika-tools"
-version = "0.2.0-pre.1"
+version = "0.2.0-pre.2"
 dependencies = [
  "arboard",
  "async-trait",

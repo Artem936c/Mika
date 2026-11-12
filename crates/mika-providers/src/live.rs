@@ -12,6 +12,7 @@ use mika_core::config::{Config, EMBEDDING_SECRET_KEY, IMAGE_SECRET_KEY};
 use mika_core::llm::{ChatMessage, ImageGen, LlmChunk, LlmRequest, Vision};
 use mika_core::memory::Embedder;
 use mika_core::secrets::{Secret, SecretStore};
+use mika_core::speech_cache::SpeechCache;
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 
@@ -26,6 +27,7 @@ pub struct Live {
     config: Arc<Mutex<Config>>,
     secrets: Arc<dyn SecretStore>,
     http: reqwest::Client,
+    speech_cache: Option<Arc<SpeechCache>>,
 }
 
 fn base64_engine() -> base64::engine::GeneralPurpose {
@@ -38,7 +40,18 @@ impl Live {
             config,
             secrets,
             http: client(),
+            speech_cache: None,
         }
+    }
+
+    /// Keeps synthesized phrases in `cache`, while the settings allow it.
+    pub fn with_speech_cache(mut self, cache: Arc<SpeechCache>) -> Self {
+        self.speech_cache = Some(cache);
+        self
+    }
+
+    pub(crate) fn speech_cache(&self) -> Option<&SpeechCache> {
+        self.speech_cache.as_deref()
     }
 
     /// The key stored under `own`, or the LLM key when there is none.

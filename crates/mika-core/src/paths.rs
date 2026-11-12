@@ -36,6 +36,24 @@ pub fn logs_dir() -> PathBuf {
     }
 }
 
+/// Sound of phrases already synthesized: `%LOCALAPPDATA%\Mika\speech-cache`,
+/// or inside `MIKA_DATA_DIR` when set. Machine-local, like the logs.
+pub fn speech_cache_dir() -> PathBuf {
+    match logs_dir().parent() {
+        Some(parent) => parent.join("speech-cache"),
+        None => data_dir().join("speech-cache"),
+    }
+}
+
+/// Vosk for the wake phrase: `lib` with the library, `model` with the model.
+/// Machine-local, next to the logs.
+pub fn vosk_dir() -> PathBuf {
+    match logs_dir().parent() {
+        Some(parent) => parent.join("vosk"),
+        None => data_dir().join("vosk"),
+    }
+}
+
 pub fn database_path() -> PathBuf {
     data_dir().join("mika.db")
 }

@@ -265,12 +265,10 @@ fn failed(e: impl std::fmt::Display) -> MicError {
     MicError::Failed(e.to_string())
 }
 
-impl Microphone for SystemMicrophone {
-    fn available(&self) -> bool {
-        self.device().is_some()
-    }
-
-    fn record(&self, control: &MicControl) -> Result<Vec<u8>, MicError> {
+impl SystemMicrophone {
+    /// Starts the device and sends mono chunks at its own rate to `tx`.
+    /// Sound flows while the returned stream lives.
+    pub fn open(&self, tx: mpsc::Sender<Vec<f32>>) -> Result<(cpal::Stream, u32), MicError> {
         let device = self.device().ok_or(MicError::NoDevice)?;
         let config = device.default_input_config().map_err(failed)?;
         let channels = config.channels() as usize;
@@ -278,7 +276,6 @@ impl Microphone for SystemMicrophone {
         let format = config.sample_format();
         let stream_config: cpal::StreamConfig = config.into();
 
-        let (tx, rx) = mpsc::channel::<Vec<f32>>();
         let on_error = |e| log::warn!("microphone stream error: {e}");
         let stream = match format {
             cpal::SampleFormat::F32 => device.build_input_stream(
@@ -319,6 +316,18 @@ impl Microphone for SystemMicrophone {
         }
         .map_err(failed)?;
         stream.play().map_err(failed)?;
+        Ok((stream, rate))
+    }
+}
+
+impl Microphone for SystemMicrophone {
+    fn available(&self) -> bool {
+        self.device().is_some()
+    }
+
+    fn record(&self, control: &MicControl) -> Result<Vec<u8>, MicError> {
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
+        let (stream, rate) = self.open(tx)?;
 
         let frame_len = (rate as u64 * FRAME_MS as u64 / 1000).max(1) as usize;
         let mut samples: Vec<f32> = Vec::new();

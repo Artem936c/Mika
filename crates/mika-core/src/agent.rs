@@ -23,6 +23,10 @@ use crate::tools::ToolRegistry;
 pub const MAX_STEPS: usize = 8;
 /// Reminders per message that a plan still has open steps.
 const MAX_NUDGES: usize = 2;
+/// Reminder after a reply that stopped without doing what it said.
+const STALL_NOTE: &str = "(служебная заметка) Ты остановилась, не доделав просьбу. \
+Не обещай и не жди разрешения на уже одобренное: продолжай вызовами инструментов сейчас же. \
+Если всё сделано или что-то мешает, коротко скажи пользователю, что вышло.";
 /// Tool output sent back to the LLM, characters.
 const MAX_TOOL_RESULT: usize = 16_000;
 /// Tool output shown in the chat row, characters.
@@ -175,6 +179,35 @@ impl ThoughtFilter {
     }
 }
 
+/// Words of a reply that promise an action without doing it: «подожди
+/// секунду», «сейчас попробую». A small model says them and ends its turn.
+const PROMISES: [&str; 9] = [
+    "подожди",
+    "подождёшь",
+    "подождешь",
+    "секунду",
+    "минутку",
+    "сейчас попробую",
+    "сейчас я ",
+    "я попробую",
+    "начала искать",
+];
+
+/// True when the reply promises an action that should have been a tool call.
+pub fn promises_action(reply: &str) -> bool {
+    let t = reply.to_lowercase();
+    PROMISES.iter().any(|p| t.contains(p))
+}
+
+/// A one-word Latin tag such as `[smile]` at the very start of a reply: small
+/// models invent their own emotion names, and none of them is meant to be read.
+fn is_invented_tag(inner: &str) -> bool {
+    (2..=MAX_TAG).contains(&inner.len())
+        && inner
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '_' || c == '-')
+}
+
 /// `🤔` or `😊😊`: a few emoji (symbols from U+2600 up, with their joiners), nothing else.
 fn is_emoji_tag(inner: &str) -> bool {
     let n = inner.chars().count();
@@ -233,6 +266,9 @@ impl TagFilter {
                         }
                         // Small models invent tags like `[🤔]`: an emoji in brackets is dropped.
                         None if is_emoji_tag(&held[1..]) => self.skip_space = true,
+                        None if !self.started && is_invented_tag(&held[1..]) => {
+                            self.skip_space = true
+                        }
                         None => {
                             self.emit(&mut out, &held);
                             self.emit(&mut out, "]");
@@ -473,10 +509,22 @@ impl Agent {
     ) -> Result<String, AgentError> {
         let mut step = 0;
         let mut nudges = 0;
+        let mut used_tools = false;
         while step < self.step_limit() {
             let (text, calls) = self.one_step(msgs, cancel, step == 0).await?;
             step += 1;
             if calls.is_empty() {
+                // Small models end a turn in silence after tools, or promise
+                // «подожди секунду» and stop: remind them to act or to report.
+                let stalled = (used_tools && text.trim().is_empty()) || promises_action(&text);
+                if stalled && nudges < MAX_NUDGES {
+                    nudges += 1;
+                    if !text.is_empty() {
+                        msgs.push(ChatMessage::assistant(text));
+                    }
+                    msgs.push(ChatMessage::user(STALL_NOTE));
+                    continue;
+                }
                 // Small models stop in the middle of a plan: remind them once or twice.
                 let open = self
                     .tasks
@@ -500,6 +548,7 @@ impl Agent {
                 msgs.push(ChatMessage::assistant(text.clone()));
                 return Ok(text);
             }
+            used_tools = true;
             msgs.push(ChatMessage::assistant_with_calls(text, calls.clone()));
             for call in calls {
                 let result = self.execute(&call, cancel).await;
@@ -1236,6 +1285,56 @@ mod tests {
             "a lone prefix comes back at the end"
         );
         assert_eq!(thoughts(&["обычный текст"]), "обычный текст");
+    }
+
+    #[test]
+    fn tag_filter_drops_invented_word_tags_at_the_start_only() {
+        let mut f = TagFilter::default();
+        let (out, cues) = f.push("[smile] Проводник открыла. [x] и [note] видны.");
+        assert_eq!(out, "Проводник открыла. [x] и [note] видны.");
+        assert_eq!(cues, vec![Emotion::Joy]);
+        let mut f = TagFilter::default();
+        let (out, cues) = f.push("[sparkle] Готово.");
+        assert_eq!(out, "Готово.");
+        assert!(cues.is_empty());
+        let mut f = TagFilter::default();
+        assert_eq!(f.push("[Sparkle] Привет").0, "[Sparkle] Привет");
+    }
+
+    #[test]
+    fn promises_without_actions_are_noticed() {
+        assert!(promises_action(
+            "Сейчас я попробую его перезапустить. Подожди немножко."
+        ));
+        assert!(promises_action(
+            "Как только найду, отправлю. Подождёшь секунду?"
+        ));
+        assert!(!promises_action(
+            "Готово! Хочешь, чтобы я прочитала, что там написано?"
+        ));
+        assert!(!promises_action("В Перми сейчас пасмурно."));
+    }
+
+    #[tokio::test]
+    async fn a_promise_or_silence_after_tools_gets_a_reminder() {
+        let p = FakeProvider::new(vec![
+            Some(vec![call("c1", "echo", json!({"text": "a"}))]),
+            Some(vec![]),
+            Some(vec![text("Нашла Алексея, подожди секунду.")]),
+            Some(vec![text("Отправила «Привет».")]),
+        ]);
+        let (a, _rx, _) = agent(p.clone());
+        assert_eq!(
+            a.handle("напиши", CancellationToken::new()).await,
+            Ok("Отправила «Привет».".into())
+        );
+        let reqs = p.requests.lock();
+        assert_eq!(reqs.len(), 4);
+        for r in &reqs[2..] {
+            let last = r.messages.last().unwrap();
+            assert_eq!(last.role, Role::User);
+            assert!(last.content.contains("не доделав"));
+        }
     }
 
     #[test]

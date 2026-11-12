@@ -211,6 +211,8 @@ export async function install(scenario: string) {
             tts: params.has('cloud') ? 'provider' : 'windows',
             tts_model: 'google/gemini-3.8-flash-lite-tts',
             tts_voice: 'Kore',
+            tts_cache: true,
+            tts_cache_bytes: 3_400_000,
             stt_model: 'qwen/qwen3-asr-0.6b',
             stt_language: 'ru',
             speech_base_url: '',
@@ -224,6 +226,10 @@ export async function install(scenario: string) {
             wake_enabled: true,
             wake_phrase: 'Мика',
             wake_status: 'on',
+            vosk_installed: params.has('vosk'),
+            vosk_downloading: false,
+            vosk_bytes: 141_000_000,
+            follow_up: true,
           };
         case 'test_microphone':
           return 'какая сегодня погода';

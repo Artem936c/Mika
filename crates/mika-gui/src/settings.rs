@@ -630,6 +630,8 @@ pub struct VoiceSettings {
     tts: TtsEngine,
     tts_model: String,
     tts_voice: String,
+    tts_cache: bool,
+    tts_cache_bytes: u64,
     stt_model: String,
     stt_language: String,
     speech_base_url: String,
@@ -644,6 +646,11 @@ pub struct VoiceSettings {
     wake_phrase: String,
     /// `off`, `on`, `starting`, or why the wake phrase cannot listen.
     wake_status: String,
+    /// Vosk is downloaded: it hears the name instead of Windows.
+    vosk_installed: bool,
+    vosk_downloading: bool,
+    vosk_bytes: u64,
+    follow_up: bool,
 }
 
 /// Async: listing voices waits for Windows and must not block the UI thread.
@@ -659,6 +666,11 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
     })
     .await
     .unwrap_or_default();
+    let cache = ctx.speech_cache.clone();
+    let (tts_cache_bytes, vosk_bytes) =
+        tauri::async_runtime::spawn_blocking(move || (cache.size(), crate::vosk::size()))
+            .await
+            .unwrap_or_default();
     let (c, microphone_enabled, llm_base_url) = {
         let cfg = ctx.config.lock();
         (
@@ -678,6 +690,8 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
         tts: c.tts,
         tts_model: c.tts_model,
         tts_voice: c.tts_voice,
+        tts_cache: c.tts_cache,
+        tts_cache_bytes,
         stt_model: c.stt_model,
         stt_language: c.stt_language,
         speech_base_url: c.speech_base_url,
@@ -691,7 +705,60 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
         wake_enabled: c.wake_enabled,
         wake_phrase: ctx.config.lock().assistant.wake_phrase.clone(),
         wake_status: ctx.wake_status.lock().clone(),
+        vosk_installed: crate::vosk::installed(),
+        vosk_downloading: crate::vosk::downloading(),
+        vosk_bytes,
+        follow_up: c.follow_up,
     })
+}
+
+/// Listen again after an answer to a spoken question, or not.
+#[tauri::command]
+pub fn set_follow_up(ctx: CtxState<'_>, value: bool) -> Result<(), String> {
+    ctx.config.lock().voice.follow_up = value;
+    if !value {
+        ctx.end_voice_dialog();
+    }
+    ctx.save_config()
+}
+
+/// Downloads Vosk on the user's press; the wake phrase switches to it.
+/// Progress goes to the window as `vosk-progress` with the share done.
+#[tauri::command]
+pub async fn install_vosk(
+    app: AppHandle,
+    ctx: tauri::State<'_, Arc<Ctx>>,
+) -> Result<String, String> {
+    use tauri::Emitter;
+    let last = std::sync::atomic::AtomicU8::new(u8::MAX);
+    crate::vosk::install(move |share| {
+        if last.swap(share, std::sync::atomic::Ordering::Relaxed) != share {
+            let _ = app.emit("vosk-progress", share);
+        }
+    })
+    .await?;
+    let ctx: &Arc<Ctx> = &ctx;
+    ctx.restart_wake();
+    let status = ctx.wake_status.lock().clone();
+    Ok(status)
+}
+
+/// Deletes Vosk; the recognizer of Windows hears the name after that.
+#[tauri::command]
+pub async fn remove_vosk(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<String, String> {
+    let ctx: Arc<Ctx> = ctx.inner().clone();
+    let stopping = ctx.clone();
+    // The listener holds the library open: stop it before deleting.
+    let removed = tauri::async_runtime::spawn_blocking(move || {
+        stopping.stop_wake();
+        crate::vosk::remove()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    ctx.restart_wake();
+    removed?;
+    let status = ctx.wake_status.lock().clone();
+    Ok(status)
 }
 
 /// The wake phrase on or off, and the name it listens for.
@@ -744,6 +811,25 @@ pub fn save_speech_settings(
     ctx.save_config()?;
     ctx.apply_voice_engine();
     Ok(())
+}
+
+/// Keep provider phrases on disk, or order every phrase anew.
+#[tauri::command]
+pub fn set_tts_cache(ctx: CtxState<'_>, value: bool) -> Result<(), String> {
+    ctx.config.lock().voice.tts_cache = value;
+    ctx.save_config()
+}
+
+/// Forgets every kept phrase; answers the bytes left.
+#[tauri::command]
+pub async fn clear_speech_cache(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<u64, String> {
+    let cache = ctx.speech_cache.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        cache.clear();
+        cache.size()
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// The user's switch: without it the microphone is never opened.

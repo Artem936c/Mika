@@ -1,6 +1,7 @@
 <script lang="ts">
   import ModelPicker from './ModelPicker.svelte';
   import { invoke } from '@tauri-apps/api/core';
+  import { listen as onEvent } from '@tauri-apps/api/event';
   import { onMount } from 'svelte';
   import Switch from '../Switch.svelte';
   import { t } from '../i18n';
@@ -15,6 +16,8 @@
     tts: Engine;
     tts_model: string;
     tts_voice: string;
+    tts_cache: boolean;
+    tts_cache_bytes: number;
     stt_model: string;
     stt_language: string;
     speech_base_url: string;
@@ -28,6 +31,10 @@
     wake_enabled: boolean;
     wake_phrase: string;
     wake_status: string;
+    vosk_installed: boolean;
+    vosk_downloading: boolean;
+    vosk_bytes: number;
+    follow_up: boolean;
   }
 
   let { name }: { name: string } = $props();
@@ -39,13 +46,50 @@
   let heard = $state('');
   let listening = $state(false);
 
-  onMount(async () => {
+  let voskShare = $state(0);
+
+  onMount(() => {
+    invoke<VoiceSettings>('get_voice_settings').then((v) => (s = v), fail);
+    const off = onEvent<number>('vosk-progress', (e) => (voskShare = e.payload));
+    return () => {
+      off.then((f) => f());
+    };
+  });
+
+  async function setFollowUp(v: boolean) {
+    if (!s) return;
     try {
+      await invoke('set_follow_up', { value: v });
+      s.follow_up = v;
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  async function installVosk() {
+    if (!s) return;
+    s.vosk_downloading = true;
+    voskShare = 0;
+    try {
+      s.wake_status = await invoke<string>('install_vosk');
+      s = await invoke<VoiceSettings>('get_voice_settings');
+    } catch (e) {
+      fail(e);
+      if (s) s.vosk_downloading = false;
+    }
+  }
+
+  async function removeVosk() {
+    if (!s) return;
+    try {
+      s.wake_status = await invoke<string>('remove_vosk');
       s = await invoke<VoiceSettings>('get_voice_settings');
     } catch (e) {
       fail(e);
     }
-  });
+  }
+
+  const voskSize = $derived(s ? Math.round(s.vosk_bytes / (1024 * 1024)) : 0);
 
   function fail(e: unknown) {
     note = String(e);
@@ -85,7 +129,9 @@
   const wakeNote = $derived.by(() => {
     if (!s || !s.wake_enabled) return '';
     if (!s.microphone_enabled) return t('voice.wake_needs_mic');
-    if (s.wake_status === 'on' || s.wake_status === 'starting') return t('voice.wake_on', { name: s.wake_phrase });
+    if (s.wake_status === 'on' || s.wake_status === 'starting') {
+      return t(s.vosk_installed ? 'voice.wake_on_vosk' : 'voice.wake_on', { name: s.wake_phrase });
+    }
     return s.wake_status;
   });
 
@@ -121,6 +167,27 @@
       return false;
     }
   }
+
+  async function setCache(v: boolean) {
+    if (!s) return;
+    try {
+      await invoke('set_tts_cache', { value: v });
+      s.tts_cache = v;
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  async function clearCache() {
+    if (!s) return;
+    try {
+      s.tts_cache_bytes = await invoke<number>('clear_speech_cache');
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  const cacheSize = $derived(s ? (s.tts_cache_bytes / (1024 * 1024)).toFixed(1) : '0');
 
   async function setEngine(engine: Engine) {
     if (!s) return;
@@ -237,9 +304,13 @@
         {/if}
       {/if}
     </div>
+    <Switch checked={s.tts_cache} title={t('voice.cache')} sub={t('voice.cache_sub', { size: cacheSize })} onchange={setCache} />
   {/if}
   <div class="acts">
     <button class="bt" onclick={testVoice}>{t('voice.test')}</button>
+    {#if s.tts === 'provider' && s.tts_cache_bytes > 0}
+      <button class="bt" onclick={clearCache}>{t('voice.cache_clear')}</button>
+    {/if}
   </div>
 
   <div class="lbl sect">{t('voice.input')}</div>
@@ -256,12 +327,27 @@
       </select>
     </label>
   {/if}
-  <Switch checked={s.wake_enabled} title={t('voice.wake', { name: s.wake_phrase })} sub={t('voice.wake_sub')} onchange={setWake} />
+  <Switch checked={s.wake_enabled} title={t('voice.wake', { name: s.wake_phrase })} sub={t('voice.wake_sub', { name: s.wake_phrase })} onchange={setWake} />
   <label>
     <span class="lbl">{t('voice.wake_phrase')}</span>
     <input class="fld short2" bind:value={s.wake_phrase} maxlength="40" onchange={() => s && setWake(s.wake_enabled)} />
   </label>
   {#if wakeNote}<p class="hint">{wakeNote}</p>{/if}
+  <Switch checked={s.follow_up} title={t('voice.follow_up')} sub={t('voice.follow_up_sub')} onchange={setFollowUp} />
+  <div class="lbl top">{t('voice.vosk')}</div>
+  {#if s.vosk_downloading}
+    <p class="hint">{t('voice.vosk_loading', { share: voskShare })}</p>
+  {:else if s.vosk_installed}
+    <p class="hint">{t('voice.vosk_on', { size: voskSize })}</p>
+    <div class="acts">
+      <button class="bt" onclick={removeVosk}>{t('voice.vosk_remove')}</button>
+    </div>
+  {:else}
+    <p class="hint">{t('voice.vosk_off')}</p>
+    <div class="acts">
+      <button class="bt" onclick={installVosk}>{t('voice.vosk_get')}</button>
+    </div>
+  {/if}
   <div class="lab">
     <span class="lbl">{t('voice.stt_model')}</span>
     <ModelPicker bind:value={s.stt_model} purpose="stt" baseUrl={s.speech_base_url} placeholder="qwen/qwen3-asr-0.6b" />

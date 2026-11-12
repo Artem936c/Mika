@@ -70,16 +70,18 @@ impl Emotion {
             .into_iter()
             .find(|e| e.as_str() == t)
             .or(match t.as_str() {
-                "спокойная" | "спокойно" => Some(Emotion::Neutral),
-                "радость" => Some(Emotion::Joy),
-                "смущение" => Some(Emotion::Shy),
-                "удивление" => Some(Emotion::Surprise),
-                "грусть" => Some(Emotion::Sad),
-                "злость" | "сердится" => Some(Emotion::Angry),
-                "думает" => Some(Emotion::Think),
+                "спокойная" | "спокойно" | "calm" => Some(Emotion::Neutral),
+                "радость" | "улыбка" | "smile" | "happy" | "laugh" | "grin" | "excited" => {
+                    Some(Emotion::Joy)
+                }
+                "смущение" | "blush" | "embarrassed" => Some(Emotion::Shy),
+                "удивление" | "surprised" | "wow" | "shocked" => Some(Emotion::Surprise),
+                "грусть" | "cry" | "crying" | "sorry" => Some(Emotion::Sad),
+                "злость" | "сердится" | "mad" => Some(Emotion::Angry),
+                "думает" | "thinking" | "hmm" => Some(Emotion::Think),
                 "подмигивает" | "подмигивание" => Some(Emotion::Wink),
-                "сонная" => Some(Emotion::Sleepy),
-                "тревога" => Some(Emotion::Worry),
+                "сонная" | "tired" => Some(Emotion::Sleepy),
+                "тревога" | "worried" | "nervous" | "scared" => Some(Emotion::Worry),
                 _ => None,
             })
     }
@@ -487,6 +489,8 @@ mod tests {
         assert_eq!(Emotion::from_tag("JOY"), Some(Emotion::Joy));
         assert_eq!(Emotion::from_tag(" Радость "), Some(Emotion::Joy));
         assert_eq!(Emotion::from_tag("тревога"), Some(Emotion::Worry));
+        assert_eq!(Emotion::from_tag("smile"), Some(Emotion::Joy));
+        assert_eq!(Emotion::from_tag("Thinking"), Some(Emotion::Think));
         assert_eq!(Emotion::from_tag("1"), None);
         assert_eq!(Emotion::from_tag("файл.txt"), None);
         for e in Emotion::ALL {

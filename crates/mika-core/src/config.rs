@@ -160,6 +160,8 @@ pub struct VoiceConfig {
     pub tts_model: String,
     /// Voice name the provider model knows, such as `Kore`.
     pub tts_voice: String,
+    /// Keep the sound of provider phrases on disk, so a repeated phrase is not paid twice.
+    pub tts_cache: bool,
     /// Recognition model of the provider; empty means voice input is off.
     pub stt_model: String,
     /// Language hint for recognition: `ru`.
@@ -170,6 +172,8 @@ pub struct VoiceConfig {
     pub input_device: String,
     /// Listen for the wake phrase while the microphone is allowed.
     pub wake_enabled: bool,
+    /// After an answer to a spoken question, listen again for a few seconds.
+    pub follow_up: bool,
 }
 
 impl Default for VoiceConfig {
@@ -181,11 +185,13 @@ impl Default for VoiceConfig {
             tts: TtsEngine::Windows,
             tts_model: String::new(),
             tts_voice: String::new(),
+            tts_cache: true,
             stt_model: String::new(),
             stt_language: "ru".into(),
             speech_base_url: String::new(),
             input_device: String::new(),
             wake_enabled: false,
+            follow_up: true,
         }
     }
 }

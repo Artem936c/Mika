@@ -4,6 +4,7 @@
 use async_trait::async_trait;
 use mika_core::config::SPEECH_SECRET_KEY;
 use mika_core::llm::{SpeechToText, TextToSpeech};
+use mika_core::speech_cache::SoundKey;
 use serde_json::{json, Value};
 
 use crate::factory::redact;
@@ -42,6 +43,38 @@ pub fn wav_from_pcm(pcm: &[u8], rate: u32) -> Vec<u8> {
     out.extend_from_slice(&data_len.to_le_bytes());
     out.extend_from_slice(pcm);
     out
+}
+
+/// Sample rate of raw sound from its content type: `audio/pcm; rate=44100`.
+pub fn pcm_rate(content_type: &str) -> Option<u32> {
+    content_type
+        .split(';')
+        .filter_map(|p| p.trim().split_once('='))
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case("rate"))
+        .and_then(|(_, v)| v.trim().parse().ok())
+        .filter(|r| (8_000..=96_000).contains(r))
+}
+
+/// Sound a player understands. The content type alone cannot be trusted:
+/// RouterAI labels a WAV file as `audio/pcm`. A file with a header stays as it
+/// is; raw samples get a WAV header at the rate the answer names (Fish Audio
+/// sends 44.1 kHz), or 24 kHz when it names none.
+pub fn playable(bytes: &[u8], content_type: &str) -> Vec<u8> {
+    let named_file = [b"RIFF".as_slice(), b"ID3", b"OggS", b"fLaC"]
+        .iter()
+        .any(|h| bytes.starts_with(h));
+    if named_file {
+        return bytes.to_vec();
+    }
+    // Raw samples may start with 0xFFFF, which looks like an MPEG frame.
+    if let Some(rate) = pcm_rate(content_type) {
+        return wav_from_pcm(bytes, rate);
+    }
+    if has_audio_header(bytes) {
+        bytes.to_vec()
+    } else {
+        wav_from_pcm(bytes, RAW_PCM_RATE)
+    }
 }
 
 /// Text of an OpenAI-style transcription answer.
@@ -130,19 +163,27 @@ impl TextToSpeech for Live {
         if model.is_empty() {
             return Err("модель синтеза речи не задана".into());
         }
+        let base = self.base(&voice.speech_base_url);
+        let name = voice.tts_voice.trim();
+        let sound_key = SoundKey {
+            base_url: &base,
+            model: &model,
+            voice: name,
+            text,
+        };
+        let cache = self.speech_cache().filter(|_| voice.tts_cache);
+        if let Some(sound) = cache.and_then(|c| c.get(&sound_key)) {
+            return Ok(sound);
+        }
         let key = self.key(SPEECH_SECRET_KEY);
         let hide = |text: String| redact(&text, key.as_ref());
         let mut body = json!({ "model": model, "input": text });
-        let name = voice.tts_voice.trim();
         if !name.is_empty() {
             body["voice"] = json!(name);
         }
         let mut req = self
             .http()
-            .post(format!(
-                "{}/audio/speech",
-                self.base(&voice.speech_base_url)
-            ))
+            .post(format!("{base}/audio/speech"))
             .timeout(SPEECH_TIMEOUT)
             .json(&body);
         if let Some(k) = &key {
@@ -153,6 +194,12 @@ impl TextToSpeech for Live {
             .await
             .map_err(|e| hide(format!("нет связи с синтезом речи: {}", e.without_url())))?;
         let status = resp.status();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let bytes = resp
             .bytes()
             .await
@@ -167,18 +214,36 @@ impl TextToSpeech for Live {
         if bytes.is_empty() {
             return Err("синтез речи вернул пустой звук".into());
         }
-        // The content type cannot be trusted: RouterAI labels a WAV file as audio/pcm.
-        Ok(if has_audio_header(&bytes) {
-            bytes.to_vec()
-        } else {
-            wav_from_pcm(&bytes, RAW_PCM_RATE)
-        })
+        let sound = playable(&bytes, &content_type);
+        if let Some(c) = cache {
+            c.put(&sound_key, &sound);
+        }
+        Ok(sound)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_sound_gets_the_rate_its_answer_names() {
+        assert_eq!(pcm_rate("audio/pcm; rate=44100; channels=1"), Some(44_100));
+        assert_eq!(pcm_rate("audio/pcm;rate=24000"), Some(24_000));
+        assert_eq!(pcm_rate("audio/pcm"), None);
+        assert_eq!(pcm_rate("audio/pcm; rate=abc"), None);
+        let rate = |wav: &[u8]| u32::from_le_bytes(wav[24..28].try_into().unwrap());
+        // Fish Audio: raw samples at 44.1 kHz, the first one -1 (0xFFFF).
+        let fish = playable(&[0xFF, 0xFF, 1, 0], "audio/pcm; rate=44100; channels=1");
+        assert_eq!(&fish[..4], b"RIFF");
+        assert_eq!(rate(&fish), 44_100);
+        // RouterAI calls a WAV file audio/pcm: it is kept as it is.
+        let wav = wav_from_pcm(&[1, 0], 24_000);
+        assert_eq!(playable(&wav, "audio/pcm"), wav);
+        assert_eq!(rate(&playable(&[1, 0, 2, 0], "audio/pcm")), 24_000);
+        let mp3 = [0xFF, 0xFB, 0x90, 0x00];
+        assert_eq!(playable(&mp3, "audio/mpeg"), mp3);
+    }
 
     #[test]
     fn known_sound_files_are_recognised_by_their_first_bytes() {

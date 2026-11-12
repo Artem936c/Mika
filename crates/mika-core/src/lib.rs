@@ -14,6 +14,7 @@ pub mod policy;
 pub mod schedule;
 pub mod secrets;
 pub mod session;
+pub mod speech_cache;
 pub mod state;
 pub mod storage;
 pub mod task;
