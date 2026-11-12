@@ -19,6 +19,8 @@ use crate::sys::{Browser, Page};
 const START_WAIT: Duration = Duration::from_secs(15);
 const LOAD_WAIT: Duration = Duration::from_secs(20);
 const CALL_WAIT: Duration = Duration::from_secs(30);
+/// A script on a page that is busy or leaving answers in seconds or never.
+const EVAL_WAIT: Duration = Duration::from_secs(10);
 
 /// Collects the page: address, title, visible text and numbered elements. Elements get
 /// a `data-mika-n` attribute so a later click finds the same one. Password values are
@@ -124,6 +126,15 @@ impl Conn {
     }
 
     async fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.call_within(method, params, CALL_WAIT).await
+    }
+
+    async fn call_within(
+        &mut self,
+        method: &str,
+        params: Value,
+        wait: Duration,
+    ) -> Result<Value, String> {
         self.id += 1;
         let id = self.id;
         let msg = json!({ "id": id, "method": method, "params": params }).to_string();
@@ -131,7 +142,7 @@ impl Conn {
             .send(Message::Text(msg.into()))
             .await
             .map_err(|e| format!("браузер закрыл связь: {e}"))?;
-        let deadline = Instant::now() + CALL_WAIT;
+        let deadline = Instant::now() + wait;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let next = tokio::time::timeout(left, self.ws.next())
@@ -161,9 +172,10 @@ impl Conn {
 
     async fn eval(&mut self, expr: &str) -> Result<Value, String> {
         let r = self
-            .call(
+            .call_within(
                 "Runtime.evaluate",
                 json!({ "expression": expr, "returnByValue": true, "awaitPromise": true }),
+                EVAL_WAIT,
             )
             .await?;
         if let Some(ex) = r.get("exceptionDetails") {
@@ -293,20 +305,26 @@ impl CdpBrowser {
         let exe = browser_exe().ok_or("не нашла Edge или Chrome на этом компьютере")?;
         std::fs::create_dir_all(&self.profile).map_err(|e| e.to_string())?;
         let _ = std::fs::remove_file(self.profile.join("DevToolsActivePort"));
-        let mut cmd = std::process::Command::new(&exe);
+        let mut args = vec![
+            "--remote-debugging-port=0".to_string(),
+            "--remote-allow-origins=http://127.0.0.1".to_string(),
+            format!("--user-data-dir=\"{}\"", self.profile.display()),
+            "--no-first-run".to_string(),
+            "--no-default-browser-check".to_string(),
+            "--disable-features=msEdgeSidebarV2".to_string(),
+            // Sites hide their search box in a narrow window (Wikipedia
+            // does below 1000 px): a desktop width keeps it on the page.
+            "--window-size=1280,900".to_string(),
+        ];
         if self.headless {
-            cmd.arg("--headless=new");
+            args.insert(0, "--headless=new".to_string());
         }
-        cmd.arg("--remote-debugging-port=0")
-            .arg("--remote-allow-origins=http://127.0.0.1")
-            .arg(format!("--user-data-dir={}", self.profile.display()))
-            .args([
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-features=msEdgeSidebarV2",
-                "about:blank",
-            ])
-            .spawn()
+        args.push("about:blank".to_string());
+        // Through the shell, not CreateProcess with inherited handles: the
+        // browser outlives the turn and must not hold Mika's pipes open.
+        use crate::sys::Launcher;
+        super::launcher::ShellLauncher
+            .open(&exe.display().to_string(), Some(&args.join(" ")))
             .map_err(|e| format!("не смогла запустить браузер: {e}"))?;
         log::info!("browser started: {}", exe.display());
         Ok(())
@@ -503,16 +521,26 @@ impl Browser for CdpBrowser {
         let focused = c
             .eval(&find_js(
                 n,
-                "el.focus(); if (typeof el.select === 'function') el.select(); \
+                "const t = (el.getAttribute('type') || 'text').toLowerCase(); \
+                 const typing = el.isContentEditable || el.tagName === 'TEXTAREA' || (el.tagName === 'INPUT' && \
+                   ['text','search','email','url','tel','number','password',''].includes(t)); \
+                 if (!typing) return 'not-a-field'; \
+                 el.focus(); if (typeof el.select === 'function') el.select(); \
                  else if (el.isContentEditable) document.execCommand('selectAll'); \
                  return document.activeElement === el || el.contains(document.activeElement);",
             ))
             .await?;
+        if focused.as_str() == Some("not-a-field") {
+            return Err(format!(
+                "элемент {n} не поле для текста (флажок, кнопка или ссылка): возьми из browser_read номер с видом «поле»"
+            ));
+        }
         if focused != Value::Bool(true) {
             return Err(format!(
                 "поле {n} не нашлось или не принимает ввод: прочитай страницу заново"
             ));
         }
+        let before = c.eval("location.href").await.unwrap_or(Value::Null);
         c.call("Input.insertText", json!({ "text": text })).await?;
         if submit {
             for kind in ["keyDown", "keyUp"] {
@@ -526,16 +554,34 @@ impl Browser for CdpBrowser {
                 )
                 .await?;
             }
+            // A search box that waits for its own suggestions ignores Enter:
+            // when the page stayed, its form is sent the way a button would.
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let now = c.eval("location.href").await.unwrap_or(Value::Null);
+            if now == before {
+                let _ = c
+                    .eval(&find_js(
+                        n,
+                        "const f = el.form; if (!f) return false; \
+                         if (typeof f.requestSubmit === 'function') f.requestSubmit(); else f.submit(); \
+                         return true;",
+                    ))
+                    .await;
+            }
         }
         c.settle().await;
         Ok(self.keep(c.snapshot().await?))
     }
 
     async fn scroll(&self, down: bool) -> Result<Page, String> {
-        let mut c = self.conn().await?;
         let dir = if down { 1 } else { -1 };
-        c.eval(&format!("window.scrollBy(0, {dir} * innerHeight * 0.8)"))
-            .await?;
+        let script = format!("window.scrollBy(0, {dir} * innerHeight * 0.8)");
+        // A page that was leaving may not answer: one more try on a fresh connection.
+        let mut c = self.conn().await?;
+        if c.eval(&script).await.is_err() {
+            c = self.conn().await?;
+            c.eval(&script).await?;
+        }
         tokio::time::sleep(Duration::from_millis(400)).await;
         Ok(self.keep(c.snapshot().await?))
     }
@@ -585,6 +631,19 @@ mod tests {
         assert_eq!(opened.url, "about:blank", "moved to the new tab");
         let back = b.read(None, Duration::ZERO).await.unwrap();
         assert_eq!(back.url, "about:blank");
+        // A search box that swallows Enter still sends its form; a flag is no field.
+        let search = b
+            .open(
+                "data:text/html;charset=utf-8,<title>Поиск</title><input type=checkbox id=c>\
+<form action=\"about:blank\"><input name=s onkeydown=\"if(event.key==='Enter')event.preventDefault()\"></form>",
+            )
+            .await
+            .unwrap();
+        let flag = search.items.iter().find(|i| i.kind == "флажок").unwrap().n;
+        assert!(b.type_into(flag, "Пермь", true).await.is_err());
+        let field = search.items.iter().find(|i| i.kind == "поле").unwrap().n;
+        let sent = b.type_into(field, "Пермь", true).await.unwrap();
+        assert!(sent.url.starts_with("about:blank?s="), "{}", sent.url);
         let login = b
             .open("data:text/html,<title>x</title><input type=password value=secret>")
             .await

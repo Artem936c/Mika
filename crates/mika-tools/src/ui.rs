@@ -48,6 +48,29 @@ const RESEND_GUARD: std::time::Duration = std::time::Duration::from_secs(90);
 /// buttons and lists but not the text of messages.
 const SELF_DRAWN: [&str; 4] = ["telegram", "ayugram", "kotatogram", "discord"];
 
+/// Messengers, by the start of their executable name. Enter there sends a
+/// message: the input is cleared first and the same text is not sent twice.
+/// Elsewhere (Notepad, Word) Ctrl+A would select the whole document.
+const CHAT_APPS: [&str; 12] = [
+    "telegram",
+    "ayugram",
+    "kotatogram",
+    "discord",
+    "whatsapp",
+    "viber",
+    "slack",
+    "teams",
+    "ms-teams",
+    "skype",
+    "signal",
+    "element",
+];
+
+fn is_chat(process: &str) -> bool {
+    let p = process.to_lowercase();
+    CHAT_APPS.iter().any(|c| p.starts_with(c))
+}
+
 /// Shared parts of the window tools.
 #[derive(Clone)]
 pub struct UiEnv {
@@ -265,6 +288,9 @@ fn node_line(node: &UiNode) -> String {
     }
     if !node.value.is_empty() {
         line.push_str(&format!(" = {}", truncate(&node.value, 120)));
+    } else if node.role == "ComboBox" {
+        // WinUI lists (Settings → Scale) show their choice only when open.
+        line.push_str(" (выбор виден, если раскрыть: ui_click по нему, потом ui_keys esc)");
     }
     if !node.enabled {
         line.push_str(" (недоступен)");
@@ -466,16 +492,41 @@ fn names_arg(args: &Value) -> Option<Vec<String>> {
 
 fn spot(args: &Value) -> Result<Spot, ToolError> {
     let point = (arg_u64(args, "x"), arg_u64(args, "y"));
+    // Small models pass a number and a label together: the number wins, then
+    // the labels, then the point.
     match (node_arg(args), point, names_arg(args)) {
-        (Some(n), (None, None), None) => Ok(Spot::Node(n)),
+        (Some(n), _, _) => Ok(Spot::Node(n)),
+        (None, _, Some(names)) if names.len() <= MAX_SEQUENCE => Ok(Spot::Names(names)),
         (None, (Some(x), Some(y)), None) => Ok(Spot::Point(x as i32, y as i32)),
-        (None, (None, None), Some(names)) if names.len() <= MAX_SEQUENCE => Ok(Spot::Names(names)),
-        (None, (None, None), Some(_)) => Err(ToolError::BadArguments(format!(
+        (None, _, Some(_)) => Err(ToolError::BadArguments(format!(
             "не больше {MAX_SEQUENCE} нажатий за раз"
         ))),
         _ => Err(ToolError::BadArguments(
             "укажи одно: n (номер из ui_read), name или names (подписи элементов) или x и y (точка в окне)".into(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod spot_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_number_wins_over_a_label_and_a_label_over_a_point() {
+        assert!(matches!(
+            spot(&json!({"n": "17", "name": "Выход"})),
+            Ok(Spot::Node(17))
+        ));
+        assert!(matches!(
+            spot(&json!({"name": "Выход", "x": 1, "y": 2})),
+            Ok(Spot::Names(_))
+        ));
+        assert!(matches!(
+            spot(&json!({"x": 1, "y": 2})),
+            Ok(Spot::Point(1, 2))
+        ));
+        assert!(spot(&json!({"window": "блокнот"})).is_err());
     }
 }
 
@@ -627,13 +678,13 @@ impl Tool for UiTypeTool {
     fn spec(&self) -> ToolSpec {
         spec(
             "ui_type",
-            "Ввести текст в окно программы. С n — в поле с этим номером из ui_read (старый текст поля заменяется). Без n — печатает туда, где стоит курсор. enter=true нажмёт Enter после текста; так отправляют сообщение в чате, и тогда поле сначала очищается. Отправленное сообщение не повторяй: тот же текст в то же окно второй раз не уйдёт.",
+            "Ввести текст в окно программы. С n — в поле с этим номером из ui_read (старый текст поля заменяется). Без n — печатает туда, где стоит курсор. enter=true нажмёт Enter после текста. В мессенджерах (Telegram, WhatsApp, Discord…) так отправляют сообщение: поле сначала очищается, а тот же текст второй раз не уйдёт, так что отправленное не повторяй.",
             props(
                 &[
                     ("text", json!({ "type": "string", "description": "Текст" })),
                     ("n", json!({ "type": "integer", "description": "Номер поля из ui_read" })),
                     ("enter", json!({ "type": "boolean", "description": "Нажать Enter после ввода" })),
-                    ("clear", json!({ "type": "boolean", "description": "Очистить поле перед вводом (ctrl+a, delete). По умолчанию — при enter без n" })),
+                    ("clear", json!({ "type": "boolean", "description": "Очистить поле перед вводом (ctrl+a, delete). По умолчанию — только в мессенджере при enter без n" })),
                     ("again", json!({ "type": "boolean", "description": "Отправить тот же текст ещё раз, только если пользователь прямо попросил повторить" })),
                 ],
                 &["text"],
@@ -662,7 +713,8 @@ impl Tool for UiTypeTool {
         let text = arg_str(&args, "text")?.to_string();
         let id = w.id;
         let enter = arg_bool(&args, "enter");
-        if enter && !arg_bool(&args, "again") {
+        let chat = enter && is_chat(&w.process);
+        if chat && !arg_bool(&args, "again") {
             if let Some((sent_to, sent_text, at)) = env.sent.lock().clone() {
                 if sent_to == id && sent_text == text && at.elapsed() < RESEND_GUARD {
                     return Err(failed(format!(
@@ -676,7 +728,7 @@ impl Tool for UiTypeTool {
         let clear = args
             .get("clear")
             .and_then(Value::as_bool)
-            .unwrap_or(enter && node_arg(&args).is_none());
+            .unwrap_or(chat && node_arg(&args).is_none());
         let before = env.foreign_windows();
         let mut typed_by_pattern = false;
         if let Some(n) = node_arg(&args) {
@@ -1162,7 +1214,8 @@ mod tests {
         assert_eq!(f.clicks.lock()[1], (105, 206, MouseButton::Right, false));
         assert!(run(&tool, json!({"x": 500, "y": 6})).await.is_err());
         assert!(tool.assess(&json!({})).is_err());
-        assert!(tool.assess(&json!({"n": 1, "x": 1, "y": 1})).is_err());
+        // A number with a point: the number wins.
+        assert!(tool.assess(&json!({"n": 1, "x": 1, "y": 1})).is_ok());
     }
 
     #[tokio::test]
@@ -1187,10 +1240,14 @@ mod tests {
     async fn a_chat_message_clears_the_field_pastes_emoji_and_is_sent_once() {
         let (e, f) = ui_env();
         let tool = UiTypeTool(e.clone());
+        f.windows.lock().push(WindowInfo {
+            id: 9,
+            title: "Telegram".into(),
+            process: "Telegram.exe".into(),
+        });
         *f.clipboard.lock() = "мой буфер".into();
-        run(&tool, json!({"text": "Как дела? 😊", "enter": true}))
-            .await
-            .unwrap();
+        let msg = json!({"window": "telegram", "text": "Как дела? 😊", "enter": true});
+        run(&tool, msg.clone()).await.unwrap();
         assert_eq!(
             *f.chords.lock(),
             vec![
@@ -1203,19 +1260,28 @@ mod tests {
         assert!(f.typed.lock().is_empty(), "emoji text is pasted");
         assert_eq!(*f.clipboard.lock(), "мой буфер");
         // The same message again is refused, unless asked for.
-        let again = run(&tool, json!({"text": "Как дела? 😊", "enter": true})).await;
-        assert!(again.is_err());
-        run(
-            &tool,
-            json!({"text": "Как дела? 😊", "enter": true, "again": true}),
-        )
-        .await
-        .unwrap();
+        assert!(run(&tool, msg.clone()).await.is_err());
+        let mut again = msg;
+        again["again"] = json!(true);
+        run(&tool, again).await.unwrap();
         // Plain text without Enter is typed where the caret is, nothing cleared.
         f.chords.lock().clear();
-        run(&tool, json!({"text": "привет"})).await.unwrap();
+        run(&tool, json!({"window": "telegram", "text": "привет"}))
+            .await
+            .unwrap();
         assert!(f.chords.lock().is_empty());
         assert_eq!(f.typed.lock().last().unwrap(), "привет");
+        // Enter in Notepad is a new line: the document is not selected and wiped,
+        // and the same line may be typed twice.
+        for _ in 0..2 {
+            run(
+                &tool,
+                json!({"window": "блокнот", "text": "строка", "enter": true}),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(f.chords.lock().iter().all(|c| c == &vec![VK_RETURN]));
     }
 
     #[tokio::test]

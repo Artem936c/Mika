@@ -284,7 +284,26 @@ fn value_of(e: &IUIAutomationElement) -> String {
         }
         if let Ok(v) = e.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) {
             if let Ok(text) = v.CurrentValue() {
-                return text.to_string();
+                if !text.is_empty() {
+                    return text.to_string();
+                }
+            }
+        }
+        // A drop-down list of WinUI (Settings → Scale) has no value: its
+        // choice is the selected item, named «100% (рекомендуется)».
+        if let Ok(s) =
+            e.GetCurrentPatternAs::<IUIAutomationSelectionPattern>(UIA_SelectionPatternId)
+        {
+            if let Ok(chosen) = s.GetCurrentSelection() {
+                let names: Vec<String> = (0..chosen.Length().unwrap_or(0))
+                    .filter_map(|i| chosen.GetElement(i).ok())
+                    .filter_map(|el| el.CurrentName().ok())
+                    .map(|n| n.to_string())
+                    .filter(|n| !n.is_empty())
+                    .collect();
+                if !names.is_empty() {
+                    return names.join(", ");
+                }
             }
         }
         if let Ok(t) = e.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId) {
@@ -366,6 +385,9 @@ fn read_tree(
     }
 }
 
+/// Presses the element through its pattern. A pattern that refuses (a menu
+/// that closed under it: «An event was unable to invoke any of the
+/// subscribers») gives `None`, and the caller clicks with the mouse instead.
 fn invoke(e: &IUIAutomationElement) -> Result<Option<&'static str>, String> {
     // SAFETY: plain COM calls on a live element.
     unsafe {
@@ -373,18 +395,24 @@ fn invoke(e: &IUIAutomationElement) -> Result<Option<&'static str>, String> {
             return Err("элемент недоступен: программа его отключила".into());
         }
         if let Ok(p) = e.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId) {
-            p.Invoke().map_err(err)?;
-            return Ok(Some("Нажала"));
+            if p.Invoke().is_ok() {
+                return Ok(Some("Нажала"));
+            }
+            return Ok(None);
         }
         if let Ok(p) = e.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId) {
-            p.Toggle().map_err(err)?;
-            return Ok(Some("Переключила"));
+            if p.Toggle().is_ok() {
+                return Ok(Some("Переключила"));
+            }
+            return Ok(None);
         }
         if let Ok(p) =
             e.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
         {
-            p.Select().map_err(err)?;
-            return Ok(Some("Выбрала"));
+            if p.Select().is_ok() {
+                return Ok(Some("Выбрала"));
+            }
+            return Ok(None);
         }
         if let Ok(p) =
             e.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(UIA_ExpandCollapsePatternId)
@@ -393,11 +421,9 @@ fn invoke(e: &IUIAutomationElement) -> Result<Option<&'static str>, String> {
                 .CurrentExpandCollapseState()
                 .is_ok_and(|s| s == ExpandCollapseState_Expanded);
             if open {
-                p.Collapse().map_err(err)?;
-                return Ok(Some("Свернула"));
+                return Ok(p.Collapse().is_ok().then_some("Свернула"));
             }
-            p.Expand().map_err(err)?;
-            return Ok(Some("Раскрыла"));
+            return Ok(p.Expand().is_ok().then_some("Раскрыла"));
         }
     }
     Ok(None)

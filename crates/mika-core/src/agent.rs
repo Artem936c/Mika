@@ -101,7 +101,15 @@ const MAX_TAG: usize = 16;
 
 /// Reasoning that some models write into the reply text, as (open, close) markers:
 /// Gemma's thought channel and the `<think>` tags of Qwen and DeepSeek.
-const THOUGHT_MARKERS: &[(&str, &str)] = &[("<|channel>", "<channel|>"), ("<think>", "</think>")];
+/// Blocks that never reach the user: thoughts, and Gemma's own tool-call and
+/// tool-result tokens when it writes them into the text instead of the
+/// tool channel (`<|tool_call>[]`).
+const THOUGHT_MARKERS: &[(&str, &str)] = &[
+    ("<|channel>", "<channel|>"),
+    ("<think>", "</think>"),
+    ("<|tool_call>", "<tool_call|>"),
+    ("<|tool_response>", "<tool_response|>"),
+];
 
 /// Cuts reasoning blocks out of streamed text. A marker may arrive split across
 /// chunks, so a tail that could start one is held back.
@@ -509,14 +517,14 @@ impl Agent {
     ) -> Result<String, AgentError> {
         let mut step = 0;
         let mut nudges = 0;
-        let mut used_tools = false;
         while step < self.step_limit() {
             let (text, calls) = self.one_step(msgs, cancel, step == 0).await?;
             step += 1;
             if calls.is_empty() {
                 // Small models end a turn in silence after tools, or promise
                 // «подожди секунду» and stop: remind them to act or to report.
-                let stalled = (used_tools && text.trim().is_empty()) || promises_action(&text);
+                // An empty reply is never an answer, with or without tools before it.
+                let stalled = text.trim().is_empty() || promises_action(&text);
                 if stalled && nudges < MAX_NUDGES {
                     nudges += 1;
                     if !text.is_empty() {
@@ -548,7 +556,6 @@ impl Agent {
                 msgs.push(ChatMessage::assistant(text.clone()));
                 return Ok(text);
             }
-            used_tools = true;
             msgs.push(ChatMessage::assistant_with_calls(text, calls.clone()));
             for call in calls {
                 let result = self.execute(&call, cancel).await;
@@ -1274,8 +1281,9 @@ mod tests {
             "Сейчас  готово"
         );
         assert_eq!(thoughts(&["<think>план</think>Привет"]), "Привет");
+        assert_eq!(thoughts(&["<|channel>thought и обрыв"]), "");
         assert_eq!(
-            thoughts(&["<|channel>thought и обрыв"]),
+            thoughts(&["<|tool_call>[]"]),
             "",
             "an unclosed block is dropped"
         );

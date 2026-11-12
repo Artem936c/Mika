@@ -281,7 +281,25 @@ impl Tool for OpenAppTool {
 }
 
 /// How well a window matches a title part or a program name; 0 is no match.
+/// Names a user says for windows that are titled otherwise.
+const TITLE_SYNONYMS: &[(&str, &str)] = &[
+    ("параметры", "настройки"),
+    ("параметры windows", "настройки"),
+    ("settings", "настройки"),
+];
+
 pub(crate) fn score(w: &WindowInfo, query: &str) -> u8 {
+    let q = query.trim().to_lowercase();
+    if let Some((_, title)) = TITLE_SYNONYMS.iter().find(|(said, _)| *said == q) {
+        let s = score_plain(w, title);
+        if s > 0 {
+            return s;
+        }
+    }
+    score_plain(w, &q)
+}
+
+fn score_plain(w: &WindowInfo, query: &str) -> u8 {
     let q = query.trim().to_lowercase();
     let q_exe = if q.ends_with(".exe") {
         q.clone()
@@ -296,7 +314,21 @@ pub(crate) fn score(w: &WindowInfo, query: &str) -> u8 {
     } else if w.process.contains(&q) {
         1
     } else {
-        0
+        // «Блокнот*» for «*Безымянный – Блокнот»: every word of the query is
+        // in the title or the program name; a star asks for unsaved changes.
+        let words: Vec<&str> = q
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        let all = !words.is_empty()
+            && words
+                .iter()
+                .all(|wd| title.contains(wd) || w.process.contains(wd));
+        match (all, q.contains('*') && title.starts_with('*')) {
+            (true, true) => 2,
+            (true, false) => 1,
+            _ => 0,
+        }
     }
 }
 
@@ -616,5 +648,19 @@ mod tests {
         assert!(run(&FocusWindowTool(e.windows), json!({"query": "word"}))
             .await
             .is_err());
+    }
+
+    #[test]
+    fn a_window_is_found_by_words_and_a_star_means_unsaved() {
+        let w = |title: &str| WindowInfo {
+            id: 1,
+            title: title.into(),
+            process: "notepad.exe".into(),
+        };
+        assert_eq!(score(&w("*Безымянный – Блокнот"), "Блокнот*"), 2);
+        assert_eq!(score(&w("Безымянный – Блокнот"), "Блокнот*"), 1);
+        assert_eq!(score(&w("Безымянный – Блокнот"), "безымянный блокнот"), 1);
+        assert_eq!(score(&w("Безымянный – Блокнот"), "калькулятор"), 0);
+        assert_eq!(score(&w("Настройки"), "Параметры"), 3);
     }
 }
