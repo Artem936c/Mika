@@ -6,10 +6,13 @@
   let {
     shape,
     tone = 'none',
+    movable = true,
     onclick,
     children,
   }: {
     shape: IslandShape;
+    /** The whole island moves only while folded; an open panel moves by its top bar. */
+    movable?: boolean;
     /** `glow`: listening or thinking. `warn`: a question is open. `danger`: the question is about a high-risk action. */
     tone?: 'none' | 'glow' | 'warn' | 'danger';
     onclick?: (e: MouseEvent) => void;
@@ -25,7 +28,7 @@
   style:height="{shape.height}px"
   style:border-radius="{shape.radius}px"
   {onclick}
-  use:dragRegion={{ threshold: true }}
+  use:dragRegion={{ threshold: true, disabled: !movable }}
 >
   <div class="ring"></div>
   <div class="island">
@@ -98,7 +101,8 @@
     position: absolute;
     inset: 0;
     border-radius: inherit;
-    overflow: hidden;
+    /* clip, not hidden: focus or scrollIntoView must never scroll the island itself. */
+    overflow: clip;
     background: var(--island);
     border: 1px solid rgba(255, 255, 255, 0.1);
   }

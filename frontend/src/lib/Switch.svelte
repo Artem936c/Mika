@@ -15,6 +15,7 @@
 
 <style>
   .switch {
+    position: relative;
     display: flex;
     gap: 14px;
     align-items: flex-start;
@@ -24,8 +25,14 @@
     background: rgba(255, 255, 255, 0.03);
     cursor: pointer;
   }
+  /* The hidden box sits inside the switch: when a click focuses it, nothing has to
+     scroll into view (an outer box with hidden overflow would shift the whole panel). */
   input {
     position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
     opacity: 0;
     pointer-events: none;
   }

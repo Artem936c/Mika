@@ -116,6 +116,7 @@ fn main() {
             bridge::set_island_rect,
             bridge::send_message,
             bridge::stop,
+            bridge::poke_avatar,
             bridge::get_history,
             bridge::clear_history,
             bridge::get_llm_settings,

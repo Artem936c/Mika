@@ -52,11 +52,26 @@ pub fn init_logging() {
 /// Holds the named mutex for the life of the process.
 pub struct InstanceGuard(#[allow(dead_code)] isize);
 
+/// Name of the single-instance mutex. A separate data folder (`MIKA_DATA_DIR`, used
+/// for test profiles) is a separate assistant and gets its own name.
+pub fn instance_name(data_dir: Option<&str>) -> String {
+    match data_dir.filter(|d| !d.is_empty()) {
+        Some(dir) => {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            dir.to_lowercase().hash(&mut h);
+            format!("Local\\MikaAssistantSingleInstance-{:016x}", h.finish())
+        }
+        None => "Local\\MikaAssistantSingleInstance".into(),
+    }
+}
+
 /// `None` when another copy is already running.
 pub fn single_instance() -> Option<InstanceGuard> {
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
     use windows_sys::Win32::System::Threading::CreateMutexW;
-    let name: Vec<u16> = "Local\\MikaAssistantSingleInstance\0"
+    let dir = std::env::var("MIKA_DATA_DIR").ok();
+    let name: Vec<u16> = format!("{}\0", instance_name(dir.as_deref()))
         .encode_utf16()
         .collect();
     // SAFETY: valid zero-terminated name; the handle lives until the process exits.
@@ -148,6 +163,16 @@ pub fn wipe_all_data(secrets: &dyn SecretStore) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_profiles_get_their_own_instance() {
+        let main = instance_name(None);
+        assert_eq!(main, instance_name(Some("")));
+        let a = instance_name(Some(r"C:\tmp\a"));
+        assert_ne!(a, main);
+        assert_eq!(a, instance_name(Some(r"C:\TMP\A")));
+        assert_ne!(a, instance_name(Some(r"C:\tmp\b")));
+    }
 
     #[test]
     fn wipe_never_touches_the_install_folder() {

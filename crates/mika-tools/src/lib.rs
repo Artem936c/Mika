@@ -216,6 +216,7 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
         reg.register(Arc::new(browser::BrowserClickTool(env.browser.clone())));
         reg.register(Arc::new(browser::BrowserTypeTool(env.browser.clone())));
         reg.register(Arc::new(browser::BrowserScrollTool(env.browser.clone())));
+        reg.register(Arc::new(browser::BrowserBackTool(env.browser.clone())));
     }
 
     if on("shell") {
@@ -333,7 +334,7 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register_all(&mut reg, &env, &[]);
         let specs = reg.specs();
-        assert_eq!(specs.len(), 69);
+        assert_eq!(specs.len(), 70);
         for s in specs {
             assert_eq!(s.parameters["type"], "object", "{}", s.name);
             assert!(!s.description.is_empty());

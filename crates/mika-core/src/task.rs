@@ -16,6 +16,8 @@ use crate::tools::{arg_str, spec, Assessment, RiskLevel, Tool, ToolError, ToolOu
 
 /// Most steps in one plan.
 pub const MAX_PLAN_STEPS: usize = 20;
+/// Longest step text kept.
+const MAX_STEP_CHARS: usize = 100;
 /// LLM calls per message while a task has a plan. Without a plan the limit is `agent::MAX_STEPS`.
 pub const TASK_MAX_STEPS: usize = 40;
 
@@ -116,7 +118,16 @@ impl TaskBoard {
     pub fn plan(&self, title: &str, steps: Vec<String>) -> Result<Task, String> {
         let steps: Vec<String> = steps
             .into_iter()
-            .map(|s| s.trim().to_string())
+            // The panel shows one line per step.
+            .map(|s| {
+                let s = s.trim();
+                if s.chars().count() > MAX_STEP_CHARS {
+                    let cut: String = s.chars().take(MAX_STEP_CHARS - 1).collect();
+                    format!("{}…", cut.trim_end())
+                } else {
+                    s.to_string()
+                }
+            })
             .filter(|s| !s.is_empty())
             .collect();
         if steps.is_empty() {
@@ -241,6 +252,7 @@ pub fn render(task: &Task) -> String {
 
 /// Text for the system prompt: when and how to plan.
 pub const TASK_RULES: &str = "Задачу больше чем из трёх действий сначала разбей на шаги инструментом task_plan. \
+Шаги пиши по-русски короткими фразами для человека, без путей и названий инструментов. \
 Перед шагом отметь его task_step со статусом active, после — done или failed с короткой заметкой. \
 После каждого действия проверь результат (ui_read, browser_read, screen_look, list_folder) и только потом отмечай done. \
 Если шаг не получился два раза подряд, остановись и спроси пользователя, как быть. \
@@ -253,7 +265,7 @@ impl Tool for TaskPlanTool {
     fn spec(&self) -> ToolSpec {
         spec(
             "task_plan",
-            "Составить план задачи из нескольких шагов. Пользователь видит план и ход выполнения. Новый вызов заменяет план.",
+            "Составить план задачи из нескольких шагов. Пользователь видит план и ход выполнения. Шаги — короткие фразы для человека, например «Посмотреть, что в Загрузках», без путей и названий инструментов. Новый вызов заменяет план.",
             json!({
                 "type": "object",
                 "properties": {
@@ -423,6 +435,9 @@ mod tests {
         assert!(b.mark(3, StepStatus::Done, "").is_err());
         assert!(b.mark(0, StepStatus::Done, "").is_err());
         assert!(b.plan("t", vec![]).is_err());
+        let long = b.plan("t", vec!["ш".repeat(300)]).unwrap();
+        assert_eq!(long.steps[0].text.chars().count(), MAX_STEP_CHARS);
+        assert!(long.steps[0].text.ends_with('…'));
         assert!(b.plan("t", vec!["x".into(); MAX_PLAN_STEPS + 1]).is_err());
     }
 

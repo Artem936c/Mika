@@ -66,7 +66,14 @@ impl Browser for Fake {
         self.0.browser_log.lock().push(format!("open {url}"));
         self.0.page.lock().clone().ok_or("no page".into())
     }
-    async fn read(&self) -> Result<Page, String> {
+    async fn read(&self, wait_for: Option<&str>, _wait: Duration) -> Result<Page, String> {
+        if let Some(w) = wait_for {
+            self.0.browser_log.lock().push(format!("wait {w}"));
+        }
+        self.0.page.lock().clone().ok_or("no page".into())
+    }
+    async fn back(&self) -> Result<Page, String> {
+        self.0.browser_log.lock().push("back".into());
         self.0.page.lock().clone().ok_or("no page".into())
     }
     async fn click(&self, n: u32) -> Result<Page, String> {

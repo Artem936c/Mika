@@ -63,8 +63,8 @@
 </script>
 
 <div class="wel">
-  <aside class="side" use:dragRegion>
-    <div class="who"><Avatar view="head" emotion="joy" size={56} /></div>
+  <aside class="side">
+    <div class="who" use:dragRegion><Avatar view="head" emotion="joy" size={56} /></div>
     <b>{t('welcome.hello', { name })}</b>
     <p>{t('welcome.lead')}</p>
     <ol>
@@ -75,11 +75,11 @@
 
   <section class="page">
     {#if step === 0}
-      <h3>{t('welcome.step_provider')}</h3>
+      <h3 use:dragRegion>{t('welcome.step_provider')}</h3>
       <p class="lead">{t('welcome.provider_lead')}</p>
       <Providers />
     {:else}
-      <h3>{t('welcome.step_privacy')}</h3>
+      <h3 use:dragRegion>{t('welcome.step_privacy')}</h3>
       <p class="lead">{t('welcome.privacy_lead')}</p>
       <div class="stack">
         <Switch checked={web} title={t('tools.web')} sub={t('tools.web_sub')} onchange={setWeb} />

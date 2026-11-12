@@ -39,6 +39,7 @@
     onwindowed,
     onnew,
     ontaskhide = () => {},
+    onpoke,
   }: {
     items: ChatItem[];
     status: AssistantState;
@@ -72,6 +73,8 @@
     onnew: () => void;
     /** Hide a finished task panel. */
     ontaskhide?: () => void;
+    /** A click on the avatar. */
+    onpoke?: () => void;
   } = $props();
 
   let draft = $state('');
@@ -117,9 +120,9 @@
 
 <div class="chat" class:wide style:--avatar-column="{AVATAR_COLUMN}px">
   {#if wide}
-    <div class="stagecol" use:dragRegion={{ ondouble: windowed ? toggleMaximize : undefined }}>
+    <div class="stagecol">
       <div class="halo"></div>
-      <div class="girlbox"><Avatar view="full" {emotion} talking={status === 'speaking'} /></div>
+      <div class="girlbox"><Avatar view="full" {emotion} talking={status === 'speaking'} {onpoke} /></div>
       <div class="plate">
         <b>{name}</b>
         <span><i class="live" class:busy></i>{t(stateLabel(status)).toLowerCase()}</span>
@@ -267,7 +270,7 @@
   /* ---- avatar column ---- */
   .stagecol {
     position: relative;
-    overflow: hidden;
+    overflow: clip;
     border-right: 1px solid var(--line);
     background: linear-gradient(180deg, #151331, #0b0b16);
   }

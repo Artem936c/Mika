@@ -78,7 +78,7 @@
   .stage {
     position: absolute;
     inset: 0;
-    overflow: hidden;
+    overflow: clip;
     pointer-events: none;
   }
   .cmp {

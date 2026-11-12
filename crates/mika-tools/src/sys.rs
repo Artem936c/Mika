@@ -214,10 +214,14 @@ pub trait Browser: Send + Sync {
     /// Last page seen, for risk checks before an action.
     fn last(&self) -> Option<Page>;
     async fn open(&self, url: &str) -> Result<Page, String>;
-    async fn read(&self) -> Result<Page, String>;
+    /// With `wait_for`, waits up to `wait` until the page text contains it.
+    async fn read(&self, wait_for: Option<&str>, wait: Duration) -> Result<Page, String>;
+    /// A click that opens a new tab moves the browser to that tab.
     async fn click(&self, n: u32) -> Result<Page, String>;
+    /// For a drop-down list `text` names the option to choose.
     async fn type_into(&self, n: u32, text: &str, submit: bool) -> Result<Page, String>;
     async fn scroll(&self, down: bool) -> Result<Page, String>;
+    async fn back(&self) -> Result<Page, String>;
 }
 
 pub trait Trash: Send + Sync {

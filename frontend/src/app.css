@@ -28,7 +28,7 @@ body {
   margin: 0;
   height: 100%;
   background: transparent;
-  overflow: hidden;
+  overflow: clip;
   font: 500 13px/1.45 'Manrope Variable', 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
   color: var(--ink);
   -webkit-font-smoothing: antialiased;

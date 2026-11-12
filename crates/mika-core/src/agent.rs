@@ -93,6 +93,15 @@ pub fn system_prompt(assistant: &AssistantConfig) -> String {
 /// Longest text between `[` and `]` that can still be an emotion tag.
 const MAX_TAG: usize = 16;
 
+/// `🤔` or `😊😊`: a few emoji (symbols from U+2600 up, with their joiners), nothing else.
+fn is_emoji_tag(inner: &str) -> bool {
+    let n = inner.chars().count();
+    (1..=4).contains(&n)
+        && inner
+            .chars()
+            .all(|c| (c as u32 >= 0x2600 && !c.is_alphanumeric()) || c == '\u{200d}')
+}
+
 /// Cuts emotion tags like `[joy]` out of streamed reply text.
 ///
 /// A tag may arrive split across chunks, so text after `[` is held back until `]`
@@ -140,6 +149,8 @@ impl TagFilter {
                             cues.push(e);
                             self.skip_space = true;
                         }
+                        // Small models invent tags like `[🤔]`: an emoji in brackets is dropped.
+                        None if is_emoji_tag(&held[1..]) => self.skip_space = true,
                         None => {
                             self.emit(&mut out, &held);
                             self.emit(&mut out, "]");
@@ -577,9 +588,14 @@ impl Agent {
             }
         };
         self.state.set(AssistantState::Thinking);
-        let (ok, text, data) = match tool.run(args, approval, cancel.child_token()).await {
-            Ok(out) => (true, out.text, out.data),
-            Err(e) => (false, format!("Ошибка: {e}"), None),
+        // "Stop" ends the wait for any tool, even one that does not watch its token.
+        let run = tool.run(args, approval, cancel.child_token());
+        let (ok, text, data) = tokio::select! {
+            _ = cancel.cancelled() => (false, "Остановлено пользователем.".to_string(), None),
+            r = run => match r {
+                Ok(out) => (true, out.text, out.data),
+                Err(e) => (false, format!("Ошибка: {e}"), None),
+            },
         };
         self.finish(call, ok, &text, data, started);
         truncate(&text, MAX_TOOL_RESULT)
@@ -929,6 +945,64 @@ mod tests {
         assert!(t.finished && !t.ok, "step 2 never ran");
     }
 
+    /// A tool that never ends and ignores its token.
+    struct Stuck;
+
+    #[async_trait]
+    impl crate::tools::Tool for Stuck {
+        fn spec(&self) -> crate::llm::ToolSpec {
+            crate::tools::spec("stuck", "never ends", json!({"type": "object"}))
+        }
+        fn assess(&self, _: &Value) -> Result<crate::tools::Assessment, crate::tools::ToolError> {
+            Ok(crate::tools::Assessment::new(
+                crate::tools::RiskLevel::Low,
+                "s",
+                "t",
+                "r",
+            ))
+        }
+        async fn run(
+            &self,
+            _: Value,
+            _: crate::gate::Approval,
+            _: CancellationToken,
+        ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_ends_a_tool_that_ignores_its_token() {
+        let p = FakeProvider::new(vec![Some(vec![call("c1", "stuck", json!({}))])]);
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let state = StateHandle::new(bus.clone());
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(Stuck));
+        let a = Agent::new(
+            p,
+            Arc::new(reg),
+            Arc::new(LowRiskOnlyGate),
+            bus,
+            state.clone(),
+            "s".into(),
+        );
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            c2.cancel();
+        });
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), a.handle("x", cancel))
+            .await
+            .expect("stop must end the turn");
+        assert_eq!(r, Err(AgentError::Cancelled));
+        assert_eq!(state.get(), AssistantState::Idle);
+        assert!(drain(&mut rx).iter().any(
+            |e| matches!(e, Event::ToolFinished { ok: false, output, .. } if output.contains("Остановлено"))
+        ));
+    }
+
     #[tokio::test]
     async fn cancel_stops_stream_and_returns_to_idle() {
         let p = FakeProvider::new(vec![None]);
@@ -1047,9 +1121,17 @@ mod tests {
     }
 
     #[test]
+    fn tag_filter_drops_invented_emoji_tags() {
+        assert_eq!(filter(&["[🤔] Шаг 1"]), ("Шаг 1".into(), vec![]));
+        assert_eq!(filter(&["Готово [😊😊]!"]), ("Готово !".into(), vec![]));
+    }
+
+    #[test]
     fn tag_filter_keeps_ordinary_brackets() {
         for text in [
             "Смотри [1] и [файл.txt].",
+            "[ ] задача и [x] сделано",
+            "[—]",
             "массив[0] = [a, b]",
             "[[joy",
             "[очень длинный текст в скобках, не метка] дальше",

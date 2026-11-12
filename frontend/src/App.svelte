@@ -319,6 +319,7 @@
       task = null;
     }}
     ontaskhide={() => (task = null)}
+    onpoke={() => invoke('poke_avatar')}
     onspeak={setSpeak}
     onscreen={setScreen}
     onmic={setMic}
@@ -342,7 +343,7 @@
     <div class="edge {edge}" aria-hidden="true" onpointerdown={(e) => resizeFrom(edge, e)}></div>
   {/each}
 {:else}
-<Island {shape} {tone} onclick={onIslandClick}>
+<Island {shape} {tone} movable={view === 'island'} onclick={onIslandClick}>
   {#if view === 'welcome'}
     <div class="layer" style={size(shape)} in:layerIn out:layerOut>
       {@render welcomePanel()}
@@ -388,7 +389,7 @@
   .win {
     position: fixed;
     inset: 0;
-    overflow: hidden;
+    overflow: clip;
     border-radius: 14px;
     border: 1px solid var(--line2);
     background: var(--island);

@@ -28,11 +28,18 @@ function startDragging() {
  * click and only a press that travels becomes a drag (the folded island opens
  * on click). A double click calls `ondouble`, for example to maximise.
  */
-export function dragRegion(node: HTMLElement, options: { threshold?: boolean; ondouble?: () => void } = {}) {
+export interface DragOptions {
+  threshold?: boolean;
+  ondouble?: () => void;
+  /** The region stays still, for example an open panel inside the island. */
+  disabled?: boolean;
+}
+
+export function dragRegion(node: HTMLElement, options: DragOptions = {}) {
   let start: { x: number; y: number } | null = null;
 
   const down = (e: PointerEvent) => {
-    if (e.button !== 0 || onControl(e.target)) return;
+    if (options.disabled || e.button !== 0 || onControl(e.target)) return;
     if (options.threshold) {
       start = { x: e.clientX, y: e.clientY };
     } else {
@@ -51,7 +58,7 @@ export function dragRegion(node: HTMLElement, options: { threshold?: boolean; on
   };
   const up = () => (start = null);
   const dbl = (e: MouseEvent) => {
-    if (!onControl(e.target)) options.ondouble?.();
+    if (!options.disabled && !onControl(e.target)) options.ondouble?.();
   };
 
   node.addEventListener('pointerdown', down);
@@ -59,7 +66,7 @@ export function dragRegion(node: HTMLElement, options: { threshold?: boolean; on
   node.addEventListener('pointerup', up);
   node.addEventListener('dblclick', dbl);
   return {
-    update(next: { threshold?: boolean; ondouble?: () => void }) {
+    update(next: DragOptions) {
       options = next ?? {};
     },
     destroy() {

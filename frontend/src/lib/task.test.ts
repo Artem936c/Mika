@@ -25,6 +25,14 @@ describe('reduceTask', () => {
     expect(progress(t)).toEqual({ done: 1, total: 3 });
   });
 
+  it('skipped steps are not counted as done', () => {
+    const t = reduceTask(null, {
+      type: 'task_updated',
+      task: { title: 't', steps: [{ text: 'a', status: 'done' }, { text: 'b', status: 'skipped' }], finished: true, ok: false },
+    }) as TaskView;
+    expect(progress(t)).toEqual({ done: 1, total: 2 });
+  });
+
   it('ignores broken payloads', () => {
     const t = reduceTask(null, task());
     expect(reduceTask(t, { type: 'task_updated', task: { title: 'x', steps: [{ text: 'a', status: 'weird' }] } })).toBe(t);

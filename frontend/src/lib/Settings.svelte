@@ -44,8 +44,8 @@
 <svelte:window onkeydown={(e) => e.key === 'Escape' && onback()} />
 
 <div class="app">
-  <aside class="side" use:dragRegion>
-    <div class="me">
+  <aside class="side">
+    <div class="me" use:dragRegion title={t('chat.drag_title')}>
       <button class="ib" onclick={onback} title={t('settings.back')} aria-label={t('settings.back')}><Icon name="back" /></button>
       <Avatar view="head" {emotion} size={32} />
       <b>{name}</b>
@@ -60,7 +60,7 @@
   </aside>
 
   <section class="page">
-    <h3>{t(`settings.page.${page}`)}</h3>
+    <h3 use:dragRegion title={t('chat.drag_title')}>{t(`settings.page.${page}`)}</h3>
     <p class="lead">{t(current.lead)}</p>
     {#key page}
       <div class="body">
@@ -102,7 +102,7 @@
     border-right: 1px solid var(--line);
     padding: 14px 12px;
     min-height: 0;
-    overflow: hidden;
+    overflow: clip;
   }
   .me {
     display: flex;

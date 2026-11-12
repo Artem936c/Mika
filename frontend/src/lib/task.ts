@@ -50,8 +50,8 @@ export function reduceTask(current: TaskView | null, event: unknown): TaskView |
   return current;
 }
 
-/** Steps done or skipped, out of all. */
+/** Steps done, out of all. Skipped steps are not work done. */
 export function progress(task: TaskView): { done: number; total: number } {
-  const done = task.steps.filter((s) => s.status === 'done' || s.status === 'skipped').length;
+  const done = task.steps.filter((s) => s.status === 'done').length;
   return { done, total: task.steps.length };
 }

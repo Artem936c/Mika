@@ -85,6 +85,38 @@ impl Emotion {
     }
 }
 
+/// Clicks on the avatar closer together than this count as one series.
+pub const POKE_SERIES: Duration = Duration::from_secs(6);
+
+/// Face for the `n`-th click of a series: pleased, shy, playful, surprised, then cross.
+pub fn poke_reaction(n: u32) -> Emotion {
+    match n {
+        0 | 1 => Emotion::Joy,
+        2 => Emotion::Shy,
+        3 => Emotion::Wink,
+        4 => Emotion::Surprise,
+        _ => Emotion::Angry,
+    }
+}
+
+/// Counts clicks on the avatar into series.
+#[derive(Debug, Default)]
+pub struct Pokes {
+    last: Option<(Instant, u32)>,
+}
+
+impl Pokes {
+    /// The reaction to a click at `now`.
+    pub fn poke(&mut self, now: Instant) -> Emotion {
+        let n = match self.last {
+            Some((t, n)) if now.duration_since(t) < POKE_SERIES => n + 1,
+            _ => 1,
+        };
+        self.last = Some((now, n));
+        poke_reaction(n)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Pulse {
     emotion: Emotion,
@@ -276,6 +308,39 @@ mod tests {
     use super::*;
     use crate::confirm::{Answer, DecidedBy};
     use crate::tools::Assessment;
+
+    #[test]
+    fn clicks_in_a_series_end_in_anger_and_a_pause_resets() {
+        let t = Instant::now();
+        let mut p = Pokes::default();
+        let s = Duration::from_secs(1);
+        let faces: Vec<Emotion> = (0..6).map(|i| p.poke(t + s * i)).collect();
+        assert_eq!(
+            faces,
+            [
+                Emotion::Joy,
+                Emotion::Shy,
+                Emotion::Wink,
+                Emotion::Surprise,
+                Emotion::Angry,
+                Emotion::Angry
+            ]
+        );
+        assert_eq!(p.poke(t + s * 5 + POKE_SERIES), Emotion::Joy);
+    }
+
+    #[test]
+    fn a_poke_cue_shows_at_once_when_idle() {
+        let t = Instant::now();
+        let mut c = EmotionCore::new(t);
+        c.on_event(
+            &Event::EmotionCue {
+                emotion: Emotion::Shy,
+            },
+            t,
+        );
+        assert_eq!(c.current(t), Emotion::Shy);
+    }
 
     fn state(to: AssistantState) -> Event {
         Event::StateChanged {

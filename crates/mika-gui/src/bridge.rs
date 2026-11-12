@@ -61,6 +61,18 @@ pub fn send_message(ctx: CtxState<'_>, text: String) {
     });
 }
 
+/// A click on the avatar: the emotion core shows the reaction for a few seconds.
+#[tauri::command]
+pub fn poke_avatar(ctx: CtxState<'_>) {
+    static POKES: std::sync::OnceLock<parking_lot::Mutex<mika_core::emotion::Pokes>> =
+        std::sync::OnceLock::new();
+    let emotion = POKES
+        .get_or_init(Default::default)
+        .lock()
+        .poke(std::time::Instant::now());
+    ctx.bus.publish(mika_core::Event::EmotionCue { emotion });
+}
+
 /// Stops the running reply, drops queued ones and denies an open question.
 #[tauri::command]
 pub fn stop(ctx: CtxState<'_>) {

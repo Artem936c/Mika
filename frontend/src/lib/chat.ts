@@ -195,6 +195,9 @@ export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
       next[idx] = { ...next[idx], ok, ms, pending: false, data: ok ? cardData(e.data) : undefined };
       return next;
     }
+    case 'state_changed':
+      // A stopped reply never gets its final text: the cursor must not blink on.
+      return e.to === 'idle' ? finishStreaming(items) : items;
     case 'error': {
       const message = str(e.message);
       return message === null ? items : [...finishStreaming(items), { kind: 'error', text: message }];

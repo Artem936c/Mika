@@ -206,11 +206,12 @@ pub fn parse_ops(args: &Value, profile: &str) -> Result<Vec<Op>, ToolError> {
         )));
     }
     let path = |item: &Value, keys: &[&str]| -> Result<PathBuf, ToolError> {
-        keys.iter()
+        let raw = keys
+            .iter()
             .find_map(|k| item.get(*k).and_then(Value::as_str))
             .filter(|s| !s.trim().is_empty())
-            .map(|s| resolve_path(s, profile))
-            .ok_or_else(|| ToolError::BadArguments(format!("в действии нет пути `{}`", keys[0])))
+            .ok_or_else(|| ToolError::BadArguments(format!("в действии нет пути `{}`", keys[0])))?;
+        checked_path(raw, profile)
     };
     items
         .iter()
@@ -229,6 +230,41 @@ pub fn parse_ops(args: &Value, profile: &str) -> Result<Vec<Op>, ToolError> {
             })
         })
         .collect()
+}
+
+/// A batch path must be full: `C:\…`, `\\server\…`, `~\…` or `%VAR%\…`. A relative path
+/// would land in the user's home folder, and names of dots or masks are never files.
+pub fn checked_path(raw: &str, profile: &str) -> Result<PathBuf, ToolError> {
+    let s = raw.trim().trim_matches('"');
+    let drive = s.len() >= 3
+        && s.as_bytes()[0].is_ascii_alphabetic()
+        && s.as_bytes()[1] == b':'
+        && matches!(s.as_bytes()[2], b'\\' | b'/');
+    if !(drive || s.starts_with("\\\\") || s.starts_with('~') || s.starts_with('%')) {
+        return Err(ToolError::BadArguments(format!(
+            "нужен полный путь вроде C:\\Папка\\файл или ~\\Downloads\\файл, а не «{s}»"
+        )));
+    }
+    if s.contains(['*', '?', '<', '>', '|']) {
+        return Err(ToolError::BadArguments(format!(
+            "в пути «{s}» маска: перечисли файлы по одному"
+        )));
+    }
+    let p = resolve_path(s, profile);
+    let dots = p
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(n) => Some(n.to_string_lossy()),
+            std::path::Component::ParentDir => Some("..".into()),
+            _ => None,
+        })
+        .any(|n| n.chars().all(|c| c == '.'));
+    if dots {
+        return Err(ToolError::BadArguments(format!(
+            "в пути «{s}» многоточие вместо части пути: пиши путь полностью, без сокращений"
+        )));
+    }
+    Ok(p)
 }
 
 /// `name (2).ext` next to `path` when `path` is taken.
@@ -251,9 +287,12 @@ pub fn free_name(path: &Path) -> PathBuf {
         .unwrap_or_else(|| path.to_path_buf())
 }
 
-/// A destination that is an existing folder means "into that folder".
+/// A destination that is an existing folder means "into that folder". So does a missing
+/// one without an extension when a file with an extension goes there: `report.pdf → Документы`.
 fn destination(from: &Path, to: &Path) -> PathBuf {
-    let to = if to.is_dir() {
+    let folder_meant =
+        !to.exists() && to.extension().is_none() && from.is_file() && from.extension().is_some();
+    let to = if to.is_dir() || folder_meant {
         match from.file_name() {
             Some(name) => to.join(name),
             None => to.to_path_buf(),
@@ -333,7 +372,7 @@ impl Tool for FileBatchTool {
     fn spec(&self) -> ToolSpec {
         spec(
             "file_batch",
-            "Выполнить много действий с файлами под одним подтверждением: move (перенести или переименовать), copy, mkdir, trash (в корзину). Если имя занято, добавляется « (2)». Папка в `to` значит «внутрь этой папки». Сначала посмотри файлы через list_folder.",
+            "Выполнить много действий с файлами под одним подтверждением: move (перенести или переименовать), copy, mkdir, trash (в корзину). Если имя занято, добавляется « (2)». Папка в `to` значит «внутрь этой папки», недостающие папки создаются сами. Пути только полные (C:\\… или ~\\…), по одному файлу, без масок. Сначала посмотри файлы через list_folder.",
             json!({
                 "type": "object",
                 "properties": {
@@ -550,6 +589,47 @@ mod tests {
             .assess(&json!({"operations": [{"op": "move", "from": "C:\\Windows\\a.dll", "to": "~/a.dll"}]}))
             .unwrap();
         assert_eq!(sys.level, RiskLevel::High);
+    }
+
+    #[test]
+    fn batch_paths_must_be_full_without_dots_or_masks() {
+        let profile = r"C:\Users\me";
+        assert!(checked_path(r"C:\Users\me\Downloads\a.pdf", profile).is_ok());
+        assert!(checked_path(r"~\Downloads\a.pdf", profile).is_ok());
+        assert!(checked_path(r"%USERPROFILE%\a.pdf", profile).is_ok());
+        // `..` folds into a plain path, and the risk is judged on that path.
+        assert_eq!(
+            checked_path(r"C:\Users\me\..\other\a.pdf", profile).unwrap(),
+            PathBuf::from(r"C:\Users\other\a.pdf")
+        );
+        for bad in [
+            r"Downloads\a.pdf",
+            r"...\song.mp3",
+            r"C:\Users\me\...\song.mp3",
+            r"C:\Users\me\Downloads\*.pdf",
+            "song.mp3",
+        ] {
+            assert!(checked_path(bad, profile).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_folder_without_extension_takes_the_file_inside() {
+        let (d, profile) = temp();
+        std::fs::write(d.path().join("song.mp3"), b"m").unwrap();
+        let (env, _) = env();
+        let tool = FileBatchTool {
+            trash: env.trash.clone(),
+            user_profile: profile,
+        };
+        let out = run(
+            &tool,
+            json!({"operations": [{"op": "move", "from": "~/song.mp3", "to": "~/Музыка"}]}),
+        )
+        .await
+        .unwrap();
+        assert!(out.text.starts_with("Сделано 1 из 1."), "{}", out.text);
+        assert!(d.path().join("Музыка").join("song.mp3").is_file());
     }
 
     #[test]

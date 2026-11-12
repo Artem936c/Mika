@@ -2,8 +2,10 @@
 //! It runs in a separate profile, never the user's. Pages with a password field,
 //! sign-in, bank or payment pages are in the blind zone: not read, not touched.
 
+use std::future::Future;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use mika_core::gate::Approval;
@@ -19,6 +21,19 @@ use crate::web::ensure_enabled;
 
 const MAX_TEXT: usize = 6000;
 const MAX_ITEMS: usize = 120;
+/// Longest wait for text to appear on a page.
+const MAX_WAIT: Duration = Duration::from_secs(15);
+
+/// Runs a browser action until it ends or the user presses "Stop".
+async fn stoppable<T>(
+    cancel: &CancellationToken,
+    action: impl Future<Output = Result<T, String>>,
+) -> Result<T, ToolError> {
+    tokio::select! {
+        _ = cancel.cancelled() => Err(ToolError::Cancelled),
+        r = action => r.map_err(failed),
+    }
+}
 
 pub fn is_blind_page(page: &Page) -> bool {
     page.password || is_blind_url(&page.url) || is_blind_title(&page.title)
@@ -140,11 +155,11 @@ impl Tool for BrowserOpenTool {
         &self,
         args: Value,
         _a: Approval,
-        _c: CancellationToken,
+        c: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         ensure_enabled(&self.enabled)?;
         let url = full_url(arg_str(&args, "url")?)?;
-        let page = self.browser.open(&url).await.map_err(failed)?;
+        let page = stoppable(&c, self.browser.open(&url)).await?;
         Ok(ToolOutput::new(render_page(&page)))
     }
 }
@@ -156,8 +171,11 @@ impl Tool for BrowserReadTool {
     fn spec(&self) -> ToolSpec {
         spec(
             "browser_read",
-            "Прочитать текущую страницу браузера Мики заново: текст и пронумерованные элементы. Вызывай после каждого действия на странице.",
-            schema(&[], &[]),
+            "Прочитать текущую страницу браузера Мики заново: текст и пронумерованные элементы. Вызывай после каждого действия на странице. wait_text — подождать до 15 секунд, пока на странице появится этот текст.",
+            schema(
+                &[("wait_text", "string", "Текст, которого ждать, необязательно")],
+                &[],
+            ),
         )
     }
 
@@ -172,12 +190,23 @@ impl Tool for BrowserReadTool {
 
     async fn run(
         &self,
-        _args: Value,
+        args: Value,
         _a: Approval,
-        _c: CancellationToken,
+        c: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
-        let page = self.0.read().await.map_err(failed)?;
-        Ok(ToolOutput::new(render_page(&page)))
+        let wait_for = args
+            .get("wait_text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|w| !w.is_empty());
+        let page = stoppable(&c, self.0.read(wait_for, MAX_WAIT)).await?;
+        let mut text = render_page(&page);
+        if let Some(w) = wait_for {
+            if !page.text.to_lowercase().contains(&w.to_lowercase()) {
+                text = format!("«{w}» на странице так и не появился за 15 секунд.\n\n{text}");
+            }
+        }
+        Ok(ToolOutput::new(text))
     }
 }
 
@@ -210,13 +239,13 @@ impl Tool for BrowserClickTool {
         &self,
         args: Value,
         _a: Approval,
-        _c: CancellationToken,
+        c: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let n = number(&args)?;
         guard(self.0.as_ref())?;
         // Numbers change with the page: name the element before the click.
         let what = item_label(self.0.as_ref(), n);
-        let page = self.0.click(n).await.map_err(failed)?;
+        let page = stoppable(&c, self.0.click(n)).await?;
         Ok(ToolOutput::new(format!(
             "Нажала {what}.\n\n{}",
             render_page(&page)
@@ -231,7 +260,7 @@ impl Tool for BrowserTypeTool {
     fn spec(&self) -> ToolSpec {
         spec(
             "browser_type",
-            "Ввести текст в поле страницы по номеру из browser_read. Старый текст поля заменяется. submit=true нажимает Enter, например чтобы начать поиск.",
+            "Ввести текст в поле страницы по номеру из browser_read. Старый текст поля заменяется. submit=true нажимает Enter, например чтобы начать поиск. Для выпадающего списка text — название пункта, который выбрать.",
             schema(
                 &[
                     ("n", "integer", "Номер поля"),
@@ -270,16 +299,12 @@ impl Tool for BrowserTypeTool {
         &self,
         args: Value,
         _a: Approval,
-        _c: CancellationToken,
+        c: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let n = number(&args)?;
         let text = arg_str(&args, "text")?;
         guard(self.0.as_ref())?;
-        let page = self
-            .0
-            .type_into(n, text, arg_bool(&args, "submit"))
-            .await
-            .map_err(failed)?;
+        let page = stoppable(&c, self.0.type_into(n, text, arg_bool(&args, "submit"))).await?;
         Ok(ToolOutput::new(format!("Ввела.\n\n{}", render_page(&page))))
     }
 }
@@ -310,14 +335,51 @@ impl Tool for BrowserScrollTool {
         &self,
         args: Value,
         _a: Approval,
-        _c: CancellationToken,
+        c: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         guard(self.0.as_ref())?;
         let down = !matches!(
             args.get("direction").and_then(Value::as_str),
             Some("up" | "вверх")
         );
-        let page = self.0.scroll(down).await.map_err(failed)?;
+        let page = stoppable(&c, self.0.scroll(down)).await?;
+        Ok(ToolOutput::new(render_page(&page)))
+    }
+}
+
+pub struct BrowserBackTool(pub Arc<dyn Browser>);
+
+#[async_trait]
+impl Tool for BrowserBackTool {
+    fn spec(&self) -> ToolSpec {
+        spec(
+            "browser_back",
+            "Вернуться на предыдущую страницу в браузере Мики и прочитать её.",
+            schema(&[], &[]),
+        )
+    }
+
+    fn assess(&self, _args: &Value) -> Result<Assessment, ToolError> {
+        if self.0.last().is_none() {
+            return Err(failed(
+                "браузер ещё не открыт: сначала открой страницу через browser_open",
+            ));
+        }
+        Ok(Assessment::new(
+            RiskLevel::Low,
+            "Вернуться на страницу назад",
+            page_host(self.0.as_ref()),
+            "только переход по истории",
+        ))
+    }
+
+    async fn run(
+        &self,
+        _args: Value,
+        _a: Approval,
+        c: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        let page = stoppable(&c, self.0.back()).await?;
         Ok(ToolOutput::new(render_page(&page)))
     }
 }
@@ -429,5 +491,63 @@ mod tests {
         assert!(BrowserScrollTool(env.browser.clone())
             .assess(&json!({}))
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn read_waits_for_text_and_says_when_it_never_came() {
+        let (env, f) = env();
+        *f.page.lock() = Some(search_page());
+        let read = BrowserReadTool(env.browser.clone());
+        let out = run(&read, json!({"wait_text": "Rust is"})).await.unwrap();
+        assert!(!out.text.contains("не появился"));
+        let out = run(&read, json!({"wait_text": "Канберра"})).await.unwrap();
+        assert!(out
+            .text
+            .starts_with("«Канберра» на странице так и не появился"));
+        assert!(f.browser_log.lock().contains(&"wait Канберра".to_string()));
+        run(&BrowserBackTool(env.browser.clone()), json!({}))
+            .await
+            .unwrap();
+        assert!(f.browser_log.lock().contains(&"back".to_string()));
+    }
+
+    #[tokio::test]
+    async fn stop_interrupts_a_browser_action() {
+        struct Slow;
+        #[async_trait]
+        impl Browser for Slow {
+            fn last(&self) -> Option<Page> {
+                Some(search_page())
+            }
+            async fn open(&self, _: &str) -> Result<Page, String> {
+                std::future::pending().await
+            }
+            async fn read(&self, _: Option<&str>, _: Duration) -> Result<Page, String> {
+                std::future::pending().await
+            }
+            async fn click(&self, _: u32) -> Result<Page, String> {
+                std::future::pending().await
+            }
+            async fn type_into(&self, _: u32, _: &str, _: bool) -> Result<Page, String> {
+                std::future::pending().await
+            }
+            async fn scroll(&self, _: bool) -> Result<Page, String> {
+                std::future::pending().await
+            }
+            async fn back(&self) -> Result<Page, String> {
+                std::future::pending().await
+            }
+        }
+        let tool = BrowserClickTool(Arc::new(Slow));
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            stop.cancel();
+        });
+        let r = tool
+            .run(json!({"n": 1}), Approval::for_tests(), cancel)
+            .await;
+        assert_eq!(r, Err(ToolError::Cancelled));
     }
 }

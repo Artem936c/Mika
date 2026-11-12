@@ -97,6 +97,21 @@ describe('new events and cards', () => {
 });
 
 describe('reduceChat', () => {
+  it('a reply stopped midway stops streaming when the state turns idle', () => {
+    expect(
+      run([
+        { type: 'assistant_delta', text: 'Шаг 1' },
+        { type: 'state_changed', from: 'speaking', to: 'thinking' },
+      ]),
+    ).toEqual([{ kind: 'assistant', text: 'Шаг 1', pending: true }]);
+    expect(
+      run([
+        { type: 'assistant_delta', text: 'Шаг 1' },
+        { type: 'state_changed', from: 'speaking', to: 'idle' },
+      ]),
+    ).toEqual([{ kind: 'assistant', text: 'Шаг 1', pending: false }]);
+  });
+
   it('user_text appends user item', () => {
     expect(run([{ type: 'user_text', text: 'привет' }])).toEqual([{ kind: 'user', text: 'привет' }]);
   });

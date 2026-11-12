@@ -52,6 +52,8 @@ const SNAPSHOT_JS: &str = r#"(() => {
     let label = attr('aria-label') || (tag === 'input' ? '' : el.innerText) || attr('placeholder') || attr('title') || attr('alt') || attr('name');
     if (kind === 'поле' && type !== 'password' && el.value) {
       label = (attr('aria-label') || attr('placeholder') || attr('name')) + ' = ' + String(el.value).slice(0, 60);
+    } else if (tag === 'select' && el.selectedIndex >= 0) {
+      label = (attr('aria-label') || attr('name') || 'список') + ' = ' + el.options[el.selectedIndex].text;
     } else if (kind === 'кнопка' && !label && el.value) {
       label = String(el.value);
     }
@@ -210,8 +212,16 @@ pub struct CdpBrowser {
     profile: PathBuf,
     port: Mutex<Option<u16>>,
     last: Mutex<Option<Page>>,
+    /// Target id of the tab Mika works in; a click that opens a tab moves here.
+    tab: Mutex<Option<String>>,
     http: reqwest::Client,
     headless: bool,
+}
+
+/// A page tab: target id and WebSocket address.
+struct Tab {
+    id: String,
+    socket: String,
 }
 
 impl CdpBrowser {
@@ -220,6 +230,7 @@ impl CdpBrowser {
             profile,
             port: Mutex::new(None),
             last: Mutex::new(None),
+            tab: Mutex::new(None),
             http: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(5))
@@ -329,28 +340,56 @@ impl CdpBrowser {
         }
     }
 
-    /// WebSocket address of the page tab.
-    async fn page_socket(&self) -> Result<String, String> {
+    /// Page tabs of the running browser, opening one when there is none.
+    async fn tabs(&self) -> Result<Vec<Tab>, String> {
         let port = self.port().await?;
-        let page = |t: &Value| t.get("type").and_then(Value::as_str) == Some("page");
-        let mut list = self.targets(port).await?;
-        if !list.iter().any(page) {
-            let _ = self
-                .http
-                .put(format!("http://127.0.0.1:{port}/json/new?about:blank"))
-                .send()
-                .await;
-            list = self.targets(port).await?;
+        let read = |list: Vec<Value>| -> Vec<Tab> {
+            list.into_iter()
+                .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+                .filter_map(|t| {
+                    Some(Tab {
+                        id: t.get("id")?.as_str()?.to_string(),
+                        socket: t.get("webSocketDebuggerUrl")?.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        };
+        let tabs = read(self.targets(port).await?);
+        if !tabs.is_empty() {
+            return Ok(tabs);
         }
-        list.iter()
-            .find(|t| page(t))
-            .and_then(|t| t.get("webSocketDebuggerUrl").and_then(Value::as_str))
-            .map(str::to_string)
-            .ok_or_else(|| "в браузере нет вкладки".into())
+        let _ = self
+            .http
+            .put(format!("http://127.0.0.1:{port}/json/new?about:blank"))
+            .send()
+            .await;
+        let tabs = read(self.targets(port).await?);
+        if tabs.is_empty() {
+            return Err("в браузере нет вкладки".into());
+        }
+        Ok(tabs)
     }
 
+    /// Connection to Mika's tab: the remembered one while it is open, else the first.
     async fn conn(&self) -> Result<Conn, String> {
-        Conn::open(&self.page_socket().await?).await
+        let tabs = self.tabs().await?;
+        let want = self.tab.lock().clone();
+        let tab = tabs
+            .iter()
+            .find(|t| Some(&t.id) == want.as_ref())
+            .unwrap_or(&tabs[0]);
+        *self.tab.lock() = Some(tab.id.clone());
+        Conn::open(&tab.socket).await
+    }
+
+    /// A tab that appeared after `before` was listed, made Mika's tab.
+    async fn new_tab(&self, before: &[String]) -> Option<Conn> {
+        let tabs = self.tabs().await.ok()?;
+        let fresh = tabs.into_iter().find(|t| !before.contains(&t.id))?;
+        *self.tab.lock() = Some(fresh.id.clone());
+        let mut c = Conn::open(&fresh.socket).await.ok()?;
+        let _ = c.call("Page.bringToFront", json!({})).await;
+        Some(c)
     }
 
     fn keep(&self, page: Page) -> Page {
@@ -390,22 +429,77 @@ impl Browser for CdpBrowser {
         Ok(self.keep(c.snapshot().await?))
     }
 
-    async fn read(&self) -> Result<Page, String> {
+    async fn read(&self, wait_for: Option<&str>, wait: Duration) -> Result<Page, String> {
         let mut c = self.conn().await?;
+        let deadline = Instant::now() + wait;
+        let want = wait_for.map(str::to_lowercase);
+        loop {
+            let page = c.snapshot().await?;
+            let found = want
+                .as_ref()
+                .is_none_or(|w| page.text.to_lowercase().contains(w));
+            if found || Instant::now() >= deadline {
+                return Ok(self.keep(page));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    async fn back(&self) -> Result<Page, String> {
+        let mut c = self.conn().await?;
+        c.eval("history.back()").await?;
+        c.settle().await;
         Ok(self.keep(c.snapshot().await?))
     }
 
     async fn click(&self, n: u32) -> Result<Page, String> {
         let mut c = self.conn().await?;
+        let before: Vec<String> = self.tabs().await?.into_iter().map(|t| t.id).collect();
         let (x, y) = Self::center_of(&mut c, n).await?;
         tokio::time::sleep(Duration::from_millis(150)).await;
         c.mouse_click(x, y).await?;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        if let Some(mut tab) = self.new_tab(&before).await {
+            tab.settle().await;
+            return Ok(self.keep(tab.snapshot().await?));
+        }
         c.settle().await;
         Ok(self.keep(c.snapshot().await?))
     }
 
     async fn type_into(&self, n: u32, text: &str, submit: bool) -> Result<Page, String> {
         let mut c = self.conn().await?;
+        let wanted = serde_json::to_string(&text.to_lowercase()).map_err(|e| e.to_string())?;
+        let chosen = c
+            .eval(&find_js(
+                n,
+                &format!(
+                    "if (el.tagName !== 'SELECT') return 'not-a-list'; \
+                     const want = {wanted}; \
+                     const opts = Array.from(el.options); \
+                     const opt = opts.find((o) => o.text.trim().toLowerCase() === want) \
+                       || opts.find((o) => o.text.toLowerCase().includes(want)) \
+                       || opts.find((o) => o.value.toLowerCase() === want); \
+                     if (!opt) return 'no-option'; \
+                     el.value = opt.value; \
+                     el.dispatchEvent(new Event('input', {{ bubbles: true }})); \
+                     el.dispatchEvent(new Event('change', {{ bubbles: true }})); \
+                     return 'chosen';"
+                ),
+            ))
+            .await?;
+        match chosen.as_str() {
+            Some("chosen") => {
+                c.settle().await;
+                return Ok(self.keep(c.snapshot().await?));
+            }
+            Some("no-option") => {
+                return Err(format!(
+                    "в списке {n} нет пункта «{text}»: прочитай страницу заново"
+                ))
+            }
+            _ => {}
+        }
         let focused = c
             .eval(&find_js(
                 n,
@@ -457,7 +551,9 @@ mod tests {
     async fn live_browser_reads_types_and_clicks() {
         let dir = tempfile::tempdir().unwrap();
         let b = CdpBrowser::new(dir.path().join("profile")).headless();
-        let html = "data:text/html;charset=utf-8,<title>Тест</title><h1>Привет</h1><input id=q placeholder=Поиск><button onclick=\"document.title='нажата '+q.value\">Найти</button><a href=%23x>Ссылка</a>";
+        let html = "data:text/html;charset=utf-8,<title>Тест</title><h1>Привет</h1><input id=q placeholder=Поиск><button onclick=\"document.title='нажата '+q.value\">Найти</button><a href=%23x>Ссылка</a>\
+<select name=city><option>Москва</option><option>Пермь</option></select>\
+<a href=about:blank target=_blank>Новая вкладка</a>";
         let page = b.open(html).await.unwrap();
         assert_eq!(page.title, "Тест");
         assert!(page.text.contains("Привет"));
@@ -471,6 +567,24 @@ mod tests {
         );
         let clicked = b.click(button).await.unwrap();
         assert_eq!(clicked.title, "нажата кошки");
+        let list = clicked.items.iter().find(|i| i.kind == "список").unwrap().n;
+        let chosen = b.type_into(list, "пермь", false).await.unwrap();
+        assert!(
+            chosen.items.iter().any(|i| i.label == "city = Пермь"),
+            "{:?}",
+            chosen.items
+        );
+        assert!(b.type_into(list, "Казань", false).await.is_err());
+        let link = chosen
+            .items
+            .iter()
+            .find(|i| i.label == "Новая вкладка")
+            .unwrap()
+            .n;
+        let opened = b.click(link).await.unwrap();
+        assert_eq!(opened.url, "about:blank", "moved to the new tab");
+        let back = b.read(None, Duration::ZERO).await.unwrap();
+        assert_eq!(back.url, "about:blank");
         let login = b
             .open("data:text/html,<title>x</title><input type=password value=secret>")
             .await

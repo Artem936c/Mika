@@ -3,8 +3,13 @@ import {
   BLINK,
   EMOTION_ORDER,
   EYE_LAYERS,
+  MOTIONS,
   MOUTH_LAYERS,
+  POKE_MOTION,
   blinkPause,
+  canGesture,
+  gesturePause,
+  idleGesture,
   canBlink,
   canTalk,
   frameUrl,
@@ -19,6 +24,29 @@ describe('frames', () => {
     const urls = [...EMOTION_ORDER, ...EYE_LAYERS, ...MOUTH_LAYERS].map(frameUrl);
     for (const u of urls) expect(u).not.toBe('');
     expect(new Set(urls).size).toBe(urls.length);
+  });
+});
+
+describe('idle life and motion', () => {
+  it('idle gestures use existing layers and fit only the calm face', () => {
+    for (let i = 0; i < 10; i++) {
+      const g = idleGesture(i / 10);
+      expect(g.ms).toBeGreaterThan(500);
+      if (g.eyes) expect(frameUrl(g.eyes)).not.toBe('');
+      if (g.mouth) expect(frameUrl(g.mouth)).not.toBe('');
+    }
+    expect(canGesture('neutral')).toBe(true);
+    expect(canGesture('sad')).toBe(false);
+    expect(gesturePause(0)).toBeGreaterThanOrEqual(4000);
+    expect(gesturePause(0.999)).toBeLessThanOrEqual(10000);
+  });
+
+  it('every emotion but neutral moves the body once', () => {
+    for (const e of EMOTION_ORDER) {
+      if (e === 'neutral') expect(MOTIONS[e]).toBeUndefined();
+      else expect(MOTIONS[e]!.frames.length, e).toBeGreaterThan(1);
+    }
+    expect(POKE_MOTION.ms).toBeGreaterThan(0);
   });
 });
 
