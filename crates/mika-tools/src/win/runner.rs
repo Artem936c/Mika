@@ -12,8 +12,26 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub struct ProcessRunner;
 
-/// UTF-8 when valid, otherwise the OEM code page that console programs use (866 for Russian).
+/// UTF-16LE from `cmd /U`: text in other encodings never holds a zero byte, while
+/// UTF-16 of Latin and Cyrillic text has zeros in odd places (line breaks at least)
+/// and none in even ones.
+fn looks_utf16le(bytes: &[u8]) -> bool {
+    bytes.len() >= 2
+        && bytes.len().is_multiple_of(2)
+        && bytes.iter().skip(1).step_by(2).any(|b| *b == 0)
+        && !bytes.iter().step_by(2).any(|b| *b == 0)
+}
+
+/// UTF-16LE from `cmd /U`, UTF-8 when valid, otherwise the OEM code page that
+/// console programs use (866 for Russian).
 pub fn decode_console(bytes: &[u8]) -> String {
+    if looks_utf16le(bytes) {
+        let wide: Vec<u16> = bytes
+            .chunks(2)
+            .map(|p| u16::from_le_bytes([p[0], p[1]]))
+            .collect();
+        return String::from_utf16_lossy(&wide);
+    }
     if let Ok(s) = std::str::from_utf8(bytes) {
         return s.to_string();
     }
@@ -108,5 +126,22 @@ impl Runner for ProcessRunner {
                 Err("остановлено".into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf16_from_cmd_utf8_and_plain_text_decode() {
+        let wide: Vec<u8> = "привет\r\nok\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(decode_console(&wide), "привет\r\nok\r\n");
+        assert_eq!(decode_console("привет".as_bytes()), "привет");
+        assert_eq!(decode_console(b"ok\r\n"), "ok\r\n");
+        assert!(!looks_utf16le(b"abcd"));
     }
 }

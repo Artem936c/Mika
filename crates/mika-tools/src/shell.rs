@@ -44,16 +44,12 @@ pub fn command_line(shell: Shell, command: &str) -> (String, Vec<String>) {
                 format!("[Console]::OutputEncoding=[Text.Encoding]::UTF8; $ProgressPreference='SilentlyContinue'; {command}"),
             ],
         ),
-        // UTF-8 output: on a Windows with another language the console code page
-        // cannot hold Cyrillic and turns it into question marks. `&` binds looser
-        // than `&&` and `||`, so the user's command keeps its own logic.
+        // `/U`: cmd's own commands write UTF-16 to the pipe. Without it, on a Windows
+        // with another language the OEM code page has no Cyrillic and turns it into
+        // question marks; `chcp` does not help a cmd that has no console.
         Shell::Cmd => (
             "cmd.exe".into(),
-            vec![
-                "/D".into(),
-                "/C".into(),
-                format!("chcp 65001>nul & {command}"),
-            ],
+            vec!["/D".into(), "/U".into(), "/C".into(), command.to_string()],
         ),
     }
 }
