@@ -17,10 +17,89 @@
   let g = $state<General | null>(null);
   let error = $state('');
   let confirmWipe = $state(false);
+  let report = $state('');
+  let copied = $state(false);
+
+  interface UpdateInfo {
+    current: string;
+    manifest_url: string;
+    check_at_start: boolean;
+    available: { version: string; notes: string } | null;
+  }
+  let upd = $state<UpdateInfo | null>(null);
+  let updNote = $state('');
+  let updBusy = $state(false);
+  let sureInstall = $state(false);
+
+  async function loadUpdate() {
+    upd = await invoke<UpdateInfo>('get_update_info').catch(() => null);
+  }
+
+  async function saveUpdate() {
+    if (!upd) return;
+    try {
+      await invoke('save_update_settings', { manifestUrl: upd.manifest_url, checkAtStart: upd.check_at_start });
+      updNote = '';
+      return true;
+    } catch (e) {
+      updNote = String(e);
+      return false;
+    }
+  }
+
+  async function checkUpdate() {
+    if (!upd || !(await saveUpdate())) return;
+    updBusy = true;
+    try {
+      const found = await invoke<{ version: string; notes: string } | null>('check_update');
+      upd.available = found;
+      updNote = found ? '' : t('general.update_none');
+    } catch (e) {
+      updNote = String(e);
+    } finally {
+      updBusy = false;
+    }
+  }
+
+  async function installUpdate() {
+    if (!sureInstall) {
+      sureInstall = true;
+      return;
+    }
+    updBusy = true;
+    updNote = t('general.update_downloading');
+    try {
+      await invoke('install_update');
+    } catch (e) {
+      updNote = String(e);
+      sureInstall = false;
+    } finally {
+      updBusy = false;
+    }
+  }
+
+  async function makeReport() {
+    try {
+      report = await invoke<string>('problem_report');
+      copied = false;
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  async function copyReport() {
+    try {
+      await navigator.clipboard.writeText(report);
+      copied = true;
+    } catch (e) {
+      error = String(e);
+    }
+  }
 
   onMount(async () => {
     try {
       g = await invoke<General>('get_general_settings');
+      await loadUpdate();
     } catch (e) {
       error = String(e);
     }
@@ -70,6 +149,38 @@
     <div class="row"><span>{t('general.version')}</span><span class="mute">{g.version}</span></div>
   </div>
 
+  {#if upd}
+    <div class="report">
+      <p>{t('general.update_sub', { version: upd.current })}</p>
+      <input class="fld" bind:value={upd.manifest_url} placeholder="https://…/mika-update.json" spellcheck="false" />
+      <label class="chk">
+        <input type="checkbox" bind:checked={upd.check_at_start} onchange={saveUpdate} />{t('general.update_at_start')}
+      </label>
+      <div class="acts">
+        <button class="bt" onclick={checkUpdate} disabled={updBusy || !upd.manifest_url.trim()}>{t('general.update_check')}</button>
+        {#if upd.available}
+          <button class="bt pri" onclick={installUpdate} disabled={updBusy}>
+            {t(sureInstall ? 'general.update_sure' : 'general.update_install', { version: upd.available.version })}
+          </button>
+        {/if}
+      </div>
+      {#if upd.available}
+        {#if upd.available.notes}<pre>{upd.available.notes}</pre>{/if}
+        <p class="warn">{t('general.update_unsigned')}</p>
+      {/if}
+      {#if updNote}<p class="note">{updNote}</p>{/if}
+    </div>
+  {/if}
+
+  <div class="report">
+    <p>{t('general.report_sub')}</p>
+    <div class="acts">
+      <button class="bt" onclick={makeReport}>{t('general.report')}</button>
+      {#if report}<button class="bt" onclick={copyReport}>{t(copied ? 'general.report_copied' : 'general.report_copy')}</button>{/if}
+    </div>
+    {#if report}<pre>{report}</pre>{/if}
+  </div>
+
   <div class="danger">
     <p>{t('general.wipe_text')}</p>
     <div class="acts">
@@ -114,6 +225,50 @@
   }
   .link:hover {
     text-decoration: underline;
+  }
+  .report {
+    padding: 14px 16px;
+    margin-bottom: 12px;
+    border-radius: 16px;
+    border: 1px solid var(--line);
+  }
+  .report p {
+    margin: 0 0 12px;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--mute);
+  }
+  .report pre {
+    margin: 12px 0 0;
+    max-height: 160px;
+    overflow: auto;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.35);
+    font: 11.5px/1.45 var(--mono);
+    white-space: pre-wrap;
+    word-break: break-word;
+    user-select: text;
+  }
+  .chk {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 10px 0 12px;
+    font-size: 13px;
+    color: var(--mute);
+    cursor: pointer;
+  }
+  .chk input {
+    accent-color: var(--v);
+  }
+  .warn {
+    margin: 10px 0 0 !important;
+    color: var(--warn) !important;
+  }
+  .note {
+    margin: 10px 0 0 !important;
+    user-select: text;
   }
   .danger {
     padding: 14px 16px;

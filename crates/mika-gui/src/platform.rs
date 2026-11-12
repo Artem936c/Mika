@@ -121,6 +121,14 @@ pub fn wipe_all_data(secrets: &dyn SecretStore) -> Result<(), String> {
             .delete(&kind.secret_key())
             .map_err(|e| e.to_string())?;
     }
+    for key in [
+        mika_core::config::EMBEDDING_SECRET_KEY,
+        mika_core::config::IMAGE_SECRET_KEY,
+        mika_core::config::TELEGRAM_SECRET_KEY,
+        mika_core::config::SPEECH_SECRET_KEY,
+    ] {
+        secrets.delete(key).map_err(|e| e.to_string())?;
+    }
     set_autostart(false)?;
     let mut script = String::from("ping -n 3 127.0.0.1 >nul");
     for dir in data_folders() {

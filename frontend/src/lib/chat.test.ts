@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   cardData,
+  countdown,
   formatSeconds,
   fromHistory,
   inlineMarkup,
@@ -14,6 +15,86 @@ import {
 import { isMessageKey } from './i18n';
 
 const run = (events: unknown[], start: ChatItem[] = []) => events.reduce<ChatItem[]>(reduceChat, start);
+
+describe('timings', () => {
+  const run = (events: unknown[]) => events.reduce<ChatItem[]>((items, e) => reduceChat(items, e), []);
+
+  it('one row under the reply collects every stage', () => {
+    const items = run([
+      { type: 'timing', stage: 'stt', ms: 900 },
+      { type: 'user_text', text: 'привет' },
+      { type: 'timing', stage: 'llm', ms: 1200 },
+      { type: 'assistant_delta', text: 'Привет!' },
+      { type: 'assistant_text', text: 'Привет!' },
+      { type: 'timing', stage: 'tts', ms: 1900 },
+    ]);
+    expect(items.map((it) => it.kind)).toEqual(['user', 'assistant', 'timing']);
+    expect(items[2]).toMatchObject({ done: true, timings: { stt: 900, llm: 1200, tts: 1900 } });
+  });
+
+  it('the first sound before the end of the text joins the same row', () => {
+    const items = run([
+      { type: 'user_text', text: 'расскажи' },
+      { type: 'timing', stage: 'llm', ms: 800 },
+      { type: 'assistant_delta', text: 'Первая фраза. ' },
+      { type: 'timing', stage: 'tts', ms: 1500 },
+      { type: 'assistant_delta', text: 'Вторая.' },
+      { type: 'assistant_text', text: 'Первая фраза. Вторая.' },
+    ]);
+    expect(items.map((it) => it.kind)).toEqual(['user', 'assistant', 'timing']);
+    expect(items[1].text).toBe('Первая фраза. Вторая.');
+    expect(items[2].timings).toEqual({ llm: 800, tts: 1500 });
+  });
+
+  it('timings of a reply that never ended do not leak into the next one', () => {
+    const items = run([
+      { type: 'user_text', text: 'раз' },
+      { type: 'timing', stage: 'llm', ms: 700 },
+      { type: 'error', message: 'обрыв' },
+      { type: 'timing', stage: 'stt', ms: 400 },
+      { type: 'user_text', text: 'два' },
+      { type: 'timing', stage: 'llm', ms: 300 },
+      { type: 'assistant_text', text: 'ок' },
+    ]);
+    const row = items[items.length - 1];
+    expect(row.kind).toBe('timing');
+    expect(row.timings).toEqual({ stt: 400, llm: 300 });
+    expect(items.filter((it) => it.kind === 'timing')).toHaveLength(1);
+  });
+
+  it('ignores unknown stages and broken numbers', () => {
+    expect(run([{ type: 'timing', stage: 'gpu', ms: 5 }, { type: 'timing', stage: 'llm', ms: 'x' }])).toEqual([]);
+  });
+});
+
+describe('new events and cards', () => {
+  it('a fired reminder becomes its own row, a task does not', () => {
+    const items = reduceChat([], { type: 'reminder_fired', id: 1, text: 'чайник', kind: 'remind', late_s: 0 });
+    expect(items).toEqual([{ kind: 'reminder', text: 'чайник' }]);
+    expect(reduceChat([], { type: 'reminder_fired', id: 2, text: 'сделай', kind: 'task', late_s: 0 })).toEqual([]);
+  });
+
+  it('image card needs a path', () => {
+    expect(cardData({ kind: 'image', path: 'C:\\p\\a.png' })).toEqual({ kind: 'image', path: 'C:\\p\\a.png' });
+    expect(cardData({ kind: 'image' })).toBeUndefined();
+    expect(cardData({ kind: 'image', path: '' })).toBeUndefined();
+  });
+
+  it('labels extension and window tools', () => {
+    expect(toolLabel('mcp_files_read')).toBe('tool.extension');
+    expect(toolLabel('ui_click')).toBe('tool.ui');
+    expect(toolLabel('reminder_set')).toBe('tool.reminder');
+    expect(toolLabel('unknown_tool')).toBe('tool.other');
+  });
+
+  it('counts down to a reminder', () => {
+    const now = 1_000_000_000;
+    expect(countdown(1_000_000 + 581, now)).toBe('9:41');
+    expect(countdown(1_000_000 + 3900, now)).toBe('1:05:00');
+    expect(countdown(1_000_000 - 5, now)).toBe('0:00');
+    expect(countdown(1_000_000 + 90_000, now)).toBe('');
+  });
+});
 
 describe('reduceChat', () => {
   it('user_text appends user item', () => {

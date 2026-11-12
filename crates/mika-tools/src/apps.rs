@@ -180,7 +180,8 @@ impl Tool for OpenAppTool {
     }
 }
 
-fn score(w: &WindowInfo, query: &str) -> u8 {
+/// How well a window matches a title part or a program name; 0 is no match.
+pub(crate) fn score(w: &WindowInfo, query: &str) -> u8 {
     let q = query.trim().to_lowercase();
     let q_exe = if q.ends_with(".exe") {
         q.clone()

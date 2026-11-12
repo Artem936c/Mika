@@ -39,7 +39,17 @@ impl OpenAiProvider {
 fn message_json(m: &ChatMessage) -> Value {
     match m.role {
         Role::System => json!({ "role": "system", "content": m.content }),
-        Role::User => json!({ "role": "user", "content": m.content }),
+        Role::User if m.images.is_empty() => json!({ "role": "user", "content": m.content }),
+        Role::User => {
+            let mut parts = vec![json!({ "type": "text", "text": m.content })];
+            for png in &m.images {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": format!("data:image/png;base64,{png}") },
+                }));
+            }
+            json!({ "role": "user", "content": parts })
+        }
         Role::Tool => json!({
             "role": "tool",
             "tool_call_id": m.tool_call_id.clone().unwrap_or_default(),
@@ -203,5 +213,19 @@ mod tests {
         );
         assert_eq!(b["messages"][3]["tool_call_id"], "c1");
         assert_eq!(b["tools"][0]["function"]["name"], "echo");
+    }
+
+    #[test]
+    fn picture_goes_as_a_data_url_part() {
+        let req = LlmRequest {
+            messages: vec![ChatMessage::user_with_image("что тут?", "QUJD")],
+            tools: Vec::new(),
+        };
+        let b = request_body("m", &req);
+        assert_eq!(b["messages"][0]["content"][0]["text"], "что тут?");
+        assert_eq!(
+            b["messages"][0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,QUJD"
+        );
     }
 }

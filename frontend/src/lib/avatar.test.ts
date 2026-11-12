@@ -1,38 +1,59 @@
 import { describe, expect, it } from 'vitest';
-import { EMOTION_ORDER, EMOTIONS, avatarSvg, isEmotion, reduceEmotion } from './avatar';
+import {
+  BLINK,
+  EMOTION_ORDER,
+  EYE_LAYERS,
+  MOUTH_LAYERS,
+  blinkPause,
+  canBlink,
+  canTalk,
+  frameUrl,
+  isEmotion,
+  nextMouth,
+  reduceEmotion,
+} from './avatar';
 import { isMessageKey } from './i18n';
 
-describe('avatarSvg', () => {
-  it('has a view box for head and full', () => {
-    expect(avatarSvg('head', 'neutral')).toContain('viewBox="96 92 208 208"');
-    expect(avatarSvg('full', 'neutral')).toContain('viewBox="0 0 400 520"');
+describe('frames', () => {
+  it('every emotion and layer has its own picture', () => {
+    const urls = [...EMOTION_ORDER, ...EYE_LAYERS, ...MOUTH_LAYERS].map(frameUrl);
+    for (const u of urls) expect(u).not.toBe('');
+    expect(new Set(urls).size).toBe(urls.length);
+  });
+});
+
+describe('blink and lips', () => {
+  it('blink closes the eyes and opens them again', () => {
+    expect(BLINK.map(([l]) => l)).toContain('eyes-shut');
+    expect(BLINK[BLINK.length - 1][0]).toBeNull();
+    expect(canBlink('neutral')).toBe(true);
+    expect(canBlink('joy')).toBe(false);
   });
 
-  it('every emotion renders a distinct face', () => {
-    const faces = EMOTION_ORDER.map((e) => avatarSvg('head', e));
-    expect(new Set(faces).size).toBe(10);
-    for (const face of faces) {
-      expect(face).not.toContain('undefined');
-      expect(face).not.toContain('NaN');
+  it('pause between blinks stays in a lively range', () => {
+    expect(blinkPause(0)).toBeGreaterThanOrEqual(2000);
+    expect(blinkPause(0.999)).toBeLessThanOrEqual(6000);
+  });
+
+  it('the mouth never keeps one shape twice in a row', () => {
+    let m = nextMouth(null, 0);
+    for (let i = 0; i < 50; i++) {
+      const n = nextMouth(m, (i * 0.37) % 1);
+      expect(n).not.toBe(m);
+      m = n;
     }
+    expect(nextMouth('mouth-oo', 0.9999)).not.toBe('mouth-oo');
   });
 
-  it('unknown emotion falls back to neutral', () => {
-    expect(avatarSvg('head', 'rage')).toBe(avatarSvg('head', 'neutral'));
-    expect(avatarSvg('head', undefined)).toBe(avatarSvg('head', 'neutral'));
-  });
-
-  it('refers only to gradients that AvatarDefs provides', () => {
-    const ids = [...avatarSvg('full', 'shy').matchAll(/url\(#([\w-]+)\)/g)].map((m) => m[1]);
-    const known = ['mk-hair', 'mk-tail', 'mk-back', 'mk-skin', 'mk-iris', 'mk-collar', 'mk-face', 'mk-eye-l', 'mk-eye-r'];
-    expect(ids.length).toBeGreaterThan(5);
-    for (const id of ids) expect(known).toContain(id);
+  it('lips move only where the mouth layers fit', () => {
+    expect(canTalk('neutral')).toBe(true);
+    expect(canTalk('sad')).toBe(false);
   });
 });
 
 describe('emotions', () => {
   it('ten slots, each with a name and a reason in the locale file', () => {
-    expect(Object.keys(EMOTIONS).sort()).toEqual([...EMOTION_ORDER].sort());
+    expect(EMOTION_ORDER.length).toBe(10);
     for (const e of EMOTION_ORDER) {
       expect(isMessageKey(`emotion.${e}`), e).toBe(true);
       expect(isMessageKey(`emotion.why.${e}`), e).toBe(true);

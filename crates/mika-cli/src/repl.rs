@@ -69,6 +69,28 @@ impl Renderer {
             Event::ConfirmResolved { answer, by, .. } => {
                 format!("[confirm] {answer:?} ({})", by.as_str()).to_lowercase()
             }
+            Event::ReminderFired { text, late_s, .. } => {
+                format!("[reminder] {text} (late {late_s} s)")
+            }
+            Event::UiTarget { x, y, w, h } => format!("[target] {x},{y} {w}x{h}"),
+            Event::Timing { stage, ms } => format!("[time] {stage} {ms} ms"),
+            Event::TaskUpdated { task } => {
+                let done = task
+                    .steps
+                    .iter()
+                    .filter(|s| s.status == mika_core::task::StepStatus::Done)
+                    .count();
+                let state = if task.finished {
+                    "закончена"
+                } else {
+                    "идёт"
+                };
+                format!(
+                    "[task] {} — {done}/{} — {state}",
+                    task.title,
+                    task.steps.len()
+                )
+            }
             Event::EmotionCue { emotion } | Event::EmotionChanged { emotion } => {
                 format!("[emotion] {}", emotion.as_str())
             }

@@ -2,9 +2,9 @@
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import Icon from '../Icon.svelte';
+  import MediaProviders from './MediaProviders.svelte';
   import { formatSeconds } from '../chat';
   import { t } from '../i18n';
-  import type { IconName } from '../icons';
 
   type Kind = 'openai' | 'anthropic' | 'ollama';
   interface LlmSettings {
@@ -20,12 +20,7 @@
     { id: 'anthropic', url: 'https://api.anthropic.com' },
     { id: 'ollama', url: 'http://localhost:11434/v1' },
   ];
-  // Voice and images get real settings in later epics.
-  const LATER: { icon: IconName; title: 'providers.stt' | 'providers.tts' | 'providers.image' }[] = [
-    { icon: 'mic', title: 'providers.stt' },
-    { icon: 'vol', title: 'providers.tts' },
-    { icon: 'mon', title: 'providers.image' },
-  ];
+
 
   let kind = $state<Kind>('openai');
   let baseUrl = $state('');
@@ -152,13 +147,9 @@
   </div>
 </div>
 
-{#each LATER as p (p.title)}
-  <div class="prov later">
-    <div class="ico"><Icon name={p.icon} size={19} /></div>
-    <div class="what"><b>{t(p.title)}</b><small>{t(`${p.title}_sub`)}</small></div>
-    <span class="lat">{t('providers.off')}</span>
-  </div>
-{/each}
+<MediaProviders />
+
+<p class="hint">{t('providers.speech_hint')}</p>
 
 <style>
   .prov {
@@ -170,9 +161,6 @@
     border: 1px solid var(--line);
     background: rgba(255, 255, 255, 0.03);
     margin-bottom: 10px;
-  }
-  .prov.later {
-    opacity: 0.6;
   }
   .ico {
     flex: none;

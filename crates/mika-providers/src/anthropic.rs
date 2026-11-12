@@ -43,7 +43,16 @@ pub fn request_body(model: &str, req: &LlmRequest) -> Value {
     let mut turns: Vec<(&'static str, Vec<Value>)> = Vec::new();
     for m in req.messages.iter().filter(|m| m.role != Role::System) {
         let (role, blocks) = match m.role {
-            Role::User => ("user", vec![json!({ "type": "text", "text": m.content })]),
+            Role::User => {
+                let mut b = vec![json!({ "type": "text", "text": m.content })];
+                for png in &m.images {
+                    b.push(json!({
+                        "type": "image",
+                        "source": { "type": "base64", "media_type": "image/png", "data": png },
+                    }));
+                }
+                ("user", b)
+            }
             Role::Tool => (
                 "user",
                 vec![json!({

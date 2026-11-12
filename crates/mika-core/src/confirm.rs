@@ -34,6 +34,8 @@ pub enum DecidedBy {
     Chat,
     Timeout,
     Policy,
+    Telegram,
+    Voice,
 }
 
 impl DecidedBy {
@@ -44,6 +46,8 @@ impl DecidedBy {
             DecidedBy::Chat => "chat",
             DecidedBy::Timeout => "timeout",
             DecidedBy::Policy => "policy",
+            DecidedBy::Telegram => "telegram",
+            DecidedBy::Voice => "voice",
         }
     }
 }
@@ -192,7 +196,8 @@ impl Confirmations {
     }
 }
 
-fn clean(text: &str) -> String {
+/// Lower case, `ё` as `е`, words separated by single spaces, no punctuation.
+pub fn clean(text: &str) -> String {
     text.to_lowercase()
         .replace('ё', "е")
         .chars()
@@ -260,9 +265,103 @@ pub fn parse_answer(text: &str) -> Option<Answer> {
     }
 }
 
+/// What a spoken phrase means for an open request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoiceAnswer {
+    Answer(Answer),
+    /// High risk: the user must say the name of the action. Holds that name.
+    NeedName(String),
+    /// Not an answer at all.
+    Unclear,
+}
+
+/// Rules for answering by voice (design, section 8). Recognition adds words and
+/// punctuation, so the match is looser than for typed text, except where it matters:
+/// a high-risk action is approved only by saying its name, never by "yes".
+pub fn voice_answer(text: &str, assessment: &Assessment) -> VoiceAnswer {
+    const DENY_FIRST: &[&str] = &["нет", "отмена", "отмени", "отклони", "стоп", "не"];
+    const ONCE_ANY: &[&str] = &["подтверждаю", "разрешаю", "разреши", "выполняй"];
+    let t = clean(text);
+    let words: Vec<&str> = t.split(' ').collect();
+    if parse_answer(text) == Some(Answer::Deny)
+        || words.first().is_some_and(|w| DENY_FIRST.contains(w))
+    {
+        return VoiceAnswer::Answer(Answer::Deny);
+    }
+    if assessment.level == crate::tools::RiskLevel::High {
+        let name = clean(&assessment.summary);
+        return if !name.is_empty() && t.contains(&name) {
+            VoiceAnswer::Answer(Answer::Once)
+        } else {
+            VoiceAnswer::NeedName(assessment.summary.clone())
+        };
+    }
+    match parse_answer(text) {
+        Some(answer) => VoiceAnswer::Answer(answer),
+        None if words.iter().any(|w| ONCE_ANY.contains(w)) || words.first() == Some(&"да") => {
+            VoiceAnswer::Answer(Answer::Once)
+        }
+        None => VoiceAnswer::Unclear,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn risk(level: RiskLevel, summary: &str) -> Assessment {
+        Assessment::new(level, summary, "цель", "причина")
+    }
+
+    #[test]
+    fn voice_yes_approves_low_and_medium_risk() {
+        let a = risk(RiskLevel::Medium, "Закрыть «Блокнот»");
+        for phrase in ["Да.", "Подтверждаю!", "Да, подтверждаю.", "ну разрешаю"]
+        {
+            assert_eq!(
+                voice_answer(phrase, &a),
+                VoiceAnswer::Answer(Answer::Once),
+                "{phrase}"
+            );
+        }
+        assert_eq!(
+            voice_answer("Разреши всегда", &a),
+            VoiceAnswer::Answer(Answer::Always)
+        );
+        assert_eq!(voice_answer("какая погода", &a), VoiceAnswer::Unclear);
+    }
+
+    #[test]
+    fn voice_high_risk_needs_the_action_name() {
+        let a = risk(RiskLevel::High, "Выключить компьютер");
+        for phrase in ["Да", "Подтверждаю", "Разреши всегда", "выключить"]
+        {
+            assert_eq!(
+                voice_answer(phrase, &a),
+                VoiceAnswer::NeedName("Выключить компьютер".into()),
+                "{phrase}"
+            );
+        }
+        assert_eq!(
+            voice_answer("Да, выключить компьютер.", &a),
+            VoiceAnswer::Answer(Answer::Once)
+        );
+    }
+
+    #[test]
+    fn voice_no_denies_any_risk() {
+        for level in [RiskLevel::Low, RiskLevel::High] {
+            let a = risk(level, "Выключить компьютер");
+            for phrase in ["Нет.", "Отмена", "Нет, не выключай компьютер", "Стоп!"]
+            {
+                assert_eq!(
+                    voice_answer(phrase, &a),
+                    VoiceAnswer::Answer(Answer::Deny),
+                    "{phrase}"
+                );
+            }
+        }
+    }
 
     fn setup() -> (
         Arc<Confirmations>,

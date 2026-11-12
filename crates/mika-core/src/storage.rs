@@ -51,7 +51,45 @@ const MIGRATIONS: &[&str] = &[
         title TEXT NOT NULL,
         body TEXT NOT NULL
     );",
+    "CREATE TABLE reminders (
+        id INTEGER PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        due_at INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        repeat TEXT NOT NULL,
+        done INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX reminders_due ON reminders(done, due_at);
+    CREATE TABLE todos (
+        id INTEGER PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        text TEXT NOT NULL,
+        due TEXT,
+        done INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE TABLE facts (
+        id INTEGER PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        text TEXT NOT NULL
+    );
+    CREATE TABLE commands (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        key TEXT NOT NULL UNIQUE,
+        prompt TEXT NOT NULL
+    );",
+    "ALTER TABLE facts ADD COLUMN embedding BLOB;
+    ALTER TABLE facts ADD COLUMN embedding_model TEXT;
+    CREATE TABLE message_vectors (
+        message_id INTEGER PRIMARY KEY,
+        model TEXT NOT NULL,
+        embedding BLOB NOT NULL
+    );",
 ];
+
+/// Conversations put aside by "new conversation" get this prefix.
+pub const ARCHIVE_PREFIX: &str = "archive-";
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -110,6 +148,95 @@ impl Db {
         })
     }
 
+    /// Puts the conversation aside under an archive name. Returns how many messages moved.
+    pub fn archive_messages(&self, conversation: &str) -> Result<usize, DbError> {
+        let name = format!(
+            "{ARCHIVE_PREFIX}{}",
+            chrono::Local::now().format("%Y%m%d-%H%M%S")
+        );
+        self.with(|c| {
+            c.execute(
+                "UPDATE messages SET conversation = ?2 WHERE conversation = ?1",
+                params![conversation, name],
+            )
+        })
+    }
+
+    /// Deletes every archived conversation. Returns how many messages went.
+    pub fn clear_archive(&self) -> Result<usize, DbError> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM messages WHERE conversation LIKE ?1",
+                [format!("{ARCHIVE_PREFIX}%")],
+            )
+        })
+    }
+
+    pub fn archive_size(&self) -> Result<usize, DbError> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM messages WHERE conversation LIKE ?1",
+                [format!("{ARCHIVE_PREFIX}%")],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .map(|n| n as usize)
+    }
+
+    /// The newest user and assistant messages of every conversation: (id, date, role, text).
+    pub fn recent_text_messages(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, crate::llm::Role, String)>, DbError> {
+        use crate::llm::Role;
+        let rows: Vec<(i64, String, String)> = self.with(|c| {
+            let mut st =
+                c.prepare("SELECT id, created_at, body FROM messages ORDER BY id DESC LIMIT ?1")?;
+            let rows = st.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect()
+        })?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, at, body)| {
+                let m = serde_json::from_str::<ChatMessage>(&body).ok()?;
+                (matches!(m.role, Role::User | Role::Assistant) && !m.content.trim().is_empty())
+                    .then_some((id, at, m.role, m.content))
+            })
+            .collect())
+    }
+
+    /// User and assistant messages of every conversation that contain all `words`,
+    /// newest first: (date, role, text). Case is ignored, Cyrillic included.
+    pub fn search_messages(
+        &self,
+        words: &[String],
+        limit: usize,
+    ) -> Result<Vec<(String, crate::llm::Role, String)>, DbError> {
+        use crate::llm::Role;
+        let rows: Vec<(String, String)> = self.with(|c| {
+            let mut st = c.prepare("SELECT created_at, body FROM messages ORDER BY id DESC")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect()
+        })?;
+        let mut out = Vec::new();
+        for (at, body) in rows {
+            let Ok(m) = serde_json::from_str::<ChatMessage>(&body) else {
+                continue;
+            };
+            if !matches!(m.role, Role::User | Role::Assistant) || m.content.trim().is_empty() {
+                continue;
+            }
+            let hay = m.content.to_lowercase();
+            if words.iter().all(|w| hay.contains(&w.to_lowercase())) {
+                out.push((at, m.role, m.content));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn load_messages(&self, conversation: &str) -> Result<Vec<ChatMessage>, DbError> {
         let bodies: Vec<String> = self.with(|c| {
             let mut st =
@@ -149,6 +276,26 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         db.append_message("a", &ChatMessage::user("1")).unwrap();
         assert!(db.load_messages("b").unwrap().is_empty());
+    }
+
+    #[test]
+    fn archived_conversation_leaves_main_but_stays_searchable() {
+        let db = Db::open_in_memory().unwrap();
+        db.append_message("main", &ChatMessage::user("Мой кот Барсик"))
+            .unwrap();
+        db.append_message("main", &ChatMessage::assistant("Запомнила"))
+            .unwrap();
+        assert_eq!(db.archive_messages("main").unwrap(), 2);
+        assert!(db.load_messages("main").unwrap().is_empty());
+        assert_eq!(db.archive_size().unwrap(), 2);
+        let found = db.search_messages(&["барсик".into()], 5).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].2, "Мой кот Барсик");
+        assert_eq!(db.clear_archive().unwrap(), 2);
+        assert!(db
+            .search_messages(&["барсик".into()], 5)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -1,9 +1,10 @@
 // Chat items folded from bus events. Pure functions.
 
 import type { MessageKey } from './i18n';
+import { TASK_TOOLS } from './task';
 
 export interface ChatItem {
-  kind: 'user' | 'assistant' | 'tool' | 'error';
+  kind: 'user' | 'assistant' | 'tool' | 'error' | 'reminder' | 'timing';
   text: string;
   /** Tool call id for tool rows. */
   id?: string;
@@ -15,6 +16,36 @@ export interface ChatItem {
   pending?: boolean;
   /** Card drawn under a finished tool row. */
   data?: CardData;
+  /** For a timing row: how long each stage of the reply took, milliseconds. */
+  timings?: Timings;
+  /** A timing row is drawn only once its reply has ended. */
+  done?: boolean;
+}
+
+/** Stages of a reply: speech to text, first piece of the answer, first sound. */
+export interface Timings {
+  stt?: number;
+  llm?: number;
+  tts?: number;
+}
+
+const STAGES = ['stt', 'llm', 'tts'] as const;
+type Stage = (typeof STAGES)[number];
+const isStage = (v: unknown): v is Stage => typeof v === 'string' && (STAGES as readonly string[]).includes(v);
+
+/** Folds the timing rows of the reply that just ended into one row under it. */
+function settleTimings(items: ChatItem[]): ChatItem[] {
+  const open = items.filter((it) => it.kind === 'timing' && !it.done);
+  if (open.length === 0) return items;
+  const timings: Timings = Object.assign({}, ...open.map((it) => it.timings));
+  return [...items.filter((it) => !(it.kind === 'timing' && !it.done)), { kind: 'timing', text: '', timings, done: true }];
+}
+
+/** Open timing rows that belong to a reply that never ended; the trailing ones are for the new message. */
+function dropStaleTimings(items: ChatItem[]): ChatItem[] {
+  let tail = items.length;
+  while (tail > 0 && items[tail - 1].kind === 'timing' && !items[tail - 1].done) tail -= 1;
+  return [...items.slice(0, tail).filter((it) => !(it.kind === 'timing' && !it.done)), ...items.slice(tail)];
 }
 
 export interface WeatherDay {
@@ -40,7 +71,13 @@ export interface VolumeData {
   was: number;
 }
 
-export type CardData = WeatherData | VolumeData;
+/** A picture the assistant saved: generated or a screenshot. */
+export interface ImageData {
+  kind: 'image';
+  path: string;
+}
+
+export type CardData = WeatherData | VolumeData | ImageData;
 
 const num = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 
@@ -55,6 +92,9 @@ export function cardData(v: unknown): CardData | undefined {
   if (!d) return undefined;
   if (d.kind === 'volume' && num(d.level) && num(d.was)) {
     return { kind: 'volume', level: d.level, was: d.was };
+  }
+  if (d.kind === 'image' && typeof d.path === 'string' && d.path) {
+    return { kind: 'image', path: d.path };
   }
   if (
     d.kind === 'weather' &&
@@ -89,7 +129,35 @@ export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
   switch (e.type) {
     case 'user_text': {
       const text = str(e.text);
-      return text === null ? items : [...finishStreaming(items), { kind: 'user', text }];
+      return text === null ? items : [...dropStaleTimings(finishStreaming(items)), { kind: 'user', text }];
+    }
+    case 'timing': {
+      if (!isStage(e.stage) || !num(e.ms)) return items;
+      const stage = { [e.stage]: e.ms };
+      // Recognition opens a new turn: rows left open by a reply that never ended are dropped.
+      if (e.stage === 'stt') {
+        return [...items.filter((it) => !(it.kind === 'timing' && !it.done)), { kind: 'timing', text: '', timings: stage }];
+      }
+      // A row of this reply is already open: the stage joins it where it stands.
+      const open = items.findIndex((it) => it.kind === 'timing' && !it.done);
+      if (open >= 0) {
+        const next = items.slice();
+        next[open] = { ...next[open], timings: { ...next[open].timings, ...stage } };
+        return next;
+      }
+      const last = items[items.length - 1];
+      // The first sound often comes after the text has ended: it joins the finished row.
+      if (e.stage === 'tts' && last?.kind === 'timing') {
+        return [...items.slice(0, -1), { ...last, timings: { ...last.timings, ...stage } }];
+      }
+      if (e.stage === 'tts' && last?.kind === 'assistant' && !last.pending) {
+        return [...items, { kind: 'timing', text: '', timings: stage, done: true }];
+      }
+      // The text still arriving stays last, so the next piece finds it.
+      if (last?.kind === 'assistant' && last.pending) {
+        return [...items.slice(0, -1), { kind: 'timing', text: '', timings: stage }, last];
+      }
+      return [...items, { kind: 'timing', text: '', timings: stage }];
     }
     case 'assistant_delta': {
       const text = str(e.text);
@@ -104,19 +172,19 @@ export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
       const text = str(e.text);
       if (text === null) return items;
       const idx = items.findIndex((it) => it.kind === 'assistant' && it.pending);
-      if (idx >= 0) return finishStreaming(items);
-      return text ? [...items, { kind: 'assistant', text }] : items;
+      if (idx >= 0) return settleTimings(finishStreaming(items));
+      return text ? settleTimings([...items, { kind: 'assistant', text }]) : items;
     }
     case 'tool_started': {
       const id = str(e.id);
       const name = str(e.name);
-      if (id === null || name === null) return items;
+      if (id === null || name === null || TASK_TOOLS.includes(name)) return items;
       return [...finishStreaming(items), { kind: 'tool', id, name, text: str(e.summary) ?? name, pending: true }];
     }
     case 'tool_finished': {
       const id = str(e.id);
       const name = str(e.name);
-      if (id === null || name === null) return items;
+      if (id === null || name === null || TASK_TOOLS.includes(name)) return items;
       const ok = e.ok === true;
       const ms = typeof e.elapsed_ms === 'number' ? e.elapsed_ms : undefined;
       const idx = items.findIndex((it) => it.kind === 'tool' && it.id === id);
@@ -130,6 +198,12 @@ export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
     case 'error': {
       const message = str(e.message);
       return message === null ? items : [...finishStreaming(items), { kind: 'error', text: message }];
+    }
+    case 'reminder_fired': {
+      const text = str(e.text);
+      // A scheduled task shows up as its own user message when it starts.
+      if (text === null || e.kind === 'task') return items;
+      return [...finishStreaming(items), { kind: 'reminder', text }];
     }
     default:
       return items;
@@ -192,11 +266,55 @@ const TOOL_GROUPS: Record<string, MessageKey> = {
   web_search: 'tool.search',
   get_weather: 'tool.weather',
   get_time: 'tool.time',
+  archive_create: 'tool.files',
+  archive_extract: 'tool.files',
+  arrange_window: 'tool.window',
+  radio: 'tool.device',
+  brightness: 'tool.device',
+  get_rates: 'tool.rates',
+  get_news: 'tool.news',
+  reminder_set: 'tool.reminder',
+  reminder_list: 'tool.reminder',
+  reminder_cancel: 'tool.reminder',
+  todo_add: 'tool.todo',
+  todo_list: 'tool.todo',
+  todo_done: 'tool.todo',
+  todo_remove: 'tool.todo',
+  memory_save: 'tool.memory',
+  memory_search: 'tool.memory',
+  memory_forget: 'tool.memory',
+  history_search: 'tool.memory',
+  media_control: 'tool.media',
+  now_playing: 'tool.media',
+  ui_read: 'tool.ui',
+  ui_click: 'tool.ui',
+  ui_type: 'tool.ui',
+  ui_keys: 'tool.ui',
+  ui_scroll: 'tool.ui',
+  screen_look: 'tool.screen',
+  screen_text: 'tool.screen',
+  screenshot_save: 'tool.screen',
+  generate_image: 'tool.image',
+  command_save: 'tool.command',
+  command_list: 'tool.command',
+  command_delete: 'tool.command',
 };
 
 /** Short label of the tool group for the pill in the "thinking" island. */
 export function toolLabel(name: string): MessageKey {
+  if (name.startsWith('mcp_')) return 'tool.extension';
   return Object.prototype.hasOwnProperty.call(TOOL_GROUPS, name) ? TOOL_GROUPS[name] : 'tool.other';
+}
+
+/** Time left until `dueAt` (unix seconds): `9:41`, `1:05:00`, or nothing when it is over a day away. */
+export function countdown(dueAt: number, nowMs: number): string {
+  const left = Math.max(0, Math.round(dueAt - nowMs / 1000));
+  if (left >= 86_400) return '';
+  const h = Math.floor(left / 3600);
+  const m = Math.floor((left % 3600) / 60);
+  const s = left % 60;
+  const two = (n: number) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${two(m)}:${two(s)}` : `${m}:${two(s)}`;
 }
 
 /** Short weekday of an ISO date, capitalised; empty for a bad date. */

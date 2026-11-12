@@ -23,7 +23,7 @@ const EXECUTABLE: &[&str] = &[
     "reg", "hta", "cpl", "jar",
 ];
 
-fn path_assessment(
+pub(crate) fn path_assessment(
     path: &Path,
     user_profile: &str,
     access: PathAccess,
@@ -37,7 +37,7 @@ fn path_assessment(
         .with_scope(shown.to_lowercase())
 }
 
-fn path_arg(args: &Value, key: &str, profile: &str) -> Result<PathBuf, ToolError> {
+pub(crate) fn path_arg(args: &Value, key: &str, profile: &str) -> Result<PathBuf, ToolError> {
     let raw = arg_str(args, key)?;
     if raw.trim().is_empty() {
         return Err(ToolError::BadArguments(format!("пустой путь `{key}`")));

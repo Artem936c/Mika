@@ -26,7 +26,7 @@ export const SETTINGS_SHAPE: IslandShape = { width: 860, height: 500, radius: 34
 /** Width of the avatar column in the wide chat. */
 export const AVATAR_COLUMN = 290;
 
-export type View = 'island' | 'chat' | 'settings';
+export type View = 'island' | 'chat' | 'settings' | 'welcome';
 
 export function isAssistantState(value: unknown): value is AssistantState {
   return typeof value === 'string' && Object.prototype.hasOwnProperty.call(ISLAND_SHAPES, value);
@@ -42,7 +42,7 @@ export function shapeFor(state: unknown): IslandShape {
 
 /** Island shape for the open panel and the assistant state. An open panel wins over the state. */
 export function viewShape(view: View, state: AssistantState, wide: boolean): IslandShape {
-  if (view === 'settings') return SETTINGS_SHAPE;
+  if (view === 'settings' || view === 'welcome') return SETTINGS_SHAPE;
   if (view === 'chat') return wide ? CHAT_WIDE : CHAT_NARROW;
   return shapeFor(state);
 }

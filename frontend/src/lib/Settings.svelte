@@ -1,16 +1,21 @@
 <script lang="ts">
   import Avatar from './Avatar.svelte';
+  import { dragRegion } from './drag';
   import General from './General.svelte';
   import Icon from './Icon.svelte';
   import Permissions from './Permissions.svelte';
   import type { Emotion } from './avatar';
   import { t, type MessageKey } from './i18n';
   import type { IconName } from './icons';
+  import Extensions from './settings/Extensions.svelte';
+  import IslandPage from './settings/IslandPage.svelte';
+  import Memory from './settings/Memory.svelte';
   import Persona from './settings/Persona.svelte';
   import Providers from './settings/Providers.svelte';
   import Tools from './settings/Tools.svelte';
+  import Voice from './settings/Voice.svelte';
 
-  type Page = 'persona' | 'providers' | 'permissions' | 'tools' | 'general';
+  type Page = 'persona' | 'providers' | 'permissions' | 'tools' | 'memory' | 'extensions' | 'voice' | 'island' | 'general';
 
   let {
     name,
@@ -24,13 +29,11 @@
     { id: 'providers', icon: 'plug', lead: 'providers.lead' },
     { id: 'permissions', icon: 'shield', lead: 'permissions.lead' },
     { id: 'tools', icon: 'wrench', lead: 'tools.lead' },
+    { id: 'memory', icon: 'brain', lead: 'memory.lead' },
+    { id: 'extensions', icon: 'puzzle', lead: 'ext.lead' },
+    { id: 'voice', icon: 'vol', lead: 'voice.lead' },
+    { id: 'island', icon: 'mon', lead: 'island.lead' },
     { id: 'general', icon: 'set', lead: 'general.lead' },
-  ];
-  // Pages of later epics: visible, so the layout does not jump when they arrive.
-  const LATER: { id: 'voice' | 'island' | 'memory'; icon: IconName }[] = [
-    { id: 'voice', icon: 'mic' },
-    { id: 'island', icon: 'mon' },
-    { id: 'memory', icon: 'folder' },
   ];
 
   // svelte-ignore state_referenced_locally
@@ -41,7 +44,7 @@
 <svelte:window onkeydown={(e) => e.key === 'Escape' && onback()} />
 
 <div class="app">
-  <aside class="side">
+  <aside class="side" use:dragRegion>
     <div class="me">
       <button class="ib" onclick={onback} title={t('settings.back')} aria-label={t('settings.back')}><Icon name="back" /></button>
       <Avatar view="head" {emotion} size={32} />
@@ -52,9 +55,6 @@
         <button class:on={page === p.id} aria-current={page === p.id ? 'page' : undefined} onclick={() => (page = p.id)}>
           <Icon name={p.icon} />{t(`settings.page.${p.id}`)}
         </button>
-      {/each}
-      {#each LATER as p (p.id)}
-        <button class="off" disabled title={t('settings.later')}><Icon name={p.icon} />{t(`settings.page.${p.id}`)}</button>
       {/each}
     </nav>
   </aside>
@@ -72,6 +72,14 @@
           <Permissions {name} />
         {:else if page === 'tools'}
           <Tools />
+        {:else if page === 'memory'}
+          <Memory />
+        {:else if page === 'extensions'}
+          <Extensions />
+        {:else if page === 'voice'}
+          <Voice {name} />
+        {:else if page === 'island'}
+          <IslandPage />
         {:else}
           <General {name} />
         {/if}
@@ -118,7 +126,7 @@
     gap: 10px;
     width: 100%;
     box-sizing: border-box;
-    padding: 10px 12px;
+    padding: 8px 12px;
     border-radius: 12px;
     font-size: 13.5px;
     font-weight: 600;
@@ -132,10 +140,6 @@
   nav button.on {
     color: #fff;
     background: rgba(143, 125, 255, 0.18);
-  }
-  nav button.off {
-    opacity: 0.45;
-    cursor: default;
   }
   .page {
     min-width: 0;

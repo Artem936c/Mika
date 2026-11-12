@@ -13,12 +13,16 @@ use crate::emotion::Emotion;
 use crate::events::{Event, EventBus};
 use crate::gate::{Gate, GateDecision};
 use crate::llm::{ChatMessage, LlmChunk, LlmError, LlmProvider, LlmRequest, ToolCall};
+use crate::memory::Recall;
 use crate::state::{AssistantState, StateHandle};
 use crate::storage::Db;
+use crate::task::{TaskBoard, TASK_MAX_STEPS};
 use crate::tools::ToolRegistry;
 
-/// LLM calls per user message.
+/// LLM calls per user message. A task with a plan gets `task::TASK_MAX_STEPS`.
 pub const MAX_STEPS: usize = 8;
+/// Reminders per message that a plan still has open steps.
+const MAX_NUDGES: usize = 2;
 /// Tool output sent back to the LLM, characters.
 const MAX_TOOL_RESULT: usize = 16_000;
 /// Tool output shown in the chat row, characters.
@@ -71,7 +75,11 @@ pub fn system_prompt(assistant: &AssistantConfig) -> String {
 Не говори, что сделала действие, пока инструмент не вернул успех. \
 Если пользователь отклонил действие, прими это и предложи другой путь. \
 Не придумывай факты о системе: проверь инструментом или скажи, что не знаешь. \
-Ты умеешь шутить, рассказывать анекдоты и играть в словесные игры без инструментов.\n\
+Ты умеешь шутить, рассказывать анекдоты, переводить и играть в словесные игры без инструментов. \
+Когда пользователь сообщает о себе что-то важное на будущее (имя, близкие, предпочтения, даты), \
+сохрани это инструментом memory_save. \
+Чтобы действовать в окне программы, сначала прочитай его через ui_read, потом нажимай и печатай \
+по номерам элементов; после каждого действия читай окно заново.\n\
 {persona}\n\
 В самом начале ответа можешь поставить одну метку эмоции в квадратных скобках: \
 [joy] радость, [shy] смущение, [surprise] удивление, [sad] грусть, [angry] сердишься, \
@@ -163,9 +171,16 @@ impl TagFilter {
     }
 }
 
+/// Adds a paragraph to the system prompt of each request: the time, remembered facts.
+pub type PromptExtra = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 pub struct Agent {
     provider: RwLock<Arc<dyn LlmProvider>>,
-    registry: Arc<ToolRegistry>,
+    registry: RwLock<Arc<ToolRegistry>>,
+    extras: RwLock<Vec<PromptExtra>>,
+    recall: RwLock<Option<Arc<dyn Recall>>>,
+    /// What memory returned for the message being answered.
+    recalled: Mutex<Option<String>>,
     gate: Arc<dyn Gate>,
     bus: EventBus,
     state: StateHandle,
@@ -173,6 +188,8 @@ pub struct Agent {
     history: Mutex<Vec<ChatMessage>>,
     store: Option<(Arc<Db>, String)>,
     turn: tokio::sync::Mutex<()>,
+    /// Plan of the message being answered; with a plan the step limit is higher.
+    tasks: RwLock<Option<TaskBoard>>,
 }
 
 impl Agent {
@@ -186,7 +203,10 @@ impl Agent {
     ) -> Self {
         Self {
             provider: RwLock::new(provider),
-            registry,
+            registry: RwLock::new(registry),
+            extras: RwLock::new(Vec::new()),
+            recall: RwLock::new(None),
+            recalled: Mutex::new(None),
             gate,
             bus,
             state,
@@ -194,6 +214,19 @@ impl Agent {
             history: Mutex::new(Vec::new()),
             store: None,
             turn: tokio::sync::Mutex::new(()),
+            tasks: RwLock::new(None),
+        }
+    }
+
+    /// The board that `task_plan` and `task_step` write to.
+    pub fn set_task_board(&self, board: TaskBoard) {
+        *self.tasks.write() = Some(board);
+    }
+
+    fn step_limit(&self) -> usize {
+        match self.tasks.read().as_ref() {
+            Some(b) if b.active() => TASK_MAX_STEPS,
+            _ => MAX_STEPS,
         }
     }
 
@@ -212,8 +245,47 @@ impl Agent {
         *self.provider.write() = provider;
     }
 
+    /// Replaces the tool set, for example when an MCP server connects.
+    pub fn set_registry(&self, registry: Arc<ToolRegistry>) {
+        *self.registry.write() = registry;
+    }
+
+    pub fn registry(&self) -> Arc<ToolRegistry> {
+        self.registry.read().clone()
+    }
+
+    /// Memory asked once per user message; its answer joins the system prompt.
+    pub fn set_recall(&self, recall: Arc<dyn Recall>) {
+        *self.recall.write() = Some(recall);
+    }
+
+    pub fn add_prompt_extra(&self, extra: PromptExtra) {
+        self.extras.write().push(extra);
+    }
+
+    fn full_system_prompt(&self) -> String {
+        let mut prompt = self.system_prompt.read().clone();
+        for extra in self.extras.read().iter() {
+            if let Some(text) = extra().filter(|t| !t.trim().is_empty()) {
+                prompt.push_str("\n\n");
+                prompt.push_str(text.trim());
+            }
+        }
+        if let Some(text) = self.recalled.lock().as_deref() {
+            prompt.push_str("\n\n");
+            prompt.push_str(text.trim());
+        }
+        prompt
+    }
+
     pub fn set_system_prompt(&self, prompt: String) {
         *self.system_prompt.write() = prompt;
+    }
+
+    /// Adds an assistant message that no reply produced, such as a fired reminder,
+    /// so the next reply knows about it.
+    pub fn append_note(&self, text: &str) {
+        self.commit(vec![ChatMessage::assistant(text)]);
     }
 
     pub fn history(&self) -> Vec<ChatMessage> {
@@ -230,13 +302,43 @@ impl Agent {
         text: &str,
         cancel: CancellationToken,
     ) -> Result<String, AgentError> {
+        self.handle_expanded(text, text, cancel).await
+    }
+
+    /// Like `handle`, but the chat shows `shown` while the model gets `text`:
+    /// a user command expands into its instruction.
+    pub async fn handle_expanded(
+        &self,
+        shown: &str,
+        text: &str,
+        cancel: CancellationToken,
+    ) -> Result<String, AgentError> {
         let _turn = self.turn.lock().await;
         let text = text.trim();
-        self.bus.publish(Event::UserText { text: text.into() });
+        self.bus.publish(Event::UserText {
+            text: shown.trim().into(),
+        });
         self.state.set(AssistantState::Thinking);
 
+        let recall = self.recall.read().clone();
+        let recalled = match recall {
+            Some(r) => tokio::select! {
+                _ = cancel.cancelled() => None,
+                found = r.recall(text) => found,
+            },
+            None => None,
+        };
+        *self.recalled.lock() = recalled;
+
+        let board = self.tasks.read().clone();
+        if let Some(b) = &board {
+            b.clear();
+        }
         let mut new_msgs = vec![ChatMessage::user(text)];
         let result = self.run_steps(&mut new_msgs, &cancel).await;
+        if let Some(b) = &board {
+            b.finish(result.is_err());
+        }
 
         match &result {
             Ok(reply) => {
@@ -276,9 +378,32 @@ impl Agent {
         msgs: &mut Vec<ChatMessage>,
         cancel: &CancellationToken,
     ) -> Result<String, AgentError> {
-        for _ in 0..MAX_STEPS {
-            let (text, calls) = self.one_step(msgs, cancel).await?;
+        let mut step = 0;
+        let mut nudges = 0;
+        while step < self.step_limit() {
+            let (text, calls) = self.one_step(msgs, cancel, step == 0).await?;
+            step += 1;
             if calls.is_empty() {
+                // Small models stop in the middle of a plan: remind them once or twice.
+                let open = self
+                    .tasks
+                    .read()
+                    .as_ref()
+                    .map(TaskBoard::open_steps)
+                    .unwrap_or_default();
+                if !open.is_empty() && nudges < MAX_NUDGES {
+                    nudges += 1;
+                    if !text.is_empty() {
+                        msgs.push(ChatMessage::assistant(text));
+                    }
+                    let list: Vec<String> = open.iter().map(usize::to_string).collect();
+                    msgs.push(ChatMessage::user(format!(
+                        "(служебная заметка) В плане не закрыты шаги {}. Продолжай их выполнять \
+и отмечай task_step, а если шаг не выходит — отметь failed с причиной и скажи пользователю.",
+                        list.join(", ")
+                    )));
+                    continue;
+                }
                 msgs.push(ChatMessage::assistant(text.clone()));
                 return Ok(text);
             }
@@ -298,8 +423,12 @@ impl Agent {
         &self,
         msgs: &[ChatMessage],
         cancel: &CancellationToken,
+        // The first request of a turn reports how long the provider took to start answering.
+        timed: bool,
     ) -> Result<(String, Vec<ToolCall>), AgentError> {
-        let mut messages = vec![ChatMessage::system(self.system_prompt.read().clone())];
+        let asked = Instant::now();
+        let mut waiting_first = timed;
+        let mut messages = vec![ChatMessage::system(self.full_system_prompt())];
         messages.extend(
             trim_history(&self.history.lock(), HISTORY_BUDGET)
                 .iter()
@@ -308,7 +437,7 @@ impl Agent {
         messages.extend(msgs.iter().cloned());
         let req = LlmRequest {
             messages,
-            tools: self.registry.specs(),
+            tools: self.registry().specs(),
         };
         let provider = self.provider.read().clone();
 
@@ -333,6 +462,15 @@ impl Agent {
                 _ = cancel.cancelled() => return Err(AgentError::Cancelled),
                 c = stream.next() => c,
             };
+            if waiting_first && matches!(chunk, Some(Ok(_))) {
+                waiting_first = false;
+                let ms = asked.elapsed().as_millis() as u64;
+                log::info!("first piece of the answer after {ms} ms");
+                self.bus.publish(Event::Timing {
+                    stage: "llm".into(),
+                    ms,
+                });
+            }
             match chunk {
                 None => {
                     let rest = tags.finish();
@@ -373,7 +511,7 @@ impl Agent {
             .enumerate()
             .map(|(i, item)| {
                 let name = item.get("name")?.as_str()?;
-                self.registry.get(name)?;
+                self.registry().get(name)?;
                 let arguments = match item.get("arguments") {
                     None | Some(Value::Null) => Value::Object(Default::default()),
                     Some(v @ Value::Object(_)) => v.clone(),
@@ -403,7 +541,7 @@ impl Agent {
     /// Runs one tool call. Always returns text for the LLM, errors included.
     async fn execute(&self, call: &ToolCall, cancel: &CancellationToken) -> String {
         let started = Instant::now();
-        let Some(tool) = self.registry.get(&call.name) else {
+        let Some(tool) = self.registry().get(&call.name) else {
             let msg = format!("Ошибка: инструмента `{}` нет.", call.name);
             self.finish(call, false, &msg, None, started);
             return msg;
@@ -683,6 +821,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn planned_task_runs_past_the_plain_limit_and_closes() {
+        use crate::task::{StepStatus, TaskPlanTool, TaskStepTool};
+        let steps: Vec<String> = (1..=6).map(|i| format!("шаг {i}")).collect();
+        let mut scripts = vec![Some(vec![call(
+            "p",
+            "task_plan",
+            json!({"title": "длинная", "steps": steps}),
+        )])];
+        for i in 1..=6 {
+            scripts.push(Some(vec![call(
+                &format!("a{i}"),
+                "task_step",
+                json!({"step": i, "status": "active"}),
+            )]));
+            scripts.push(Some(vec![call(
+                &format!("d{i}"),
+                "task_step",
+                json!({"step": i, "status": "done"}),
+            )]));
+        }
+        scripts.push(Some(vec![text("Всё сделала")]));
+        let p = FakeProvider::new(scripts);
+        let bus = EventBus::new(256);
+        let mut rx = bus.subscribe();
+        let state = StateHandle::new(bus.clone());
+        let board = TaskBoard::new(bus.clone());
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(TaskPlanTool(board.clone())));
+        reg.register(Arc::new(TaskStepTool(board.clone())));
+        let a = Agent::new(
+            p.clone(),
+            Arc::new(reg),
+            Arc::new(LowRiskOnlyGate),
+            bus,
+            state,
+            "s".into(),
+        );
+        a.set_task_board(board.clone());
+        assert_eq!(
+            a.handle("x", CancellationToken::new()).await,
+            Ok("Всё сделала".into())
+        );
+        assert_eq!(p.requests.lock().len(), 14);
+        let t = board.get().unwrap();
+        assert!(t.finished && t.ok);
+        assert!(t.steps.iter().all(|s| s.status == StepStatus::Done));
+        assert!(drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, Event::TaskUpdated { task } if task.finished)));
+    }
+
+    #[tokio::test]
+    async fn open_steps_get_a_reminder_then_the_reply_ends() {
+        use crate::task::{TaskPlanTool, TaskStepTool};
+        let p = FakeProvider::new(vec![
+            Some(vec![call(
+                "p",
+                "task_plan",
+                json!({"title": "т", "steps": ["a", "b"]}),
+            )]),
+            Some(vec![text("Начала.")]),
+            Some(vec![call(
+                "d1",
+                "task_step",
+                json!({"step": 1, "status": "done"}),
+            )]),
+            Some(vec![text("Ещё чуть.")]),
+            Some(vec![text("Всё, дальше не могу.")]),
+        ]);
+        let bus = EventBus::new(256);
+        let state = StateHandle::new(bus.clone());
+        let board = TaskBoard::new(bus.clone());
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(TaskPlanTool(board.clone())));
+        reg.register(Arc::new(TaskStepTool(board.clone())));
+        let a = Agent::new(
+            p.clone(),
+            Arc::new(reg),
+            Arc::new(LowRiskOnlyGate),
+            bus,
+            state,
+            "s".into(),
+        );
+        a.set_task_board(board.clone());
+        assert_eq!(
+            a.handle("x", CancellationToken::new()).await,
+            Ok("Всё, дальше не могу.".into())
+        );
+        let reqs = p.requests.lock();
+        assert_eq!(reqs.len(), 5);
+        let last_user = reqs[2]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .unwrap();
+        assert!(last_user.content.contains("не закрыты шаги 1, 2"));
+        let last_user = reqs[4]
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .unwrap();
+        assert!(last_user.content.contains("не закрыты шаги 2"));
+        let t = board.get().unwrap();
+        assert!(t.finished && !t.ok, "step 2 never ran");
+    }
+
+    #[tokio::test]
     async fn cancel_stops_stream_and_returns_to_idle() {
         let p = FakeProvider::new(vec![None]);
         let (a, mut rx, state) = agent(p);
@@ -921,6 +1168,84 @@ mod tests {
             e,
             Event::ToolFinished { data: Some(d), .. } if d["kind"] == "volume" && d["level"] == 40
         )));
+    }
+
+    #[tokio::test]
+    async fn prompt_extras_and_new_registry_reach_the_next_request() {
+        let p = FakeProvider::new(vec![Some(vec![text("а")]), Some(vec![text("б")])]);
+        let (a, _rx, _) = agent(p.clone());
+        a.add_prompt_extra(Arc::new(|| Some("Помни: кот Барсик".into())));
+        a.add_prompt_extra(Arc::new(|| None));
+        a.handle("1", CancellationToken::new()).await.unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool));
+        a.set_registry(Arc::new(reg));
+        a.handle("2", CancellationToken::new()).await.unwrap();
+        let reqs = p.requests.lock();
+        assert_eq!(reqs[0].messages[0].content, "sys\n\nПомни: кот Барсик");
+        assert_eq!(reqs[0].tools.len(), 2);
+        assert_eq!(reqs[1].tools.len(), 1);
+    }
+
+    struct FixedRecall;
+
+    #[async_trait]
+    impl Recall for FixedRecall {
+        async fn recall(&self, user_text: &str) -> Option<String> {
+            user_text
+                .contains("кот")
+                .then(|| "Факт: кот Барсик".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn first_piece_of_a_turn_is_timed_once() {
+        let p = FakeProvider::new(vec![
+            Some(vec![call("c1", "echo", json!({"text": "x"}))]),
+            Some(vec![text("Готово")]),
+        ]);
+        let (a, mut rx, _) = agent(p);
+        a.handle("x", CancellationToken::new()).await.unwrap();
+        let timings: Vec<Event> = drain(&mut rx)
+            .into_iter()
+            .filter(|e| matches!(e, Event::Timing { .. }))
+            .collect();
+        assert_eq!(timings.len(), 1);
+        assert!(matches!(&timings[0], Event::Timing { stage, .. } if stage == "llm"));
+    }
+
+    #[tokio::test]
+    async fn recall_joins_the_prompt_only_for_its_own_message() {
+        let p = FakeProvider::new(vec![Some(vec![text("а")]), Some(vec![text("б")])]);
+        let (a, _rx, _) = agent(p.clone());
+        a.set_recall(Arc::new(FixedRecall));
+        a.handle("как мой кот?", CancellationToken::new())
+            .await
+            .unwrap();
+        a.handle("погода", CancellationToken::new()).await.unwrap();
+        let reqs = p.requests.lock();
+        assert_eq!(reqs[0].messages[0].content, "sys\n\nФакт: кот Барсик");
+        assert_eq!(reqs[1].messages[0].content, "sys");
+    }
+
+    #[tokio::test]
+    async fn expanded_message_shows_short_text_and_sends_full_one() {
+        let p = FakeProvider::new(vec![Some(vec![text("ок")])]);
+        let (a, mut rx, _) = agent(p.clone());
+        a.handle_expanded("отбой", "отбой\n\nВыключи звук", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            drain(&mut rx)[0],
+            Event::UserText {
+                text: "отбой".into()
+            }
+        );
+        let reqs = p.requests.lock();
+        assert_eq!(
+            reqs[0].messages.last().unwrap().content,
+            "отбой\n\nВыключи звук"
+        );
     }
 
     #[tokio::test]

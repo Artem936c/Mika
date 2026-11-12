@@ -1,28 +1,33 @@
 //! Real Windows implementations of the system interfaces.
 
 mod audio;
+mod browser;
 mod clipboard;
 mod http;
+mod input;
 mod launcher;
+mod media;
 mod power;
 mod probe;
+mod radio;
 mod rdp;
 mod runner;
+mod screen;
 mod trash;
+mod uia;
 mod wnd;
 
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use mika_core::storage::Db;
 
-use crate::sys::ToolEnv;
+use crate::sys::{Shared, ToolEnv};
 
 pub use runner::ProcessRunner;
 
 impl ToolEnv {
     /// Environment backed by the real system.
-    pub fn windows(db: Arc<Db>, web_enabled: Arc<AtomicBool>) -> Self {
+    pub fn windows(db: Arc<Db>, shared: Shared) -> Self {
         let user_profile = std::env::var("USERPROFILE").unwrap_or_default();
         Self {
             launcher: Arc::new(launcher::ShellLauncher),
@@ -37,9 +42,17 @@ impl ToolEnv {
             runner: Arc::new(runner::ProcessRunner),
             http: Arc::new(http::ReqwestHttp::new()),
             probe: Arc::new(probe::SysinfoProbe),
+            ui: Arc::new(uia::UiaUi::new()),
+            input: Arc::new(input::SendInputDevice),
+            screen: Arc::new(screen::GdiScreen),
+            media: Arc::new(media::WinMedia),
+            radios: Arc::new(radio::WinRadios),
+            browser: Arc::new(browser::CdpBrowser::new(
+                mika_core::paths::data_dir().join("browser"),
+            )),
             db,
-            web_enabled,
             user_profile,
+            shared,
         }
     }
 }

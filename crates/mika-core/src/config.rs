@@ -14,6 +14,36 @@ pub struct Config {
     pub llm: LlmConfig,
     pub tools: ToolsConfig,
     pub avatar: AvatarConfig,
+    pub island: IslandConfig,
+    pub image: ImageConfig,
+    pub mcp: McpConfig,
+    pub telegram: TelegramConfig,
+    pub embedding: EmbeddingConfig,
+    pub updates: UpdatesConfig,
+}
+
+/// Where to look for new versions. Nothing is checked while `manifest_url` is empty.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdatesConfig {
+    /// https address of a JSON file: version, installer address, SHA-256, notes.
+    pub manifest_url: String,
+    /// Look for a new version at start. Download and install only after a click.
+    pub check_at_start: bool,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self {
+            manifest_url: String::new(),
+            check_at_start: true,
+        }
+    }
+}
+
+/// Key of the token for an MCP server reached over HTTP.
+pub fn mcp_token_key(server: &str) -> String {
+    format!("mcp.{}.token", server.trim())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -24,6 +54,8 @@ pub struct AssistantConfig {
     pub persona: Persona,
     /// Used when `persona` is `custom`.
     pub custom_prompt: String,
+    /// The first-run screen was passed.
+    pub onboarded: bool,
 }
 
 impl Default for AssistantConfig {
@@ -33,6 +65,7 @@ impl Default for AssistantConfig {
             wake_phrase: "Мика".into(),
             persona: Persona::default(),
             custom_prompt: String::new(),
+            onboarded: false,
         }
     }
 }
@@ -109,20 +142,138 @@ pub enum WindowMode {
 pub struct WindowConfig {
     pub mode: WindowMode,
     pub monitor: Option<String>,
+    /// Where the ordinary window was last: x, y, width, height in physical pixels.
+    pub rect: Option<[i32; 4]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VoiceConfig {
     pub speak_replies: bool,
+    /// Name of the Windows voice; empty picks a Russian one.
+    pub voice: String,
+    /// Speech rate of the Windows voice, 0.5..=2.0.
+    pub rate: f32,
+    /// Who reads replies aloud.
+    pub tts: TtsEngine,
+    /// Speech model of the provider, for `tts = "provider"`.
+    pub tts_model: String,
+    /// Voice name the provider model knows, such as `Kore`.
+    pub tts_voice: String,
+    /// Recognition model of the provider; empty means voice input is off.
+    pub stt_model: String,
+    /// Language hint for recognition: `ru`.
+    pub stt_language: String,
+    /// Address for speech requests; empty means the LLM address.
+    pub speech_base_url: String,
+    /// Name of the recording device; empty means the Windows default.
+    pub input_device: String,
+    /// Listen for the wake phrase while the microphone is allowed.
+    pub wake_enabled: bool,
 }
 
 impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
             speak_replies: true,
+            voice: String::new(),
+            rate: 1.0,
+            tts: TtsEngine::Windows,
+            tts_model: String::new(),
+            tts_voice: String::new(),
+            stt_model: String::new(),
+            stt_language: "ru".into(),
+            speech_base_url: String::new(),
+            input_device: String::new(),
+            wake_enabled: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TtsEngine {
+    /// The voice built into Windows: local, no network.
+    #[default]
+    Windows,
+    /// The provider's `/audio/speech`.
+    Provider,
+}
+
+/// Key for speech requests; without one the LLM key is used.
+pub const SPEECH_SECRET_KEY: &str = "speech.api_key";
+
+/// What the island shows when idle and when it hides.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IslandConfig {
+    /// City for the idle weather; empty means no weather.
+    pub city: String,
+    /// Hide the island while a full-screen program is in front.
+    pub hide_in_games: bool,
+}
+
+impl Default for IslandConfig {
+    fn default() -> Self {
+        Self {
+            city: String::new(),
+            hide_in_games: true,
+        }
+    }
+}
+
+/// Picture provider. The key lives in the secret store under `IMAGE_SECRET_KEY`;
+/// without one the LLM key is used.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImageConfig {
+    /// Empty means the LLM address.
+    pub base_url: String,
+    /// Empty means pictures are off.
+    pub model: String,
+}
+
+/// Embeddings for memory search by meaning. The key lives in the secret store
+/// under `EMBEDDING_SECRET_KEY`; without one the LLM key is used.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingConfig {
+    /// Empty means the LLM address.
+    pub base_url: String,
+    /// Empty means search by words.
+    pub model: String,
+}
+
+pub const EMBEDDING_SECRET_KEY: &str = "embedding.api_key";
+pub const IMAGE_SECRET_KEY: &str = "image.api_key";
+pub const TELEGRAM_SECRET_KEY: &str = "telegram.bot_token";
+
+/// One MCP server started as a child process.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpServerConfig {
+    pub name: String,
+    /// Program to start for a local server. Empty for a server reached by `url`.
+    pub command: String,
+    pub args: Vec<String>,
+    pub enabled: bool,
+    /// Address of a server reached over HTTP. Empty for a local server.
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    pub servers: Vec<McpServerConfig>,
+}
+
+/// Commands from the phone. The bot token lives in the secret store.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelegramConfig {
+    pub enabled: bool,
+    /// Numeric id of the only account that may send commands; 0 means nobody.
+    pub user_id: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -172,6 +323,8 @@ pub struct LlmConfig {
     /// Empty means the default address of the kind.
     pub base_url: String,
     pub model: String,
+    /// Model for questions about a screenshot; empty means `model`.
+    pub vision_model: String,
 }
 
 impl Default for LlmConfig {
@@ -180,6 +333,7 @@ impl Default for LlmConfig {
             kind: ProviderKind::Openai,
             base_url: String::new(),
             model: "gpt-4o-mini".into(),
+            vision_model: String::new(),
         }
     }
 }
@@ -197,10 +351,26 @@ impl LlmConfig {
 }
 
 /// Tools that reach the network are off until the user turns them on.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
     pub web_enabled: bool,
+    /// RSS feed for the news tool.
+    pub news_feed: String,
+    /// Tool groups the user switched off; their tools are not offered to the model.
+    pub disabled_groups: Vec<String>,
+}
+
+pub const DEFAULT_NEWS_FEED: &str = "https://lenta.ru/rss/news";
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            web_enabled: false,
+            news_feed: DEFAULT_NEWS_FEED.into(),
+            disabled_groups: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -388,6 +558,32 @@ mod tests {
         c.save(&p).unwrap();
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("persona = \"bold\""), "{text}");
+        assert_eq!(Config::load(&p).unwrap(), c);
+    }
+
+    #[test]
+    fn new_sections_have_safe_defaults_and_roundtrip() {
+        let (_d, p) = tmp();
+        let mut c = Config::default();
+        assert!(!c.telegram.enabled && c.telegram.user_id == 0);
+        assert!(c.mcp.servers.is_empty() && c.image.model.is_empty());
+        assert!(c.island.hide_in_games && c.island.city.is_empty());
+        assert!(c.embedding.model.is_empty());
+        assert_eq!(c.voice.tts, TtsEngine::Windows);
+        assert!(c.voice.stt_model.is_empty() && c.voice.stt_language == "ru");
+        c.voice.tts = TtsEngine::Provider;
+        c.voice.tts_voice = "Kore".into();
+        assert_eq!(c.tools.news_feed, DEFAULT_NEWS_FEED);
+        c.mcp.servers.push(McpServerConfig {
+            name: "files".into(),
+            command: "npx".into(),
+            args: vec!["-y".into(), "server".into()],
+            enabled: true,
+            url: String::new(),
+        });
+        c.telegram.user_id = 42;
+        c.island.city = "Пермь".into();
+        c.save(&p).unwrap();
         assert_eq!(Config::load(&p).unwrap(), c);
     }
 

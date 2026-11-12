@@ -29,6 +29,9 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// PNG pictures in base64, for models that can see.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 impl ChatMessage {
@@ -38,6 +41,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -47,6 +51,14 @@ impl ChatMessage {
 
     pub fn user(content: impl Into<String>) -> Self {
         Self::plain(Role::User, content)
+    }
+
+    /// A user message with one PNG picture in base64.
+    pub fn user_with_image(content: impl Into<String>, png_base64: impl Into<String>) -> Self {
+        Self {
+            images: vec![png_base64.into()],
+            ..Self::plain(Role::User, content)
+        }
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
@@ -103,6 +115,30 @@ pub enum LlmError {
 }
 
 pub type LlmStream = BoxStream<'static, Result<LlmChunk, LlmError>>;
+
+/// A model that can look at a picture.
+#[async_trait]
+pub trait Vision: Send + Sync {
+    async fn ask(&self, png: &[u8], question: &str) -> Result<String, String>;
+}
+
+/// Speech recognition. Takes a WAV file, returns the text that was said.
+#[async_trait]
+pub trait SpeechToText: Send + Sync {
+    async fn transcribe(&self, wav: &[u8]) -> Result<String, String>;
+}
+
+/// Speech synthesis. Returns an audio file: WAV, MP3 or Ogg.
+#[async_trait]
+pub trait TextToSpeech: Send + Sync {
+    async fn synthesize(&self, text: &str) -> Result<Vec<u8>, String>;
+}
+
+/// A model that draws pictures. Returns PNG, JPEG or WebP bytes.
+#[async_trait]
+pub trait ImageGen: Send + Sync {
+    async fn generate(&self, prompt: &str) -> Result<Vec<u8>, String>;
+}
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {

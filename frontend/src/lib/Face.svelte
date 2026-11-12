@@ -5,7 +5,7 @@
   import Bars from './Bars.svelte';
   import Icon from './Icon.svelte';
   import type { Emotion } from './avatar';
-  import { speakWords, toolLabel } from './chat';
+  import { countdown, speakWords, toolLabel } from './chat';
   import { t } from './i18n';
   import { stateLabel, type AssistantState } from './island';
 
@@ -17,6 +17,9 @@
     tool,
     emotion,
     speak,
+    weather = null,
+    timer = null,
+    track = null,
     onspeak,
   }: {
     status: AssistantState;
@@ -29,16 +32,30 @@
     tool: string;
     emotion: Emotion;
     speak: boolean;
+    /** Temperature outside, whole degrees. */
+    weather?: { temp: number; text: string } | null;
+    /** The nearest reminder: unix seconds and its text. */
+    timer?: { due_at: number; text: string } | null;
+    /** What plays now in the user's player. */
+    track?: { title: string; artist: string } | null;
     onspeak: (v: boolean) => void;
   } = $props();
 
   let clock = $state('');
+  let now = $state(Date.now());
   onMount(() => {
-    const tick = () => (clock = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }));
+    const tick = () => {
+      now = Date.now();
+      clock = new Date(now).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+    };
     tick();
-    const id = setInterval(tick, 10_000);
+    const id = setInterval(tick, 1000);
     return () => clearInterval(id);
   });
+
+  // A reminder within the next hour replaces the clock with a countdown.
+  const left = $derived(timer && timer.due_at * 1000 - now < 3_600_000 ? countdown(timer.due_at, now) : '');
+  const degrees = $derived(weather ? `${weather.temp > 0 ? '+' : ''}${weather.temp}°` : '');
 
   // Two lines of 15 px text fit about 110 characters in the 620 px form.
   const words = $derived(speakWords(reply, 110));
@@ -47,9 +64,20 @@
 {#if status === 'idle'}
   <div class="rowl">
     <Avatar view="head" {emotion} size={30} />
-    <span class="name">{name}</span>
+    {#if track}
+      <span class="name song" title={track.artist ? `${track.title} — ${track.artist}` : track.title}>
+        <Icon name="note" size={12} />{track.title}
+      </span>
+    {:else}
+      <span class="name">{name}</span>
+    {/if}
     <span class="grow"></span>
-    <span class="mute">{clock}</span>
+    {#if degrees}<span class="mute" title={weather?.text}>{degrees}</span>{/if}
+    {#if left}
+      <span class="timer" title={t('face.timer_title', { text: timer?.text ?? '' })}><Icon name="bell" size={12} />{left}</span>
+    {:else}
+      <span class="mute">{clock}</span>
+    {/if}
     <span class="pad"></span>
   </div>
 {:else if status === 'listening'}
@@ -123,6 +151,20 @@
   .mute {
     color: var(--mute);
     font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+  .song {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--p);
+  }
+  .timer {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--c);
     font-variant-numeric: tabular-nums;
   }
   .shim {

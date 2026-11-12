@@ -11,8 +11,14 @@ if (import.meta.env.DEV && scenario !== null) {
 }
 
 // The desktop avatar window loads the same bundle with `?view=avatar`.
+// The click-target frame loads it with `?view=target`.
+const view = params.get('view');
 const { default: Root } =
-  params.get('view') === 'avatar' ? await import('./AvatarWindow.svelte') : await import('./App.svelte');
+  view === 'avatar'
+    ? await import('./AvatarWindow.svelte')
+    : view === 'target'
+      ? await import('./TargetFrame.svelte')
+      : await import('./App.svelte');
 
 const app = mount(Root, { target: document.getElementById('app')! });
 

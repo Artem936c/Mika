@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
+  import { dragRegion } from './drag';
   import type { IslandShape } from './island';
 
   let {
@@ -24,6 +25,7 @@
   style:height="{shape.height}px"
   style:border-radius="{shape.radius}px"
   {onclick}
+  use:dragRegion={{ threshold: true }}
 >
   <div class="ring"></div>
   <div class="island">

@@ -4,7 +4,6 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import Avatar from './lib/Avatar.svelte';
-  import AvatarDefs from './lib/AvatarDefs.svelte';
   import { isEmotion, reduceEmotion, type Emotion } from './lib/avatar';
   import { bubbleFor, lingerMs, type Bubble } from './lib/bubble';
   import { reducePending, type Pending } from './lib/confirm';
@@ -43,6 +42,11 @@
     if (e?.type === 'assistant_delta' && typeof e.text === 'string') reply += e.text;
     if (e?.type === 'tool_started' && typeof e.summary === 'string') work = e.summary;
     if (e?.type === 'tool_finished') work = '';
+    if (e?.type === 'reminder_fired' && typeof e.text === 'string' && (payload as { kind?: string }).kind !== 'task') {
+      lingering = e.text;
+      clearTimeout(lingerTimer);
+      lingerTimer = setTimeout(() => (lingering = ''), lingerMs(lingering));
+    }
     if (before !== 'idle' && current === 'idle' && reply) {
       const shown = bubbleFor('speaking', reply, '', null);
       lingering = shown && 'text' in shown ? shown.text : '';
@@ -65,7 +69,6 @@
   });
 </script>
 
-<AvatarDefs />
 <div class="stage">
   <div class="bbl" class:on={text !== ''}>{shownText}</div>
   <div class="cmp"><Avatar view="full" {emotion} talking={current === 'speaking'} /></div>

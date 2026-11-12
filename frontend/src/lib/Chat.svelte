@@ -1,8 +1,12 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import Avatar from './Avatar.svelte';
+  import { dragRegion, toggleMaximize } from './drag';
   import ConfirmCard from './ConfirmCard.svelte';
   import Icon from './Icon.svelte';
+  import ImageCard from './ImageCard.svelte';
+  import TaskPanel from './TaskPanel.svelte';
+  import type { TaskView } from './task';
   import WeatherCard from './WeatherCard.svelte';
   import type { Emotion } from './avatar';
   import { formatSeconds, inlineMarkup, type ChatItem } from './chat';
@@ -15,9 +19,13 @@
     status,
     name,
     speak,
+    screen,
+    mic,
     pending,
+    task = null,
     emotion,
     wide,
+    windowed = false,
     needsSetup = false,
     onanswer,
     onsend,
@@ -25,16 +33,29 @@
     onclose,
     onsettings,
     onspeak,
+    onscreen,
+    onmic,
+    onlisten,
+    onwindowed,
     onnew,
+    ontaskhide = () => {},
   }: {
     items: ChatItem[];
     status: AssistantState;
     name: string;
     speak: boolean;
+    /** The user allowed looking at the screen. */
+    screen: boolean;
+    /** The user allowed the microphone. */
+    mic: boolean;
     pending: Pending | null;
+    /** Plan of the running multi-step task. */
+    task?: TaskView | null;
     emotion: Emotion;
     /** Show the avatar column on the left. */
     wide: boolean;
+    /** The chat lives in an ordinary window, not in the island. */
+    windowed?: boolean;
     needsSetup?: boolean;
     onanswer: (a: 'once' | 'always' | 'deny') => void;
     onsend: (text: string) => void;
@@ -42,7 +63,15 @@
     onclose: () => void;
     onsettings: () => void;
     onspeak: (v: boolean) => void;
+    onscreen: (v: boolean) => void;
+    onmic: (v: boolean) => void;
+    /** Start recording a phrase, or finish the running recording. */
+    onlisten: () => void;
+    /** Turn the island into an ordinary window, or back. */
+    onwindowed: (v: boolean) => void;
     onnew: () => void;
+    /** Hide a finished task panel. */
+    ontaskhide?: () => void;
   } = $props();
 
   let draft = $state('');
@@ -88,7 +117,7 @@
 
 <div class="chat" class:wide style:--avatar-column="{AVATAR_COLUMN}px">
   {#if wide}
-    <div class="stagecol">
+    <div class="stagecol" use:dragRegion={{ ondouble: windowed ? toggleMaximize : undefined }}>
       <div class="halo"></div>
       <div class="girlbox"><Avatar view="full" {emotion} talking={status === 'speaking'} /></div>
       <div class="plate">
@@ -99,20 +128,35 @@
   {/if}
 
   <div class="chatcol">
-    <header class="cbar">
+    <header class="cbar" use:dragRegion={{ ondouble: windowed ? toggleMaximize : undefined }} title={t('chat.drag_title')}>
       {#if !wide}
         <span title={t(stateLabel(status))}><Avatar view="head" {emotion} size={30} talking={status === 'speaking'} /></span>
       {/if}
       <button class="tg" class:on={speak} title={t('chat.speak_title')} aria-pressed={speak} onclick={() => onspeak(!speak)}>
         <Icon name={speak ? 'vol' : 'mute'} size={14} />{t('chat.speak')}
       </button>
-      <button class="tg" disabled title={t('chat.mic_title')}><Icon name="mic" size={14} />{t('chat.mic')}</button>
-      <button class="tg" disabled title={t('chat.screen_title')}><Icon name="mon" size={14} />{t('chat.screen')}</button>
+      <button class="tg" class:on={mic} title={t('chat.mic_title')} aria-pressed={mic} onclick={() => onmic(!mic)}>
+        <Icon name="mic" size={14} />{t('chat.mic')}
+      </button>
+      <button class="tg" class:on={screen} title={t('chat.screen_title')} aria-pressed={screen} onclick={() => onscreen(!screen)}>
+        <Icon name="mon" size={14} />{t('chat.screen')}
+      </button>
       <span class="grow"></span>
       <button class="ib" title={t('chat.new_title')} aria-label={t('chat.new')} onclick={onnew}><Icon name="plus" /></button>
-      <button class="ib" disabled title={t('chat.unpin_title')} aria-label={t('chat.unpin')}><Icon name="out" /></button>
+      <button
+        class="ib"
+        class:on={windowed}
+        title={t(windowed ? 'chat.pin_title' : 'chat.unpin_title')}
+        aria-label={t(windowed ? 'chat.pin' : 'chat.unpin')}
+        aria-pressed={windowed}
+        onclick={() => onwindowed(!windowed)}
+      >
+        <Icon name="out" />
+      </button>
       <button class="ib" title={t('chat.settings')} aria-label={t('chat.settings')} onclick={onsettings}><Icon name="set" /></button>
-      <button class="ib" title={t('chat.close_title')} aria-label={t('chat.close')} onclick={onclose}><Icon name="x" /></button>
+      {#if !windowed}
+        <button class="ib" title={t('chat.close_title')} aria-label={t('chat.close')} onclick={onclose}><Icon name="x" /></button>
+      {/if}
     </header>
 
     {#if needsSetup}
@@ -150,7 +194,19 @@
             </div>
             {#if it.data?.kind === 'weather'}
               <WeatherCard data={it.data} />
+            {:else if it.data?.kind === 'image'}
+              <ImageCard path={it.data.path} />
             {/if}
+          {:else if it.kind === 'timing'}
+            {#if it.done && it.timings}
+              <div class="tim">
+                {#if it.timings.stt !== undefined}<span>{t('chat.time_stt', { value: formatSeconds(it.timings.stt) })}</span>{/if}
+                {#if it.timings.llm !== undefined}<span>{t('chat.time_llm', { value: formatSeconds(it.timings.llm) })}</span>{/if}
+                {#if it.timings.tts !== undefined}<span>{t('chat.time_tts', { value: formatSeconds(it.timings.tts) })}</span>{/if}
+              </div>
+            {/if}
+          {:else if it.kind === 'reminder'}
+            <div class="rem"><Icon name="bell" size={15} /><span>{it.text}</span></div>
           {:else}
             <div class="err"><Icon name="alert" size={14} /><span>{it.text}</span></div>
           {/if}
@@ -158,6 +214,9 @@
       </div>
     </div>
 
+    {#if task}
+      <TaskPanel {task} {onstop} onhide={ontaskhide} />
+    {/if}
     {#if pending}
       <ConfirmCard {pending} {onanswer} compact />
     {/if}
@@ -171,7 +230,17 @@
         placeholder={t('chat.placeholder')}
         aria-label={t('chat.message')}
       ></textarea>
-      <button class="ib" disabled title={t('chat.voice_input')} aria-label={t('chat.voice_input')}><Icon name="mic" /></button>
+      <button
+        class="ib"
+        class:rec={status === 'listening'}
+        disabled={!mic}
+        title={t(!mic ? 'chat.voice_off' : status === 'listening' ? 'chat.voice_stop' : 'chat.voice_input')}
+        aria-label={t(status === 'listening' ? 'chat.voice_stop' : 'chat.voice_input')}
+        aria-pressed={status === 'listening'}
+        onclick={onlisten}
+      >
+        <Icon name="mic" />
+      </button>
       {#if busy && !draft.trim()}
         <button class="ib stop" onclick={onstop} title={t('chat.stop')} aria-label={t('chat.stop')}><Icon name="stop" /></button>
       {:else}
@@ -415,6 +484,33 @@
     color: var(--bad);
     margin-top: 2px;
   }
+  .tim {
+    display: flex;
+    gap: 12px;
+    margin: -3px 0 0 4px;
+    font-size: 11px;
+    color: var(--dim);
+    font-variant-numeric: tabular-nums;
+  }
+  .rem {
+    align-self: flex-start;
+    max-width: 80%;
+    display: flex;
+    gap: 9px;
+    align-items: flex-start;
+    padding: 9px 14px;
+    border-radius: 16px;
+    font-size: 14px;
+    line-height: 1.4;
+    background: rgba(111, 227, 255, 0.08);
+    border: 1px solid rgba(111, 227, 255, 0.3);
+    user-select: text;
+  }
+  .rem :global(.icon) {
+    flex: none;
+    color: var(--c);
+    margin-top: 2px;
+  }
   .comp {
     flex: none;
     margin: 0 14px 14px;
@@ -450,6 +546,22 @@
   .comp .ib {
     width: 34px;
     height: 34px;
+  }
+  .ib.rec {
+    color: #fff;
+    border-color: transparent;
+    background: linear-gradient(135deg, var(--v), var(--p));
+    animation: rec 1.1s ease-in-out infinite;
+  }
+  @keyframes rec {
+    50% {
+      box-shadow: 0 0 0 5px rgba(143, 125, 255, 0.22);
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ib.rec {
+      animation: none;
+    }
   }
   .ib.stop {
     color: var(--bad);

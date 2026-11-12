@@ -1,5 +1,6 @@
 //! Risk policy: rules, classifiers, audit log and the gate that runs tools.
 
+pub mod blind;
 pub mod command;
 pub mod gate;
 pub mod paths;

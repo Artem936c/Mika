@@ -18,7 +18,7 @@ use crate::util::{failed, schema, truncate, url_decode, url_encode, url_host};
 pub const WEB_DISABLED: &str =
     "Интернет-инструменты выключены. Их можно включить в настройках Мики, вкладка «Инструменты».";
 
-fn ensure_enabled(flag: &AtomicBool) -> Result<(), ToolError> {
+pub(crate) fn ensure_enabled(flag: &AtomicBool) -> Result<(), ToolError> {
     if flag.load(Ordering::Relaxed) {
         Ok(())
     } else {
@@ -237,6 +237,40 @@ pub struct WeatherTool {
     pub enabled: Arc<AtomicBool>,
 }
 
+/// Temperature now, in whole degrees, and the sky in words: for the idle island.
+pub async fn brief_weather(http: &dyn Http, city: &str) -> Result<(i64, String), String> {
+    let geo: Value = serde_json::from_str(
+        &http
+            .get(&format!(
+                "https://geocoding-api.open-meteo.com/v1/search?name={}&count=1&language=ru&format=json",
+                url_encode(city.trim())
+            ))
+            .await?,
+    )
+    .map_err(|e| format!("непонятный ответ геокодера: {e}"))?;
+    let place = geo["results"]
+        .get(0)
+        .ok_or_else(|| format!("не нашла город «{city}»"))?;
+    let f: Value = serde_json::from_str(
+        &http
+            .get(&format!(
+                "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}&current=temperature_2m,weather_code&timezone=auto",
+                place["latitude"].as_f64().unwrap_or_default(),
+                place["longitude"].as_f64().unwrap_or_default()
+            ))
+            .await?,
+    )
+    .map_err(|e| format!("непонятный ответ прогноза: {e}"))?;
+    let c = &f["current"];
+    let temp = c["temperature_2m"]
+        .as_f64()
+        .ok_or("в прогнозе нет температуры")?;
+    Ok((
+        temp.round() as i64,
+        weather_code(c["weather_code"].as_i64().unwrap_or(-1)).to_string(),
+    ))
+}
+
 pub fn weather_code(code: i64) -> &'static str {
     match code {
         0 => "ясно",
@@ -377,10 +411,10 @@ mod tests {
     #[tokio::test]
     async fn web_tools_refuse_when_disabled() {
         let (e, f) = env();
-        e.web_enabled.store(false, Ordering::Relaxed);
+        e.shared.web_enabled.store(false, Ordering::Relaxed);
         let w = WeatherTool {
             http: e.http.clone(),
-            enabled: e.web_enabled.clone(),
+            enabled: e.shared.web_enabled.clone(),
         };
         let err = run(&w, json!({"city": "Москва"})).await.unwrap_err();
         assert_eq!(err.to_string(), WEB_DISABLED);
@@ -423,7 +457,7 @@ mod tests {
         let out = run(
             &WeatherTool {
                 http: e.http,
-                enabled: e.web_enabled,
+                enabled: e.shared.web_enabled,
             },
             json!({"city": "москва"}),
         )
@@ -458,7 +492,7 @@ mod tests {
         let err = run(
             &WeatherTool {
                 http: e.http,
-                enabled: e.web_enabled,
+                enabled: e.shared.web_enabled,
             },
             json!({"city": "Нигдеград"}),
         )
@@ -491,7 +525,7 @@ mod tests {
         let out = run(
             &FetchPageTool {
                 http: e.http,
-                enabled: e.web_enabled,
+                enabled: e.shared.web_enabled,
             },
             json!({"url": "https://example.com/a"}),
         )

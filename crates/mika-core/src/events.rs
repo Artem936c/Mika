@@ -5,6 +5,7 @@ use tokio::sync::broadcast;
 
 use crate::confirm::{Answer, DecidedBy};
 use crate::emotion::Emotion;
+use crate::schedule::ReminderKind;
 use crate::state::AssistantState;
 use crate::tools::Assessment;
 
@@ -61,6 +62,31 @@ pub enum Event {
     /// The face to show now, chosen by the emotion core.
     EmotionChanged {
         emotion: Emotion,
+    },
+    /// A reminder, timer or scheduled task whose time has come.
+    ReminderFired {
+        id: i64,
+        text: String,
+        kind: ReminderKind,
+        /// Seconds past the due time: more than a few when the app was closed.
+        late_s: u64,
+    },
+    /// Screen rectangle of the element about to be clicked, physical pixels.
+    UiTarget {
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    },
+    /// How long one stage of a reply took: `stt` (speech to text), `llm` (first
+    /// piece of the answer), `tts` (first sound of the spoken answer).
+    Timing {
+        stage: String,
+        ms: u64,
+    },
+    /// The whole state of the running multi-step task, sent after every change.
+    TaskUpdated {
+        task: crate::task::Task,
     },
     Error {
         message: String,

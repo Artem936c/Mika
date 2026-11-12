@@ -65,6 +65,7 @@ pub fn send_message(ctx: CtxState<'_>, text: String) {
 #[tauri::command]
 pub fn stop(ctx: CtxState<'_>) {
     ctx.session.stop();
+    ctx.voice.stop();
 }
 
 #[derive(serde::Serialize)]
@@ -95,11 +96,14 @@ pub fn get_history(ctx: CtxState<'_>) -> Vec<HistoryItem> {
         .collect()
 }
 
+/// Starts a new conversation. The old one goes to the archive, where
+/// `history_search` still finds it; the "Memory" page clears the archive.
 #[tauri::command]
 pub fn clear_history(ctx: CtxState<'_>) -> Result<(), String> {
     ctx.session.agent.clear_history();
     ctx.db
-        .clear_messages(crate::app::CONVERSATION)
+        .archive_messages(crate::app::CONVERSATION)
+        .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
@@ -212,6 +216,10 @@ pub struct UiSettings {
     custom_prompt: String,
     avatar_in_island: bool,
     avatar_on_desktop: bool,
+    /// True when the main window is an ordinary window instead of the island.
+    windowed: bool,
+    /// False until the first-run screen is passed.
+    onboarded: bool,
 }
 
 #[tauri::command]
@@ -227,7 +235,94 @@ pub fn get_ui_settings(ctx: CtxState<'_>) -> UiSettings {
         custom_prompt: c.assistant.custom_prompt.clone(),
         avatar_in_island: c.avatar.in_island,
         avatar_on_desktop: c.avatar.on_desktop,
+        windowed: c.window.mode == mika_core::config::WindowMode::Window,
+        onboarded: c.assistant.onboarded,
     }
+}
+
+/// Switches between the island and an ordinary window and remembers the choice.
+pub fn apply_window_mode(
+    app: &AppHandle,
+    ctx: &crate::app::Ctx,
+    windowed: bool,
+) -> Result<(), String> {
+    use mika_core::config::WindowMode;
+    use tauri::Manager;
+    let window = app
+        .get_webview_window("island")
+        .ok_or("main window is gone")?;
+    if windowed {
+        let saved = ctx.config.lock().window.rect;
+        crate::window::enter_window_mode(&window, saved).map_err(|e| e.to_string())?;
+        ctx.config.lock().window.mode = WindowMode::Window;
+    } else {
+        let (rect, monitor) = {
+            let c = ctx.config.lock();
+            (
+                crate::window::window_rect(&window),
+                c.window.monitor.clone(),
+            )
+        };
+        crate::window::enter_island_mode(&window, monitor.as_deref()).map_err(|e| e.to_string())?;
+        let mut c = ctx.config.lock();
+        c.window.mode = WindowMode::Pinned;
+        if rect.is_some() {
+            c.window.rect = rect;
+        }
+    }
+    ctx.save_config()?;
+    settings_changed(app);
+    Ok(())
+}
+
+/// The user let go of the dragged window: snap the island to a monitor, turn it
+/// into an ordinary window, or turn the window back into the island.
+pub fn handle_drop(app: &AppHandle, ctx: &crate::app::Ctx) {
+    use crate::window::DropAction;
+    use tauri::Manager;
+    let Some(window) = app.get_webview_window("island") else {
+        return;
+    };
+    let windowed = crate::window::WINDOWED.load(std::sync::atomic::Ordering::Relaxed);
+    let scale = window.scale_factor().unwrap_or(1.0);
+    // The window keeps the size it had last time, whatever monitor it lands on.
+    let saved_size = ctx
+        .config
+        .lock()
+        .window
+        .rect
+        .map(|r| (r[2] as f64 / scale, r[3] as f64 / scale));
+    let result = match crate::window::drop_action(&window, saved_size) {
+        DropAction::Stay => Ok(()),
+        DropAction::Island { monitor } => {
+            ctx.config.lock().window.monitor = monitor.clone();
+            if windowed {
+                apply_window_mode(app, ctx, false)
+            } else {
+                crate::window::place_on(&window, monitor.as_deref())
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| ctx.save_config())
+            }
+        }
+        DropAction::Window { rect } => {
+            ctx.config.lock().window.rect = Some(rect);
+            apply_window_mode(app, ctx, true)
+        }
+    };
+    if let Err(e) = result {
+        log::warn!("cannot place the dropped window: {e}");
+    }
+}
+
+/// Async: window style changes must not run inside a synchronous command on Windows.
+#[tauri::command]
+pub async fn set_window_mode(
+    app: AppHandle,
+    ctx: tauri::State<'_, Arc<crate::app::Ctx>>,
+    windowed: bool,
+) -> Result<(), String> {
+    apply_window_mode(&app, &ctx, windowed)
 }
 
 /// Longest assistant name, characters.
@@ -244,7 +339,7 @@ pub fn clean_name(value: &str) -> Result<String, String> {
 }
 
 /// Tells every window to read the settings again.
-fn settings_changed(app: &AppHandle) {
+pub fn settings_changed(app: &AppHandle) {
     let _ = app.emit(
         crate::tray::UI_CHANNEL,
         serde_json::json!({ "action": "settings_changed" }),
@@ -310,9 +405,15 @@ pub fn get_emotion(
 }
 
 #[tauri::command]
-pub fn set_speak_replies(ctx: CtxState<'_>, value: bool) -> Result<(), String> {
+pub fn set_speak_replies(app: AppHandle, ctx: CtxState<'_>, value: bool) -> Result<(), String> {
     ctx.config.lock().voice.speak_replies = value;
-    ctx.save_config()
+    ctx.speaker.set(value);
+    if !value {
+        ctx.voice.stop();
+    }
+    ctx.save_config()?;
+    settings_changed(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -373,6 +474,19 @@ pub fn open_folder(which: String) -> Result<(), String> {
 #[tauri::command]
 pub fn wipe_all_data(app: AppHandle, ctx: CtxState<'_>) -> Result<(), String> {
     ctx.session.stop();
+    let servers: Vec<String> = ctx
+        .config
+        .lock()
+        .mcp
+        .servers
+        .iter()
+        .map(|s| s.name.clone())
+        .collect();
+    for name in servers {
+        ctx.secrets
+            .delete(&mika_core::config::mcp_token_key(&name))
+            .map_err(|e| e.to_string())?;
+    }
     crate::platform::wipe_all_data(ctx.secrets.as_ref())?;
     log::info!("all data wiped, exiting");
     app.exit(0);

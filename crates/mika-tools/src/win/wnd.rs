@@ -1,15 +1,44 @@
 use windows::core::{BOOL, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow, ShowWindow, GW_OWNER, SW_RESTORE,
-    WM_CLOSE,
+    EnumWindows, GetForegroundWindow, GetWindow, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow,
+    SetWindowPos, ShowWindow, GW_OWNER, SWP_NOACTIVATE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE,
+    SW_RESTORE, WM_CLOSE,
 };
 
-use crate::sys::{WindowInfo, Windows};
+use crate::sys::{Placement, WindowInfo, Windows};
+
+fn title_of(h: HWND) -> String {
+    // SAFETY: plain queries on a window handle; a stale handle gives an empty title.
+    unsafe {
+        let len = GetWindowTextLengthW(h);
+        if len <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let n = GetWindowTextW(h, &mut buf);
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
+}
+
+/// Half of the work area of the monitor: (x, y, width, height).
+pub fn half(work: (i32, i32, i32, i32), placement: Placement) -> (i32, i32, i32, i32) {
+    let (x, y, w, h) = work;
+    match placement {
+        Placement::Left => (x, y, w / 2, h),
+        Placement::Right => (x + w / 2, y, w - w / 2, h),
+        Placement::Top => (x, y, w, h / 2),
+        Placement::Bottom => (x, y + h / 2, w, h - h / 2),
+        _ => work,
+    }
+}
 
 pub struct WinWindows;
 
@@ -106,5 +135,58 @@ impl Windows for WinWindows {
         // SAFETY: posting WM_CLOSE to a window handle; a stale handle just fails.
         unsafe { PostMessageW(Some(hwnd(id)), WM_CLOSE, WPARAM(0), LPARAM(0)) }
             .map_err(|e| format!("не удалось закрыть окно: {}", e.message()))
+    }
+
+    fn foreground(&self) -> Option<WindowInfo> {
+        // SAFETY: plain query.
+        let h = unsafe { GetForegroundWindow() };
+        if h.is_invalid() {
+            return None;
+        }
+        Some(WindowInfo {
+            id: h.0 as usize as u64,
+            title: title_of(h),
+            process: process_name(h),
+        })
+    }
+
+    fn place(&self, id: u64, placement: Placement) -> Result<(), String> {
+        let h = hwnd(id);
+        // SAFETY: plain calls on a window handle; a stale handle just fails.
+        unsafe {
+            match placement {
+                Placement::Maximize => {
+                    let _ = ShowWindow(h, SW_MAXIMIZE);
+                }
+                Placement::Minimize => {
+                    let _ = ShowWindow(h, SW_MINIMIZE);
+                }
+                Placement::Restore => {
+                    let _ = ShowWindow(h, SW_RESTORE);
+                }
+                side => {
+                    let monitor = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+                    let mut info = MONITORINFO {
+                        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+                        return Err("не удалось узнать размер экрана".into());
+                    }
+                    let RECT {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    } = info.rcWork;
+                    let (x, y, w, hgt) = half((left, top, right - left, bottom - top), side);
+                    // A maximized window ignores SetWindowPos until restored.
+                    let _ = ShowWindow(h, SW_RESTORE);
+                    SetWindowPos(h, None, x, y, w, hgt, SWP_NOZORDER | SWP_NOACTIVATE)
+                        .map_err(|e| format!("не удалось переставить окно: {}", e.message()))?;
+                }
+            }
+        }
+        Ok(())
     }
 }
