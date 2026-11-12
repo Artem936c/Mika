@@ -95,6 +95,25 @@ pub enum Heard {
     Text(String),
 }
 
+/// Whether speech would be heard: system sound on and above zero. Read at most
+/// once a second; an unreadable mixer counts as audible.
+fn audible(volume: Arc<dyn mika_tools::sys::Volume>) -> mika_audio::speech::Audible {
+    let last: Arc<Mutex<Option<(std::time::Instant, bool)>>> = Arc::new(Mutex::new(None));
+    Arc::new(move || {
+        if let Some((at, heard)) = *last.lock() {
+            if at.elapsed() < std::time::Duration::from_secs(1) {
+                return heard;
+            }
+        }
+        let heard = match volume.get() {
+            Ok((level, muted)) => !muted && level > 0,
+            Err(_) => true,
+        };
+        *last.lock() = Some((std::time::Instant::now(), heard));
+        heard
+    })
+}
+
 impl Ctx {
     pub fn build(bus: EventBus, state: StateHandle) -> Result<Ctx, String> {
         let (config, err) = Config::load_or_default(&config_path());
@@ -159,6 +178,7 @@ impl Ctx {
                 tasks: task_board.clone(),
             },
         );
+        let speaker = speaker.with_audible(audible(env.volume.clone()));
         let mut registry = ToolRegistry::new();
         mika_tools::register_all(&mut registry, &env, &disabled);
 

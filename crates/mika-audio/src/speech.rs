@@ -117,21 +117,41 @@ pub fn clean_for_speech(text: &str) -> String {
     spaces.replace_all(text.trim(), " ").into_owned()
 }
 
+/// Whether anyone can hear her now: false while the system sound is muted.
+pub type Audible = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// The "speak replies" switch shared with the settings.
 #[derive(Clone, Default)]
-pub struct SpeakerSwitch(Arc<AtomicBool>);
+pub struct SpeakerSwitch {
+    on: Arc<AtomicBool>,
+    audible: Option<Audible>,
+}
 
 impl SpeakerSwitch {
     pub fn new(on: bool) -> Self {
-        Self(Arc::new(AtomicBool::new(on)))
+        Self {
+            on: Arc::new(AtomicBool::new(on)),
+            audible: None,
+        }
+    }
+
+    /// Speech is not made while `audible` says nobody would hear it: a paid
+    /// synthesizer is not asked for a reply that plays into silence.
+    pub fn with_audible(mut self, audible: Audible) -> Self {
+        self.audible = Some(audible);
+        self
     }
 
     pub fn set(&self, on: bool) {
-        self.0.store(on, Ordering::Relaxed);
+        self.on.store(on, Ordering::Relaxed);
     }
 
     pub fn get(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.on.load(Ordering::Relaxed)
+    }
+
+    fn heard(&self) -> bool {
+        self.audible.as_ref().is_none_or(|a| a())
     }
 }
 
@@ -143,7 +163,7 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
     let mut streamed = false;
     let say = |text: &str| {
         let clean = clean_for_speech(text);
-        if !clean.is_empty() {
+        if !clean.is_empty() && switch.heard() {
             voice.speak(&clean);
         }
     };
@@ -381,5 +401,29 @@ mod tests {
         .await;
         assert!(v.said.lock().is_empty());
         assert_eq!(*v.stops.lock(), 1);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_synthesized_while_the_system_sound_is_muted() {
+        let bus = EventBus::new(64);
+        let voice = Arc::new(FakeVoice::default());
+        let muted = Arc::new(AtomicBool::new(true));
+        let m = muted.clone();
+        let switch =
+            SpeakerSwitch::new(true).with_audible(Arc::new(move || !m.load(Ordering::Relaxed)));
+        let job = tokio::spawn(run_speaker(bus.clone(), voice.clone(), switch));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        bus.publish(Event::AssistantText {
+            text: "В тишину.".into(),
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(voice.said.lock().is_empty());
+        muted.store(false, Ordering::Relaxed);
+        bus.publish(Event::AssistantText {
+            text: "Теперь слышно.".into(),
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        job.abort();
+        assert_eq!(*voice.said.lock(), ["Теперь слышно."]);
     }
 }

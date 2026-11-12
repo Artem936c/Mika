@@ -1,7 +1,8 @@
 //! Windows voice: `SpeechSynthesizer` makes the sound, `MediaPlayer` plays it.
 //! Both are built into Windows, so speech works offline and adds no downloads.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +25,65 @@ const REMOTE_WAIT: Duration = Duration::from_secs(45);
 
 /// Sound of a sentence that a remote synthesizer is making or has made.
 type RemoteAudio = mpsc::Receiver<Result<Vec<u8>, String>>;
+
+/// Sentences synthesized ahead of the one playing. Each request to a paid
+/// provider costs money, so a long reply is not ordered whole in advance:
+/// after a stop only these few are lost.
+const LOOKAHEAD: usize = 2;
+
+/// A remote synthesis that waits for its turn.
+struct Job {
+    generation: u64,
+    text: String,
+    tx: mpsc::Sender<Result<Vec<u8>, String>>,
+    synth: RemoteSynth,
+}
+
+/// Remote requests asked for but not yet played, and those waiting to be asked.
+#[derive(Default)]
+struct Prefetch {
+    in_flight: AtomicUsize,
+    waiting: Mutex<VecDeque<Job>>,
+}
+
+impl Prefetch {
+    fn start(&self, job: Job) {
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        std::thread::spawn(move || {
+            let _ = job.tx.send((job.synth)(&job.text));
+        });
+    }
+
+    /// Asks for the sound now, or later when fewer than `LOOKAHEAD` are ahead.
+    fn submit(&self, job: Job) {
+        if self.in_flight.load(Ordering::Relaxed) < LOOKAHEAD {
+            self.start(job);
+        } else {
+            self.waiting.lock().push_back(job);
+        }
+    }
+
+    /// One remote sentence was played or dropped: the next waiting one may be asked
+    /// for, unless a stop made it stale.
+    fn done(&self, current: u64) {
+        let _ = self
+            .in_flight
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
+        let next = {
+            let mut waiting = self.waiting.lock();
+            waiting.retain(|j| j.generation == current);
+            waiting.pop_front()
+        };
+        if let Some(job) = next {
+            self.start(job);
+        }
+    }
+
+    /// A stop: nothing that waits is asked for.
+    fn clear(&self) {
+        self.waiting.lock().clear();
+    }
+}
 
 /// One sentence to speak.
 struct Sentence {
@@ -49,6 +109,7 @@ pub struct WindowsVoice {
     /// Grows on every `stop`; sentences of an older generation are dropped.
     generation: Arc<AtomicU64>,
     remote: Mutex<Option<RemoteSynth>>,
+    prefetch: Arc<Prefetch>,
     observer: Observer,
     /// True until the first sentence after a stop is queued.
     fresh: AtomicBool,
@@ -74,14 +135,17 @@ impl WindowsVoice {
         let seen = generation.clone();
         let observer: Observer = Arc::new(Mutex::new(None));
         let watching = observer.clone();
+        let prefetch = Arc::new(Prefetch::default());
+        let ahead = prefetch.clone();
         std::thread::Builder::new()
             .name("voice".into())
-            .spawn(move || worker(rx, seen, watching))
+            .spawn(move || worker(rx, seen, watching, ahead))
             .expect("spawn voice thread");
         Self {
             tx: Mutex::new(tx),
             generation,
             remote: Mutex::new(None),
+            prefetch,
             observer,
             fresh: AtomicBool::new(true),
         }
@@ -241,7 +305,12 @@ fn wait_remote(rx: &RemoteAudio, stopped: &impl Fn() -> bool) -> Option<Result<V
     }
 }
 
-fn worker(rx: mpsc::Receiver<Cmd>, generation: Arc<AtomicU64>, observer: Observer) {
+fn worker(
+    rx: mpsc::Receiver<Cmd>,
+    generation: Arc<AtomicU64>,
+    observer: Observer,
+    prefetch: Arc<Prefetch>,
+) {
     // SAFETY: COM is initialised for this thread, which lives as long as the channel.
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -282,6 +351,11 @@ fn worker(rx: mpsc::Receiver<Cmd>, generation: Arc<AtomicU64>, observer: Observe
             Cmd::Speak(s) => {
                 let gen = s.generation;
                 let stopped = || generation.load(Ordering::Relaxed) != gen;
+                // Whatever happens to a remote sentence, its place ahead is freed.
+                let _free = s.remote.is_some().then(|| FreeOnDrop {
+                    prefetch: &prefetch,
+                    generation: &generation,
+                });
                 if stopped() {
                     continue;
                 }
@@ -324,15 +398,30 @@ fn worker(rx: mpsc::Receiver<Cmd>, generation: Arc<AtomicU64>, observer: Observe
     }
 }
 
+/// Frees a sentence's place in the prefetch when the worker is done with it.
+struct FreeOnDrop<'a> {
+    prefetch: &'a Prefetch,
+    generation: &'a AtomicU64,
+}
+
+impl Drop for FreeOnDrop<'_> {
+    fn drop(&mut self) {
+        self.prefetch.done(self.generation.load(Ordering::Relaxed));
+    }
+}
+
 impl Voice for WindowsVoice {
     fn speak(&self, text: &str) {
         let gen = self.generation.load(Ordering::Relaxed);
-        // The remote sound is asked for at once, while earlier sentences still play.
+        // The sound is asked for ahead of playback, but never more than
+        // `LOOKAHEAD` sentences ahead: each request is paid.
         let remote = self.remote.lock().clone().map(|synth| {
             let (tx, rx) = mpsc::channel();
-            let sentence = text.to_string();
-            std::thread::spawn(move || {
-                let _ = tx.send(synth(&sentence));
+            self.prefetch.submit(Job {
+                generation: gen,
+                text: text.to_string(),
+                tx,
+                synth,
             });
             rx
         });
@@ -355,6 +444,7 @@ impl Voice for WindowsVoice {
 
     fn stop(&self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
+        self.prefetch.clear();
         self.fresh.store(true, Ordering::Relaxed);
     }
 
@@ -385,6 +475,48 @@ impl Voice for WindowsVoice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_reply_is_ordered_only_a_few_sentences_ahead() {
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = asked.clone();
+        let synth: RemoteSynth = Arc::new(move |t: &str| {
+            log.lock().push(t.to_string());
+            Ok(Vec::new())
+        });
+        let p = Prefetch::default();
+        let mut rxs = Vec::new();
+        for i in 0..6 {
+            let (tx, rx) = mpsc::channel();
+            p.submit(Job {
+                generation: 0,
+                text: format!("s{i}"),
+                tx,
+                synth: synth.clone(),
+            });
+            rxs.push(rx);
+        }
+        // Two are asked for, four wait.
+        for rx in &rxs[..2] {
+            rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        }
+        assert_eq!(p.waiting.lock().len(), 4);
+        // The first is played: the third may be asked for.
+        p.done(0);
+        rxs[2]
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        // A stop: what waits is never asked for.
+        p.clear();
+        p.done(1);
+        p.done(1);
+        std::thread::sleep(Duration::from_millis(100));
+        let mut got = asked.lock().clone();
+        got.sort();
+        assert_eq!(got, ["s0", "s1", "s2"]);
+        assert_eq!(p.in_flight.load(Ordering::Relaxed), 0);
+    }
 
     fn v(name: &str, language: &str) -> VoiceInfo {
         VoiceInfo {
