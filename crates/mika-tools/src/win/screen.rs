@@ -178,8 +178,8 @@ fn grab(window: Option<u64>, max_side: u32) -> Result<(Vec<u8>, u32, u32, f32), 
             return Err("Windows не отдал пиксели снимка".into());
         }
         let mut rgb = Vec::with_capacity(out_w as usize * out_h as usize * 3);
-        for px in bgra.chunks_exact(4) {
-            rgb.extend_from_slice(&[px[2], px[1], px[0]]);
+        for [b, g, r, _] in bgra.as_chunks::<4>().0 {
+            rgb.extend_from_slice(&[*r, *g, *b]);
         }
         Ok((rgb, out_w as u32, out_h as u32, factor))
     }

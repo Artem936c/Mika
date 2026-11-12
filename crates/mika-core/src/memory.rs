@@ -53,10 +53,9 @@ pub fn encode_vector(v: &[f32]) -> Vec<u8> {
 }
 
 pub fn decode_vector(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    // A trailing piece shorter than four bytes is ignored.
+    let (whole, _) = bytes.as_chunks::<4>();
+    whole.iter().map(|c| f32::from_le_bytes(*c)).collect()
 }
 
 /// Cosine similarity; 0 for vectors of different length or zero length.
