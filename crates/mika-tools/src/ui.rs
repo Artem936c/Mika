@@ -37,6 +37,17 @@ const MAX_SEQUENCE: usize = 30;
 /// The last tree read from each window: actions report what changed since.
 pub type Seen = Arc<Mutex<HashMap<u64, Vec<UiNode>>>>;
 
+/// The last text sent with Enter: window, text and when.
+pub type Sent = Arc<Mutex<Option<(u64, String, std::time::Instant)>>>;
+
+/// The same message to the same window this soon is a double send: small
+/// models repeat ui_type when a chat window does not show what changed.
+const RESEND_GUARD: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Programs that draw their content themselves: UI Automation shows their
+/// buttons and lists but not the text of messages.
+const SELF_DRAWN: [&str; 4] = ["telegram", "ayugram", "kotatogram", "discord"];
+
 /// Shared parts of the window tools.
 #[derive(Clone)]
 pub struct UiEnv {
@@ -47,6 +58,10 @@ pub struct UiEnv {
     /// Executable name of the assistant itself, lower case; its windows are never a target.
     pub own_process: String,
     pub seen: Seen,
+    /// Text with emoji is pasted: typed by key events, it lands out of order in
+    /// some programs (Telegram puts 😊 in the middle of the word).
+    pub clipboard: Option<Arc<dyn crate::sys::Clipboard>>,
+    pub sent: Sent,
 }
 
 impl UiEnv {
@@ -364,7 +379,7 @@ impl Tool for UiReadTool {
     fn spec(&self) -> ToolSpec {
         spec(
             "ui_read",
-            "Прочитать окно программы целиком: кнопки, поля, меню и их текст. У каждого элемента номер в квадратных скобках для ui_click и ui_type. После действия ui_click, ui_type и ui_keys сами сообщают, что изменилось, так что читать всё окно заново нужно редко.",
+            "Прочитать окно программы целиком: кнопки, поля, меню и их текст. У каждого элемента номер в квадратных скобках для ui_click и ui_type. После действия ui_click, ui_type и ui_keys сами сообщают, что изменилось, так что читать всё окно заново нужно редко. Если нужного текста (сообщений, документа) в ответе нет, программа рисует его сама: прочитай его screen_text с этим окном.",
             props(&[], &[]),
         )
     }
@@ -394,8 +409,14 @@ impl Tool for UiReadTool {
                 label(&w)
             )));
         }
+        let process = w.process.to_lowercase();
+        let note = if SELF_DRAWN.iter().any(|p| process.starts_with(p)) {
+            "\n(Эта программа не отдаёт текст сообщений: прочитать переписку можно screen_text с этим окном.)"
+        } else {
+            ""
+        };
         Ok(ToolOutput::new(format!(
-            "Окно {}\n{}",
+            "Окно {}\n{}{note}",
             label(&w),
             render_tree(&nodes)
         )))
@@ -606,12 +627,14 @@ impl Tool for UiTypeTool {
     fn spec(&self) -> ToolSpec {
         spec(
             "ui_type",
-            "Ввести текст в окно программы. С n — в поле с этим номером из ui_read (старый текст поля заменяется). Без n — печатает туда, где стоит курсор. enter=true нажмёт Enter после текста.",
+            "Ввести текст в окно программы. С n — в поле с этим номером из ui_read (старый текст поля заменяется). Без n — печатает туда, где стоит курсор. enter=true нажмёт Enter после текста; так отправляют сообщение в чате, и тогда поле сначала очищается. Отправленное сообщение не повторяй: тот же текст в то же окно второй раз не уйдёт.",
             props(
                 &[
                     ("text", json!({ "type": "string", "description": "Текст" })),
                     ("n", json!({ "type": "integer", "description": "Номер поля из ui_read" })),
                     ("enter", json!({ "type": "boolean", "description": "Нажать Enter после ввода" })),
+                    ("clear", json!({ "type": "boolean", "description": "Очистить поле перед вводом (ctrl+a, delete). По умолчанию — при enter без n" })),
+                    ("again", json!({ "type": "boolean", "description": "Отправить тот же текст ещё раз, только если пользователь прямо попросил повторить" })),
                 ],
                 &["text"],
             ),
@@ -638,6 +661,22 @@ impl Tool for UiTypeTool {
         let w = env.target(&args)?;
         let text = arg_str(&args, "text")?.to_string();
         let id = w.id;
+        let enter = arg_bool(&args, "enter");
+        if enter && !arg_bool(&args, "again") {
+            if let Some((sent_to, sent_text, at)) = env.sent.lock().clone() {
+                if sent_to == id && sent_text == text && at.elapsed() < RESEND_GUARD {
+                    return Err(failed(format!(
+                        "этот же текст уже отправлен в это окно {} с назад, второй раз не отправляю. \
+Проверь окно (ui_read или screen_text). Если пользователь просит повторить, вызови ui_type с again=true.",
+                        at.elapsed().as_secs()
+                    )));
+                }
+            }
+        }
+        let clear = args
+            .get("clear")
+            .and_then(Value::as_bool)
+            .unwrap_or(enter && node_arg(&args).is_none());
         let before = env.foreign_windows();
         let mut typed_by_pattern = false;
         if let Some(n) = node_arg(&args) {
@@ -659,14 +698,19 @@ impl Tool for UiTypeTool {
         }
         if !typed_by_pattern {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            env.input.text(&text).map_err(failed)?;
+            if clear {
+                env.input.chord(&[VK_CONTROL, 0x41]).map_err(failed)?;
+                env.input.chord(&[VK_DELETE]).map_err(failed)?;
+            }
+            env.type_text(&text).await?;
         }
-        if arg_bool(&args, "enter") {
+        if enter {
             if typed_by_pattern {
                 env.windows.focus(id).map_err(failed)?;
                 tokio::time::sleep(std::time::Duration::from_millis(120)).await;
             }
             env.input.chord(&[VK_RETURN]).map_err(failed)?;
+            *env.sent.lock() = Some((id, text.clone(), std::time::Instant::now()));
         }
         let report = env.outcome(&w, &before).await;
         Ok(ToolOutput::new(format!(
@@ -677,6 +721,32 @@ impl Tool for UiTypeTool {
 }
 
 const VK_RETURN: u16 = 0x0D;
+const VK_CONTROL: u16 = 0x11;
+const VK_DELETE: u16 = 0x2E;
+
+/// True for characters outside the basic plane: emoji and the like.
+fn has_astral(text: &str) -> bool {
+    text.chars().any(|c| c as u32 > 0xFFFF)
+}
+
+impl UiEnv {
+    /// Types the text where the caret is. Text with emoji goes through the
+    /// clipboard, which is put back afterwards.
+    async fn type_text(&self, text: &str) -> Result<(), ToolError> {
+        let Some(clip) = self.clipboard.clone().filter(|_| has_astral(text)) else {
+            return self.input.text(text).map_err(failed);
+        };
+        let saved = clip.get().ok();
+        clip.set(text).map_err(failed)?;
+        self.input.chord(&[VK_CONTROL, 0x56]).map_err(failed)?;
+        // The program reads the clipboard on its own time.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        if let Some(old) = saved {
+            let _ = clip.set(&old);
+        }
+        Ok(())
+    }
+}
 
 /// Virtual key of one key name.
 fn key_code(name: &str) -> Option<u16> {
@@ -986,6 +1056,8 @@ mod tests {
             bus: e.shared.bus.clone(),
             own_process: "mika.exe".into(),
             seen: Default::default(),
+            clipboard: Some(e.clipboard.clone()),
+            sent: Default::default(),
         };
         (ui, f)
     }
@@ -1109,6 +1181,41 @@ mod tests {
         assert_eq!(*f.typed.lock(), vec!["мир".to_string()]);
         assert_eq!(*f.chords.lock(), vec![vec![VK_RETURN]]);
         assert!(f.ui_calls.lock().contains(&"focus 7 1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_chat_message_clears_the_field_pastes_emoji_and_is_sent_once() {
+        let (e, f) = ui_env();
+        let tool = UiTypeTool(e.clone());
+        *f.clipboard.lock() = "мой буфер".into();
+        run(&tool, json!({"text": "Как дела? 😊", "enter": true}))
+            .await
+            .unwrap();
+        assert_eq!(
+            *f.chords.lock(),
+            vec![
+                vec![VK_CONTROL, 0x41],
+                vec![VK_DELETE],
+                vec![VK_CONTROL, 0x56],
+                vec![VK_RETURN]
+            ]
+        );
+        assert!(f.typed.lock().is_empty(), "emoji text is pasted");
+        assert_eq!(*f.clipboard.lock(), "мой буфер");
+        // The same message again is refused, unless asked for.
+        let again = run(&tool, json!({"text": "Как дела? 😊", "enter": true})).await;
+        assert!(again.is_err());
+        run(
+            &tool,
+            json!({"text": "Как дела? 😊", "enter": true, "again": true}),
+        )
+        .await
+        .unwrap();
+        // Plain text without Enter is typed where the caret is, nothing cleared.
+        f.chords.lock().clear();
+        run(&tool, json!({"text": "привет"})).await.unwrap();
+        assert!(f.chords.lock().is_empty());
+        assert_eq!(f.typed.lock().last().unwrap(), "привет");
     }
 
     #[tokio::test]

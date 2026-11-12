@@ -298,6 +298,8 @@ mod tests {
                 bus: e.shared.bus.clone(),
                 own_process: "mika.exe".into(),
                 seen: Default::default(),
+                clipboard: None,
+                sent: Default::default(),
             },
             screen: e.screen.clone(),
             enabled: e.shared.screen_enabled.clone(),

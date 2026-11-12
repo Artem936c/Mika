@@ -20,7 +20,7 @@ use crate::task::{TaskBoard, TASK_MAX_STEPS};
 use crate::tools::ToolRegistry;
 
 /// LLM calls per user message. A task with a plan gets `task::TASK_MAX_STEPS`.
-pub const MAX_STEPS: usize = 8;
+pub const MAX_STEPS: usize = 14;
 /// Reminders per message that a plan still has open steps.
 const MAX_NUDGES: usize = 2;
 /// Reminder after a reply that stopped without doing what it said.

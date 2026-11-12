@@ -27,6 +27,7 @@ pub struct Fakes {
     pub focused: Mutex<Vec<u64>>,
     pub closed: Mutex<Vec<u64>>,
     pub clipboard: Mutex<String>,
+    pub start_apps: Mutex<Vec<(String, String)>>,
     pub trashed: Mutex<Vec<PathBuf>>,
     pub hosts: Mutex<Vec<String>>,
     pub rdp_files: Mutex<Vec<PathBuf>>,
@@ -110,6 +111,9 @@ impl Launcher for Fake {
             .lock()
             .push((target.into(), args.map(str::to_string)));
         Ok(())
+    }
+    fn start_apps(&self) -> Vec<(String, String)> {
+        self.0.start_apps.lock().clone()
     }
 }
 

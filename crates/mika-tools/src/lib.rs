@@ -155,6 +155,8 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
         bus: env.shared.bus.clone(),
         own_process: own_process(),
         seen: Default::default(),
+        clipboard: Some(env.clipboard.clone()),
+        sent: Default::default(),
     };
 
     if on("apps") {

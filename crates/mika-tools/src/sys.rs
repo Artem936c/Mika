@@ -16,6 +16,11 @@ use tokio_util::sync::CancellationToken;
 pub trait Launcher: Send + Sync {
     /// Opens a program, file, folder or URL with the shell, like double-click.
     fn open(&self, target: &str, args: Option<&str>) -> Result<(), String>;
+    /// Programs of the Start menu, Store apps included: (name, AppID). Opened as
+    /// `shell:AppsFolder\<AppID>`.
+    fn start_apps(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
 }
 
 pub trait Volume: Send + Sync {

@@ -143,14 +143,47 @@ impl OpenAppTool {
         if let Some(p) = shortcuts.iter().find(|p| stem(p) == wanted) {
             return Some((stem(p), p.display().to_string()));
         }
-        shortcuts
+        let by_shortcut = shortcuts
             .iter()
             .filter(|p| {
                 let s = stem(p);
                 !s.contains("uninstall") && !s.contains("удал") && s.contains(&wanted)
             })
             .min_by_key(|p| stem(p).len())
-            .map(|p| (stem(p), p.display().to_string()))
+            .map(|p| (stem(p), p.display().to_string()));
+        if by_shortcut.is_some() {
+            return by_shortcut;
+        }
+        // Store apps have no shortcut file: the Start menu knows them by AppID.
+        self.launcher
+            .start_apps()
+            .into_iter()
+            .map(|(name, id)| (name.to_lowercase(), id))
+            .filter(|(name, _)| {
+                !name.contains("uninstall") && !name.contains("удал") && name.contains(&wanted)
+            })
+            .min_by_key(|(name, _)| (name != &wanted, name.len()))
+            .map(|(name, id)| (name, format!("shell:AppsFolder\\{id}")))
+    }
+
+    /// A window of the program when it is already running and cannot be found
+    /// to start: «телеграм» finds a Telegram window.
+    fn running(&self, name: &str) -> Option<WindowInfo> {
+        let windows = self.windows.as_ref()?;
+        let n = name.trim().to_lowercase();
+        let hint = SHORTCUT_HINTS
+            .iter()
+            .find(|(a, _)| *a == n)
+            .map(|(_, w)| (*w).to_string())
+            .unwrap_or_else(|| n.clone());
+        windows
+            .list()
+            .into_iter()
+            .filter(|w| w.process != self.own_process && !w.title.is_empty())
+            .map(|w| (score(&w, &hint).max(score(&w, &n)), w))
+            .filter(|(s, _)| *s > 0)
+            .max_by_key(|(s, _)| *s)
+            .map(|(_, w)| w)
     }
 }
 
@@ -185,9 +218,18 @@ impl Tool for OpenAppTool {
 
     fn assess(&self, args: &Value) -> Result<Assessment, ToolError> {
         let name = arg_str(args, "name")?;
-        let (display, target) = self
-            .resolve(name)
-            .ok_or_else(|| failed(format!("не нашла программу «{name}» в меню «Пуск»")))?;
+        let Some((display, target)) = self.resolve(name) else {
+            let w = self
+                .running(name)
+                .ok_or_else(|| failed(format!("не нашла программу «{name}» в меню «Пуск»")))?;
+            return Ok(Assessment::new(
+                RiskLevel::Low,
+                format!("Переключиться на «{}»", w.title),
+                w.process.clone(),
+                "программа уже открыта, окно выходит вперёд",
+            )
+            .with_scope(w.process));
+        };
         Ok(Assessment::new(
             RiskLevel::Low,
             format!("Запустить «{display}»"),
@@ -204,9 +246,18 @@ impl Tool for OpenAppTool {
         _c: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let name = arg_str(&args, "name")?;
-        let (display, target) = self
-            .resolve(name)
-            .ok_or_else(|| failed(format!("не нашла программу «{name}»")))?;
+        let Some((display, target)) = self.resolve(name) else {
+            let w = self
+                .running(name)
+                .ok_or_else(|| failed(format!("не нашла программу «{name}»")))?;
+            if let Some(windows) = &self.windows {
+                windows.focus(w.id).map_err(failed)?;
+            }
+            return Ok(ToolOutput::new(format!(
+                "«{name}» уже открыта: переключила на окно «{}» ({}). Дальше ui_read или ui_click с window.",
+                w.title, w.process
+            )));
+        };
         let before: Vec<u64> = self
             .windows
             .as_ref()
@@ -433,6 +484,38 @@ mod tests {
         );
         let out = run(&t, json!({"name": "калькулятор"})).await.unwrap().text;
         assert!(out.contains("новое окно за 0 с не появилось"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn open_app_finds_store_apps_and_running_programs() {
+        let (e, f) = env();
+        f.start_apps.lock().push((
+            "Telegram Desktop".into(),
+            "TelegramMessengerLLP.TelegramDesktop_t4vj0pshhgkwm!Telegram".into(),
+        ));
+        let t = OpenAppTool {
+            launcher: e.launcher.clone(),
+            shortcut_dirs: Vec::new(),
+            windows: Some(e.windows.clone()),
+            own_process: "mika.exe".into(),
+            wait: std::time::Duration::ZERO,
+        };
+        run(&t, json!({"name": "телеграм"})).await.unwrap();
+        assert_eq!(
+            f.opened.lock().last().unwrap().0,
+            "shell:AppsFolder\\TelegramMessengerLLP.TelegramDesktop_t4vj0pshhgkwm!Telegram"
+        );
+        // Not in the Start menu but running: its window comes forward.
+        f.start_apps.lock().clear();
+        f.windows.lock().push(WindowInfo {
+            id: 77,
+            title: "Telegram (12)".into(),
+            process: "Telegram.exe".into(),
+        });
+        let out = run(&t, json!({"name": "телеграм"})).await.unwrap().text;
+        assert!(out.contains("уже открыта"), "{out}");
+        assert_eq!(f.focused.lock().last(), Some(&77));
+        assert!(t.assess(&json!({"name": "фотошоп"})).is_err());
     }
 
     #[tokio::test]
