@@ -11,7 +11,7 @@ import {
   gesturePause,
   idleGesture,
   canBlink,
-  canTalk,
+  talkShapes,
   frameUrl,
   isEmotion,
   nextMouth,
@@ -64,18 +64,22 @@ describe('blink and lips', () => {
   });
 
   it('the mouth never keeps one shape twice in a row', () => {
-    let m = nextMouth(null, 0);
-    for (let i = 0; i < 50; i++) {
-      const n = nextMouth(m, (i * 0.37) % 1);
-      expect(n).not.toBe(m);
-      m = n;
+    for (const e of EMOTION_ORDER) {
+      let m = nextMouth(e, null, 0);
+      for (let i = 0; i < 30; i++) {
+        const n = nextMouth(e, m, (i * 0.37) % 1);
+        expect(n, e).not.toBe(m);
+        m = n;
+      }
     }
-    expect(nextMouth('mouth-oo', 0.9999)).not.toBe('mouth-oo');
+    expect(nextMouth('neutral', 'mouth-oo', 0.9999)).not.toBe('mouth-oo');
   });
 
-  it('lips move only where the mouth layers fit', () => {
-    expect(canTalk('neutral')).toBe(true);
-    expect(canTalk('sad')).toBe(false);
+  it('every face talks with a mouth drawn for it', () => {
+    expect(talkShapes('neutral')).toContain('mouth-oo');
+    // A sad face talks with its own sad mouth, never the calm one.
+    expect(talkShapes('sad')).toEqual([null, 'talk-sad']);
+    for (const e of EMOTION_ORDER) for (const s of talkShapes(e)) if (s) expect(frameUrl(s), s).not.toBe('');
   });
 });
 

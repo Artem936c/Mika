@@ -1,6 +1,7 @@
 //! Provider adapters: LLM, embeddings, pictures, MCP servers and Telegram.
 
 pub mod anthropic;
+pub mod catalog;
 mod common;
 pub mod factory;
 pub mod live;

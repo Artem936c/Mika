@@ -59,7 +59,15 @@ pub struct OpenAppTool {
     pub launcher: Arc<dyn Launcher>,
     /// Folders with Start menu shortcuts.
     pub shortcut_dirs: Vec<PathBuf>,
+    /// With windows, the tool waits for the program's window and names it.
+    pub windows: Option<Arc<dyn Windows>>,
+    /// Executable of the assistant: its own windows do not count.
+    pub own_process: String,
+    pub wait: std::time::Duration,
 }
+
+/// Longest wait for a started program to show its window.
+const WINDOW_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 
 impl OpenAppTool {
     pub fn with_start_menu(launcher: Arc<dyn Launcher>) -> Self {
@@ -73,6 +81,30 @@ impl OpenAppTool {
         Self {
             launcher,
             shortcut_dirs: dirs,
+            windows: None,
+            own_process: String::new(),
+            wait: WINDOW_WAIT,
+        }
+    }
+
+    pub fn waiting_for_window(mut self, windows: Arc<dyn Windows>, own_process: String) -> Self {
+        self.windows = Some(windows);
+        self.own_process = own_process;
+        self
+    }
+
+    /// A window that was not there before the launch, once it shows up.
+    async fn new_window(&self, before: &[u64]) -> Option<WindowInfo> {
+        let windows = self.windows.as_ref()?;
+        let deadline = std::time::Instant::now() + self.wait;
+        loop {
+            let fresh = windows.list().into_iter().find(|w| {
+                !before.contains(&w.id) && w.process != self.own_process && !w.title.is_empty()
+            });
+            if fresh.is_some() || std::time::Instant::now() >= deadline {
+                return fresh;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
     }
 
@@ -175,8 +207,25 @@ impl Tool for OpenAppTool {
         let (display, target) = self
             .resolve(name)
             .ok_or_else(|| failed(format!("не нашла программу «{name}»")))?;
+        let before: Vec<u64> = self
+            .windows
+            .as_ref()
+            .map(|w| w.list().into_iter().map(|w| w.id).collect())
+            .unwrap_or_default();
         self.launcher.open(&target, None).map_err(failed)?;
-        Ok(ToolOutput::new(format!("Запущено: {display}.")))
+        if self.windows.is_none() {
+            return Ok(ToolOutput::new(format!("Запущено: {display}.")));
+        }
+        Ok(ToolOutput::new(match self.new_window(&before).await {
+            Some(w) => format!(
+                "Запущено: {display}. Открылось окно «{}» ({}): дальше ui_read или ui_click с window.",
+                w.title, w.process
+            ),
+            None => format!(
+                "Запущено: {display}, но новое окно за {} с не появилось. Возможно, программа уже была открыта: посмотри list_windows.",
+                self.wait.as_secs()
+            ),
+        }))
     }
 }
 
@@ -349,8 +398,41 @@ mod tests {
         let t = OpenAppTool {
             launcher: e.launcher,
             shortcut_dirs: vec![dir.path().to_path_buf()],
+            windows: None,
+            own_process: String::new(),
+            wait: std::time::Duration::ZERO,
         };
         (t, dir, f)
+    }
+
+    #[tokio::test]
+    async fn open_app_names_the_window_that_appeared() {
+        let (e, f) = env();
+        let t = OpenAppTool {
+            launcher: e.launcher.clone(),
+            shortcut_dirs: Vec::new(),
+            windows: None,
+            own_process: "mika.exe".into(),
+            wait: std::time::Duration::from_millis(400),
+        }
+        .waiting_for_window(e.windows.clone(), "mika.exe".into());
+        // The fake launcher does not open windows: a window added in the background stands in.
+        let fakes = f.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            fakes.windows.lock().push(WindowInfo {
+                id: 42,
+                title: "Калькулятор".into(),
+                process: "calc.exe".into(),
+            });
+        });
+        let out = run(&t, json!({"name": "калькулятор"})).await.unwrap().text;
+        assert!(
+            out.contains("Открылось окно «Калькулятор» (calc.exe)"),
+            "{out}"
+        );
+        let out = run(&t, json!({"name": "калькулятор"})).await.unwrap().text;
+        assert!(out.contains("новое окно за 0 с не появилось"), "{out}");
     }
 
     #[tokio::test]

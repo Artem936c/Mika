@@ -9,7 +9,6 @@
     blinkPause,
     canBlink,
     canGesture,
-    canTalk,
     frameUrl,
     gesturePause,
     idleGesture,
@@ -91,11 +90,12 @@
 
   // Lips while she talks.
   $effect(() => {
-    if (!talking || !canTalk(emotion)) {
+    if (!talking) {
       mouth = null;
       return;
     }
-    const timer = setInterval(() => (mouth = nextMouth(mouth, Math.random())), MOUTH_STEP_MS);
+    const face = emotion;
+    const timer = setInterval(() => (mouth = nextMouth(face, mouth, Math.random())), MOUTH_STEP_MS);
     return () => clearInterval(timer);
   });
 

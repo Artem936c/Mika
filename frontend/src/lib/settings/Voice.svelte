@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ModelPicker from './ModelPicker.svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import Switch from '../Switch.svelte';
@@ -134,6 +135,31 @@
     invoke('test_voice', { text: t('voice.test_phrase', { name }) });
   }
 
+  interface VoiceList {
+    voices: string[];
+    source: 'provider' | 'known' | 'none';
+  }
+  let voicesOpen = $state(false);
+  let voices = $state<VoiceList | null>(null);
+
+  async function toggleVoices() {
+    voicesOpen = !voicesOpen;
+    if (!voicesOpen || !s) return;
+    voices = null;
+    try {
+      voices = await invoke<VoiceList>('list_voices', { model: s.tts_model, baseUrl: s.speech_base_url || null });
+    } catch (e) {
+      voicesOpen = false;
+      fail(e);
+    }
+  }
+
+  async function listen(v: string) {
+    if (!s) return;
+    s.tts_voice = v;
+    await testVoice();
+  }
+
   async function testMic() {
     if (listening) {
       // A second press ends the phrase early.
@@ -185,14 +211,32 @@
     {/if}
   {:else}
     <p class="hint">{t('voice.provider_sub')}</p>
-    <label>
+    <div class="lab">
       <span class="lbl">{t('voice.tts_model')}</span>
-      <input class="fld" bind:value={s.tts_model} placeholder="google/gemini-3.8-flash-lite-tts" spellcheck="false" />
-    </label>
-    <label>
+      <ModelPicker bind:value={s.tts_model} purpose="tts" baseUrl={s.speech_base_url} placeholder="google/gemini-3.8-flash-lite-tts" />
+    </div>
+    <div class="lab">
       <span class="lbl">{t('voice.tts_voice')}</span>
-      <input class="fld" bind:value={s.tts_voice} placeholder="Kore" spellcheck="false" />
-    </label>
+      <div class="vrow">
+        <input class="fld" bind:value={s.tts_voice} placeholder="Kore" spellcheck="false" />
+        <button class="bt" class:on={voicesOpen} onclick={toggleVoices}>{t('voices.browse')}</button>
+      </div>
+      {#if voicesOpen}
+        {#if voices === null}
+          <p class="hint">{t('models.loading')}</p>
+        {:else}
+          <p class="hint">{t(`voices.${voices.source}`)}</p>
+          <div class="voices">
+            {#each voices.voices as v (v)}
+              <span class="vc" class:on={s.tts_voice === v}>
+                <button class="vname" onclick={() => s && (s.tts_voice = v)}>{v}</button>
+                <button class="vplay" title={t('voices.listen')} aria-label={t('voices.listen')} onclick={() => listen(v)}>▶</button>
+              </span>
+            {/each}
+          </div>
+        {/if}
+      {/if}
+    </div>
   {/if}
   <div class="acts">
     <button class="bt" onclick={testVoice}>{t('voice.test')}</button>
@@ -218,10 +262,10 @@
     <input class="fld short2" bind:value={s.wake_phrase} maxlength="40" onchange={() => s && setWake(s.wake_enabled)} />
   </label>
   {#if wakeNote}<p class="hint">{wakeNote}</p>{/if}
-  <label>
+  <div class="lab">
     <span class="lbl">{t('voice.stt_model')}</span>
-    <input class="fld" bind:value={s.stt_model} placeholder="qwen/qwen3-asr-0.6b" spellcheck="false" />
-  </label>
+    <ModelPicker bind:value={s.stt_model} purpose="stt" baseUrl={s.speech_base_url} placeholder="qwen/qwen3-asr-0.6b" />
+  </div>
   <label>
     <span class="lbl">{t('voice.stt_language')}</span>
     <input class="fld short" bind:value={s.stt_language} maxlength="8" placeholder="ru" spellcheck="false" />
@@ -255,10 +299,12 @@
     padding-top: 18px;
     border-top: 1px solid var(--line);
   }
-  label {
+  label,
+  .lab {
     display: block;
   }
-  label .lbl {
+  label .lbl,
+  .lab .lbl {
     display: block;
     margin: 12px 0 6px;
   }
@@ -268,6 +314,50 @@
   }
   select.fld option {
     background: #14151f;
+  }
+  .vrow {
+    display: flex;
+    gap: 8px;
+  }
+  .vrow .fld {
+    flex: 1;
+    min-width: 0;
+  }
+  .bt.on {
+    border-color: rgba(143, 125, 255, 0.55);
+  }
+  .voices {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+    max-height: 180px;
+    overflow-y: auto;
+  }
+  .vc {
+    display: inline-flex;
+    border-radius: 10px;
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.03);
+    overflow: hidden;
+  }
+  .vc.on {
+    border-color: rgba(143, 125, 255, 0.6);
+    background: rgba(143, 125, 255, 0.14);
+  }
+  .vc button {
+    all: unset;
+    cursor: pointer;
+    padding: 5px 9px;
+    font-size: 12.5px;
+  }
+  .vc .vplay {
+    padding: 5px 8px;
+    color: var(--mute);
+    border-left: 1px solid var(--line);
+  }
+  .vc button:hover {
+    background: rgba(255, 255, 255, 0.06);
   }
   .short {
     width: 120px;

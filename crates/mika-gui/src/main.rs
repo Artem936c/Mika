@@ -2,6 +2,7 @@
 
 mod app;
 mod bridge;
+mod catalog;
 mod platform;
 mod settings;
 mod strings;
@@ -117,6 +118,8 @@ fn main() {
             bridge::send_message,
             bridge::stop,
             bridge::poke_avatar,
+            catalog::list_models,
+            catalog::list_voices,
             bridge::get_history,
             bridge::clear_history,
             bridge::get_llm_settings,

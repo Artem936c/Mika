@@ -3,6 +3,7 @@
 //! Every tool resolves its window first and refuses the "blind zone".
 //! The rule scope of the acting tools is the program, so "always allow" covers one program.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,6 +14,7 @@ use mika_core::policy::blind::{is_blind_title, BLIND_REFUSAL};
 use mika_core::tools::{
     arg_str, arg_str_opt, spec, Assessment, RiskLevel, Tool, ToolError, ToolOutput,
 };
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -25,6 +27,15 @@ pub const MAX_NODES: usize = 400;
 const MAX_TREE_CHARS: usize = 14_000;
 /// The highlight frame stays this long before the click.
 const TARGET_PAUSE_MS: u64 = 350;
+/// Time for the program to react before its window is read again.
+const SETTLE_MS: u64 = 400;
+/// Changed elements listed after an action.
+const MAX_CHANGES: usize = 15;
+/// Names in one click sequence.
+const MAX_SEQUENCE: usize = 30;
+
+/// The last tree read from each window: actions report what changed since.
+pub type Seen = Arc<Mutex<HashMap<u64, Vec<UiNode>>>>;
 
 /// Shared parts of the window tools.
 #[derive(Clone)]
@@ -35,6 +46,7 @@ pub struct UiEnv {
     pub bus: EventBus,
     /// Executable name of the assistant itself, lower case; its windows are never a target.
     pub own_process: String,
+    pub seen: Seen,
 }
 
 impl UiEnv {
@@ -67,7 +79,17 @@ impl UiEnv {
             failed(if query.is_empty() {
                 "нет открытых окон".to_string()
             } else {
-                format!("нет окна «{query}»")
+                // The model may name the window in another language: show what there is.
+                let open: Vec<String> = list
+                    .iter()
+                    .filter(|w| !is_blind_title(&w.title))
+                    .take(12)
+                    .map(label)
+                    .collect();
+                format!(
+                    "нет окна «{query}». Открытые окна: {}. Укажи в window часть заголовка как здесь",
+                    if open.is_empty() { "нет".to_string() } else { open.join(", ") }
+                )
             })
         })?;
         if is_blind_title(&w.title) {
@@ -84,6 +106,98 @@ impl UiEnv {
             format!("действие в программе {}", program(w)),
         )
         .with_scope(program(w))
+    }
+
+    async fn tree(&self, id: u64) -> Result<Vec<UiNode>, ToolError> {
+        let ui = self.ui.clone();
+        let nodes = tokio::task::spawn_blocking(move || ui.tree(id))
+            .await
+            .map_err(|e| failed(e.to_string()))?
+            .map_err(failed)?;
+        self.seen.lock().insert(id, nodes.clone());
+        Ok(nodes)
+    }
+
+    /// The remembered tree of the window, or a fresh one.
+    async fn known_tree(&self, id: u64) -> Result<Vec<UiNode>, ToolError> {
+        let known = self.seen.lock().get(&id).cloned();
+        match known {
+            Some(t) => Ok(t),
+            None => self.tree(id).await,
+        }
+    }
+
+    fn foreign_windows(&self) -> Vec<WindowInfo> {
+        self.windows
+            .list()
+            .into_iter()
+            .filter(|w| w.process != self.own_process)
+            .collect()
+    }
+
+    /// What an action changed: a closed window, a new window (a dialog), or the
+    /// elements that differ from the last reading. Saves a separate `ui_read`.
+    async fn outcome(&self, w: &WindowInfo, before: &[WindowInfo]) -> String {
+        tokio::time::sleep(std::time::Duration::from_millis(SETTLE_MS)).await;
+        let now = self.foreign_windows();
+        let mut out = Vec::new();
+        for n in now.iter().filter(|n| !before.iter().any(|b| b.id == n.id)) {
+            out.push(if is_blind_title(&n.title) {
+                format!(
+                    "Появилось окно {} — оно в слепой зоне, его не трогаю.",
+                    program(n)
+                )
+            } else {
+                format!(
+                    "Появилось окно {}: прочитай его через ui_read с window.",
+                    label(n)
+                )
+            });
+        }
+        if !now.iter().any(|n| n.id == w.id) {
+            self.seen.lock().remove(&w.id);
+            out.push(format!("Окно {} закрылось.", label(w)));
+            return out.join("\n");
+        }
+        let old = self.seen.lock().get(&w.id).cloned();
+        match self.tree(w.id).await {
+            Err(e) => out.push(format!("Окно не перечитала: {e}")),
+            Ok(new) => match old {
+                None => out.push(format!("Окно {} сейчас:\n{}", label(w), render_tree(&new))),
+                Some(old) => out.push(changes(&old, &new)),
+            },
+        }
+        out.join("\n")
+    }
+
+    /// One press of element `n`: UI Automation first, the mouse when it cannot.
+    async fn press(
+        &self,
+        id: u64,
+        n: u32,
+        btn: MouseButton,
+        double: bool,
+    ) -> Result<(), ToolError> {
+        let ui = self.ui.clone();
+        let rect = tokio::task::spawn_blocking(move || ui.rect(id, n))
+            .await
+            .map_err(|e| failed(e.to_string()))?
+            .map_err(failed)?;
+        self.show_target(rect);
+        if btn == MouseButton::Left && !double {
+            let ui = self.ui.clone();
+            let done = tokio::task::spawn_blocking(move || ui.invoke(id, n))
+                .await
+                .map_err(|e| failed(e.to_string()))?
+                .map_err(failed)?;
+            if done.is_some() {
+                return Ok(());
+            }
+        }
+        self.windows.focus(id).map_err(failed)?;
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let (x, y) = rect.center();
+        self.input.click(x, y, btn, double).map_err(failed)
     }
 
     fn show_target(&self, r: Rect) {
@@ -129,6 +243,91 @@ fn props(extra: &[(&str, Value)], required: &[&str]) -> Value {
     json!({ "type": "object", "properties": p, "required": required })
 }
 
+fn node_line(node: &UiNode) -> String {
+    let mut line = format!("[{}] {}", node.n, node.role);
+    if !node.name.is_empty() {
+        line.push_str(&format!(" «{}»", truncate(&node.name, 80)));
+    }
+    if !node.value.is_empty() {
+        line.push_str(&format!(" = {}", truncate(&node.value, 120)));
+    }
+    if !node.enabled {
+        line.push_str(" (недоступен)");
+    }
+    line
+}
+
+/// Elements that appeared or changed since `old`, with their current numbers.
+pub fn changes(old: &[UiNode], new: &[UiNode]) -> String {
+    let key = |n: &UiNode| {
+        (
+            n.depth,
+            n.role.clone(),
+            n.name.clone(),
+            n.value.clone(),
+            n.enabled,
+        )
+    };
+    let before: std::collections::HashSet<_> = old.iter().map(key).collect();
+    let after: std::collections::HashSet<_> = new.iter().map(key).collect();
+    let fresh: Vec<&UiNode> = new.iter().filter(|n| !before.contains(&key(n))).collect();
+    let gone = old.iter().filter(|n| !after.contains(&key(n))).count();
+    if fresh.is_empty() && gone == 0 {
+        return "Видимых изменений в окне нет.".into();
+    }
+    let mut out = String::from("Изменилось в окне (номера актуальны):");
+    for n in fresh.iter().take(MAX_CHANGES) {
+        out.push('\n');
+        out.push_str(&node_line(n));
+    }
+    if fresh.len() > MAX_CHANGES {
+        out.push_str(&format!(
+            "\n…и ещё {} новых элементов: прочитай окно",
+            fresh.len() - MAX_CHANGES
+        ));
+    }
+    if gone > 0 {
+        out.push_str(&format!("\nПропало элементов: {gone}."));
+    }
+    out
+}
+
+const CLICKABLE: &[&str] = &[
+    "button",
+    "menuitem",
+    "listitem",
+    "hyperlink",
+    "tabitem",
+    "checkbox",
+    "radiobutton",
+    "treeitem",
+    "splitbutton",
+    "dataitem",
+    "image",
+];
+
+/// The element called `name`: an exact name first, then one that contains it;
+/// enabled clickable elements win over the rest.
+pub fn find_by_name(nodes: &[UiNode], name: &str) -> Option<u32> {
+    let want = name.trim().to_lowercase();
+    if want.is_empty() {
+        return None;
+    }
+    let rank = |n: &UiNode| {
+        let role = n.role.to_lowercase();
+        (n.enabled as u8) * 2 + CLICKABLE.iter().any(|c| role == *c) as u8
+    };
+    let pick = |pred: &dyn Fn(&UiNode) -> bool| {
+        nodes
+            .iter()
+            .filter(|n| n.n > 0 && pred(n))
+            .max_by_key(|n| (rank(n), std::cmp::Reverse(n.n)))
+            .map(|n| n.n)
+    };
+    pick(&|n| n.name.trim().to_lowercase() == want)
+        .or_else(|| pick(&|n| n.name.to_lowercase().contains(&want)))
+}
+
 /// The tree as text: one element per line, children indented.
 pub fn render_tree(nodes: &[UiNode]) -> String {
     let mut out = String::new();
@@ -165,7 +364,7 @@ impl Tool for UiReadTool {
     fn spec(&self) -> ToolSpec {
         spec(
             "ui_read",
-            "Прочитать окно программы: кнопки, поля, меню и их текст. У каждого элемента номер в квадратных скобках — он нужен для ui_click и ui_type. После любого действия номера устаревают: прочитай окно заново.",
+            "Прочитать окно программы целиком: кнопки, поля, меню и их текст. У каждого элемента номер в квадратных скобках для ui_click и ui_type. После действия ui_click, ui_type и ui_keys сами сообщают, что изменилось, так что читать всё окно заново нужно редко.",
             props(&[], &[]),
         )
     }
@@ -188,12 +387,7 @@ impl Tool for UiReadTool {
         _c: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let w = self.0.target(&args)?;
-        let ui = self.0.ui.clone();
-        let id = w.id;
-        let nodes = tokio::task::spawn_blocking(move || ui.tree(id))
-            .await
-            .map_err(|e| failed(e.to_string()))?
-            .map_err(failed)?;
+        let nodes = self.0.tree(w.id).await?;
         if nodes.len() <= 1 {
             return Ok(ToolOutput::new(format!(
                 "Окно {} не отдаёт свои элементы. Попробуй клавиши (ui_keys) или посмотри на него (screen_look).",
@@ -221,19 +415,45 @@ fn button(args: &Value) -> Result<MouseButton, ToolError> {
     }
 }
 
-/// Where to click: an element number, or a point inside the window.
+/// Where to click: an element number, a point inside the window, or elements by name.
 enum Spot {
     Node(u32),
     Point(i32, i32),
+    Names(Vec<String>),
+}
+
+fn names_arg(args: &Value) -> Option<Vec<String>> {
+    let list: Vec<String> = match (args.get("names"), args.get("name")) {
+        (Some(Value::Array(a)), _) => a
+            .iter()
+            .filter_map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| v.as_i64().map(|i| i.to_string()))
+            })
+            .collect(),
+        (_, Some(Value::String(s))) => vec![s.clone()],
+        _ => return None,
+    };
+    let list: Vec<String> = list
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    (!list.is_empty()).then_some(list)
 }
 
 fn spot(args: &Value) -> Result<Spot, ToolError> {
     let point = (arg_u64(args, "x"), arg_u64(args, "y"));
-    match (node_arg(args), point) {
-        (Some(n), (None, None)) => Ok(Spot::Node(n)),
-        (None, (Some(x), Some(y))) => Ok(Spot::Point(x as i32, y as i32)),
+    match (node_arg(args), point, names_arg(args)) {
+        (Some(n), (None, None), None) => Ok(Spot::Node(n)),
+        (None, (Some(x), Some(y)), None) => Ok(Spot::Point(x as i32, y as i32)),
+        (None, (None, None), Some(names)) if names.len() <= MAX_SEQUENCE => Ok(Spot::Names(names)),
+        (None, (None, None), Some(_)) => Err(ToolError::BadArguments(format!(
+            "не больше {MAX_SEQUENCE} нажатий за раз"
+        ))),
         _ => Err(ToolError::BadArguments(
-            "укажи n (номер элемента из ui_read) или x и y (точка в окне)".into(),
+            "укажи одно: n (номер из ui_read), name или names (подписи элементов) или x и y (точка в окне)".into(),
         )),
     }
 }
@@ -243,10 +463,12 @@ impl Tool for UiClickTool {
     fn spec(&self) -> ToolSpec {
         spec(
             "ui_click",
-            "Нажать на элемент окна по номеру из ui_read: кнопку, пункт меню, флажок, вкладку. Если у элемента нет номера, можно нажать в точку x, y — пиксели от левого верхнего угла окна, как на снимке screen_look.",
+            "Нажать на элемент окна: кнопку, пункт меню, флажок, вкладку. По номеру n из ui_read, по подписи name или цепочкой подписей names — например [\"1\", \"2\", \"Умножить\", \"3\", \"Равно\"] для калькулятора или [\"Файл\", \"Сохранить как\"] для меню. Если у элемента нет ни номера, ни подписи, можно нажать в точку x, y — пиксели от левого верхнего угла окна. В ответе — что изменилось в окне.",
             props(
                 &[
                     ("n", json!({ "type": "integer", "description": "Номер элемента из ui_read" })),
+                    ("name", json!({ "type": "string", "description": "Подпись элемента" })),
+                    ("names", json!({ "type": "array", "items": { "type": "string" }, "description": "Подписи элементов, нажимаются по очереди" })),
                     ("x", json!({ "type": "integer", "description": "Пиксель по горизонтали от левого края окна" })),
                     ("y", json!({ "type": "integer", "description": "Пиксель по вертикали от верхнего края окна" })),
                     ("button", json!({ "type": "string", "enum": ["left", "right", "middle"] })),
@@ -263,6 +485,11 @@ impl Tool for UiClickTool {
         let what = match spot(args)? {
             Spot::Node(n) => format!("элемент №{n}"),
             Spot::Point(x, y) => format!("точка {x}, {y}"),
+            Spot::Names(names) => names
+                .iter()
+                .map(|n| format!("«{}»", truncate(n, 40)))
+                .collect::<Vec<_>>()
+                .join(", "),
         };
         Ok(self
             .0
@@ -281,17 +508,50 @@ impl Tool for UiClickTool {
         let double = arg_bool(&args, "double");
         let where_ = spot(&args)?;
         let id = w.id;
+        let before = env.foreign_windows();
+        if let Spot::Names(names) = &where_ {
+            let mut done = Vec::new();
+            for name in names {
+                let mut nodes = env.known_tree(id).await?;
+                let mut n = find_by_name(&nodes, name);
+                if n.is_none() {
+                    // A menu or page may have opened since the last reading.
+                    nodes = env.tree(id).await?;
+                    n = find_by_name(&nodes, name);
+                }
+                let Some(n) = n else {
+                    let report = env.outcome(&w, &before).await;
+                    return Err(failed(format!(
+                        "нет элемента «{name}» в окне {}{}. {report}",
+                        label(&w),
+                        if done.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (уже нажала: {})", done.join(", "))
+                        }
+                    )));
+                };
+                env.press(id, n, btn, double).await?;
+                done.push(format!("«{name}»"));
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+            let report = env.outcome(&w, &before).await;
+            return Ok(ToolOutput::new(format!(
+                "Нажала {}.\n{report}",
+                done.join(", ")
+            )));
+        }
         let ui = env.ui.clone();
         let rect = match where_ {
             Spot::Node(n) => tokio::task::spawn_blocking(move || ui.rect(id, n)),
-            Spot::Point(..) => tokio::task::spawn_blocking(move || ui.rect(id, 0)),
+            _ => tokio::task::spawn_blocking(move || ui.rect(id, 0)),
         }
         .await
         .map_err(|e| failed(e.to_string()))?
         .map_err(failed)?;
 
         let (x, y, frame) = match where_ {
-            Spot::Node(_) => {
+            Spot::Node(_) | Spot::Names(_) => {
                 let (x, y) = rect.center();
                 (x, y, rect)
             }
@@ -327,17 +587,15 @@ impl Tool for UiClickTool {
                 .map_err(|e| failed(e.to_string()))?
                 .map_err(failed)?;
             if let Some(what) = done {
-                return Ok(ToolOutput::new(format!(
-                    "{what}: элемент №{n}. Прочитай окно заново, чтобы увидеть результат."
-                )));
+                let report = env.outcome(&w, &before).await;
+                return Ok(ToolOutput::new(format!("{what}: элемент №{n}.\n{report}")));
             }
         }
         env.windows.focus(id).map_err(failed)?;
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         env.input.click(x, y, btn, double).map_err(failed)?;
-        Ok(ToolOutput::new(
-            "Щёлкнула мышью. Прочитай окно заново, чтобы увидеть результат.",
-        ))
+        let report = env.outcome(&w, &before).await;
+        Ok(ToolOutput::new(format!("Щёлкнула мышью.\n{report}")))
     }
 }
 
@@ -380,6 +638,7 @@ impl Tool for UiTypeTool {
         let w = env.target(&args)?;
         let text = arg_str(&args, "text")?.to_string();
         let id = w.id;
+        let before = env.foreign_windows();
         let mut typed_by_pattern = false;
         if let Some(n) = node_arg(&args) {
             let (ui, t) = (env.ui.clone(), text.clone());
@@ -409,8 +668,9 @@ impl Tool for UiTypeTool {
             }
             env.input.chord(&[VK_RETURN]).map_err(failed)?;
         }
+        let report = env.outcome(&w, &before).await;
         Ok(ToolOutput::new(format!(
-            "Ввела текст в окно {}.",
+            "Ввела текст в окно {}.\n{report}",
             label(&w)
         )))
     }
@@ -523,14 +783,16 @@ impl Tool for UiKeysTool {
     ) -> Result<ToolOutput, ToolError> {
         let w = self.0.target(&args)?;
         let chords = parse_keys(arg_str(&args, "keys")?).map_err(ToolError::BadArguments)?;
+        let before = self.0.foreign_windows();
         self.0.windows.focus(w.id).map_err(failed)?;
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         for chord in &chords {
             self.0.input.chord(chord).map_err(failed)?;
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         }
+        let report = self.0.outcome(&w, &before).await;
         Ok(ToolOutput::new(format!(
-            "Нажала клавиши в окне {}.",
+            "Нажала клавиши в окне {}.\n{report}",
             label(&w)
         )))
     }
@@ -723,6 +985,7 @@ mod tests {
             input: e.input.clone(),
             bus: e.shared.bus.clone(),
             own_process: "mika.exe".into(),
+            seen: Default::default(),
         };
         (ui, f)
     }
@@ -771,9 +1034,16 @@ mod tests {
         assert!(UiReadTool(e.clone())
             .assess(&json!({"window": "мика"}))
             .is_err());
-        assert!(UiReadTool(e)
-            .assess(&json!({"window": "калькулятор"}))
-            .is_err());
+        let err = UiReadTool(e)
+            .assess(&json!({"window": "Calculator"}))
+            .unwrap_err()
+            .to_string();
+        // The answer lists the open windows, without the blind one and without Mika.
+        assert!(
+            err.contains("«Безымянный — Блокнот» (notepad.exe)"),
+            "{err}"
+        );
+        assert!(!err.contains("банк") && !err.contains("mika.exe"), "{err}");
     }
 
     #[tokio::test]
@@ -789,6 +1059,11 @@ mod tests {
         );
         let out = run(&tool, json!({"n": 2})).await.unwrap().text;
         assert!(out.starts_with("Нажала: элемент №2"));
+        // Nothing was read before, so the whole window comes back.
+        assert!(
+            out.contains("[1] Edit «Текстовый редактор» = привет"),
+            "{out}"
+        );
         assert!(f.clicks.lock().is_empty());
         assert!(matches!(
             rx.try_recv().unwrap(),
@@ -871,6 +1146,89 @@ mod tests {
         assert!(ArrangeWindowTool(e)
             .assess(&json!({"placement": "sideways"}))
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn names_are_pressed_in_order_and_changes_reported() {
+        let (e, f) = ui_env();
+        *f.invoke_result.lock() = Some("Нажала");
+        run(&UiReadTool(e.clone()), json!({})).await.unwrap();
+        f.tree.lock().push(UiNode {
+            n: 3,
+            depth: 1,
+            role: "Text".into(),
+            name: "Результат".into(),
+            value: "1000".into(),
+            enabled: true,
+        });
+        let tool = UiClickTool(e.clone());
+        let a = tool
+            .assess(&json!({"names": ["Файл", "Текстовый"]}))
+            .unwrap();
+        assert!(a.target.starts_with("«Файл», «Текстовый»"), "{}", a.target);
+        let out = run(&tool, json!({"names": ["Файл", "Текстовый"]}))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.starts_with("Нажала «Файл», «Текстовый»."), "{out}");
+        assert!(out.contains("[3] Text «Результат» = 1000"), "{out}");
+        let err = run(&tool, json!({"name": "Сохранить"})).await.unwrap_err();
+        assert!(err.to_string().contains("нет элемента «Сохранить»"));
+    }
+
+    #[test]
+    fn find_by_name_prefers_exact_enabled_buttons() {
+        let node = |n, role: &str, name: &str, enabled| UiNode {
+            n,
+            depth: 1,
+            role: role.into(),
+            name: name.into(),
+            enabled,
+            ..Default::default()
+        };
+        let nodes = vec![
+            node(0, "Window", "Калькулятор", true),
+            node(1, "Text", "8", true),
+            node(2, "Button", "8", true),
+            node(3, "Button", "Умножить на", true),
+            node(4, "Button", "Сохранить как", false),
+            node(5, "MenuItem", "Сохранить как", true),
+        ];
+        assert_eq!(find_by_name(&nodes, "8"), Some(2));
+        assert_eq!(find_by_name(&nodes, "умножить"), Some(3));
+        assert_eq!(find_by_name(&nodes, "Сохранить как"), Some(5));
+        assert_eq!(
+            find_by_name(&nodes, "калькулятор"),
+            None,
+            "the window itself is not a target"
+        );
+        assert_eq!(find_by_name(&nodes, "делить"), None);
+    }
+
+    #[test]
+    fn changes_list_new_and_count_gone_elements() {
+        let a = vec![UiNode {
+            n: 1,
+            depth: 1,
+            role: "Text".into(),
+            value: "0".into(),
+            enabled: true,
+            ..Default::default()
+        }];
+        let b = vec![UiNode {
+            n: 1,
+            depth: 1,
+            role: "Text".into(),
+            value: "125".into(),
+            enabled: true,
+            ..Default::default()
+        }];
+        let c = changes(&a, &b);
+        assert!(
+            c.contains("[1] Text = 125") && c.contains("Пропало элементов: 1"),
+            "{c}"
+        );
+        assert_eq!(changes(&b, &b), "Видимых изменений в окне нет.");
     }
 
     #[test]

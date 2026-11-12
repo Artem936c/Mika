@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ModelPicker from './ModelPicker.svelte';
   // Vision and picture models: they use the LLM address and key unless given their own.
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
@@ -59,14 +60,14 @@
 </div>
 
 <div class="form">
-  <label>
+  <div class="lab">
     <span class="lbl">{t('providers.vision_model')}</span>
-    <input class="fld" bind:value={vision} spellcheck="false" />
-  </label>
-  <label>
+    <ModelPicker bind:value={vision} purpose="vision" />
+  </div>
+  <div class="lab">
     <span class="lbl">{t('providers.image_model')}</span>
-    <input class="fld" bind:value={imageModel} spellcheck="false" />
-  </label>
+    <ModelPicker bind:value={imageModel} purpose="image" baseUrl={imageUrl} />
+  </div>
   <label>
     <span class="lbl">{t('providers.image_url')}</span>
     <input class="fld" bind:value={imageUrl} spellcheck="false" />
@@ -138,10 +139,12 @@
     border-radius: 16px;
     border: 1px solid var(--line);
   }
-  label {
+  label,
+  .lab {
     display: block;
   }
-  label .lbl {
+  label .lbl,
+  .lab .lbl {
     display: block;
     margin: 12px 0 6px;
   }

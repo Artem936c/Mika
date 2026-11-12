@@ -79,7 +79,9 @@ pub fn system_prompt(assistant: &AssistantConfig) -> String {
 Когда пользователь сообщает о себе что-то важное на будущее (имя, близкие, предпочтения, даты), \
 сохрани это инструментом memory_save. \
 Чтобы действовать в окне программы, сначала прочитай его через ui_read, потом нажимай и печатай \
-по номерам элементов; после каждого действия читай окно заново.\n\
+по подписям элементов (надёжнее номеров); несколько кнопок подряд нажимай одним ui_click с names. \
+Ответ на действие сам сообщает, что изменилось в окне, появился ли диалог или окно закрылось: \
+сверяй это с тем, что ожидала, и исправляй, если вышло не так.\n\
 {persona}\n\
 В самом начале ответа можешь поставить одну метку эмоции в квадратных скобках: \
 [joy] радость, [shy] смущение, [surprise] удивление, [sad] грусть, [angry] сердишься, \
@@ -92,6 +94,86 @@ pub fn system_prompt(assistant: &AssistantConfig) -> String {
 
 /// Longest text between `[` and `]` that can still be an emotion tag.
 const MAX_TAG: usize = 16;
+
+/// Reasoning that some models write into the reply text, as (open, close) markers:
+/// Gemma's thought channel and the `<think>` tags of Qwen and DeepSeek.
+const THOUGHT_MARKERS: &[(&str, &str)] = &[("<|channel>", "<channel|>"), ("<think>", "</think>")];
+
+/// Cuts reasoning blocks out of streamed text. A marker may arrive split across
+/// chunks, so a tail that could start one is held back.
+#[derive(Debug, Default)]
+pub struct ThoughtFilter {
+    held: String,
+    /// Index into `THOUGHT_MARKERS` of the open block.
+    inside: Option<usize>,
+}
+
+impl ThoughtFilter {
+    /// Length in bytes of the longest tail of `s` that is a proper prefix of one of `marks`.
+    fn partial_tail(s: &str, marks: &[&str]) -> usize {
+        marks
+            .iter()
+            .flat_map(|m| {
+                (1..m.len())
+                    .filter(|k| m.is_char_boundary(*k))
+                    .map(move |k| &m[..k])
+            })
+            .filter(|p| s.ends_with(p))
+            .map(str::len)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn push(&mut self, chunk: &str) -> String {
+        self.held.push_str(chunk);
+        let mut out = String::new();
+        loop {
+            match self.inside {
+                None => {
+                    let found = THOUGHT_MARKERS
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, (open, _))| self.held.find(open).map(|at| (at, i)))
+                        .min();
+                    if let Some((at, i)) = found {
+                        out.push_str(&self.held[..at]);
+                        self.held.drain(..at + THOUGHT_MARKERS[i].0.len());
+                        self.inside = Some(i);
+                        continue;
+                    }
+                    let opens: Vec<&str> = THOUGHT_MARKERS.iter().map(|(o, _)| *o).collect();
+                    let keep = Self::partial_tail(&self.held, &opens);
+                    let cut = self.held.len() - keep;
+                    out.push_str(&self.held[..cut]);
+                    self.held.drain(..cut);
+                    return out;
+                }
+                Some(i) => {
+                    let close = THOUGHT_MARKERS[i].1;
+                    if let Some(at) = self.held.find(close) {
+                        self.held.drain(..at + close.len());
+                        self.inside = None;
+                        continue;
+                    }
+                    let keep = Self::partial_tail(&self.held, &[close]);
+                    let cut = self.held.len() - keep;
+                    self.held.drain(..cut);
+                    return out;
+                }
+            }
+        }
+    }
+
+    /// Text still held when the stream ends; an unclosed block is dropped.
+    pub fn finish(&mut self) -> String {
+        let held = std::mem::take(&mut self.held);
+        if self.inside.take().is_some() {
+            String::new()
+        } else {
+            held
+        }
+    }
+}
 
 /// `🤔` or `😊😊`: a few emoji (symbols from U+2600 up, with their joiners), nothing else.
 fn is_emoji_tag(inner: &str) -> bool {
@@ -459,6 +541,7 @@ impl Agent {
         let mut text = String::new();
         let mut calls = Vec::new();
         let mut tags = TagFilter::default();
+        let mut thoughts = ThoughtFilter::default();
         // A reply that starts like tool calls written as text is held back, see `calls_from_text`.
         let mut written_calls = String::new();
         let mut route = |agent: &Self, text: &mut String, piece: String| {
@@ -484,13 +567,17 @@ impl Agent {
             }
             match chunk {
                 None => {
-                    let rest = tags.finish();
+                    let (mut rest, cues) = tags.push(&thoughts.finish());
+                    for emotion in cues {
+                        self.bus.publish(Event::EmotionCue { emotion });
+                    }
+                    rest.push_str(&tags.finish());
                     route(self, &mut text, rest);
                     break;
                 }
                 Some(Err(e)) => return Err(e.into()),
                 Some(Ok(LlmChunk::Text(t))) => {
-                    let (clean, cues) = tags.push(&t);
+                    let (clean, cues) = tags.push(&thoughts.push(&t));
                     for emotion in cues {
                         self.bus.publish(Event::EmotionCue { emotion });
                     }
@@ -1118,6 +1205,37 @@ mod tests {
             filter(&["[", "wink", "]", " ", "Ха"]),
             ("Ха".into(), vec![Emotion::Wink])
         );
+    }
+
+    fn thoughts(chunks: &[&str]) -> String {
+        let mut f = ThoughtFilter::default();
+        let mut out: String = chunks.iter().map(|c| f.push(c)).collect();
+        out.push_str(&f.finish());
+        out
+    }
+
+    #[test]
+    fn thought_blocks_are_cut_even_when_split() {
+        assert_eq!(
+            thoughts(&["<|channel>thought\nсчитаю…<channel|>Ответ: 51"]),
+            "Ответ: 51"
+        );
+        assert_eq!(
+            thoughts(&["Сейчас <|chan", "nel>thought думаю<chan", "nel|> готово"]),
+            "Сейчас  готово"
+        );
+        assert_eq!(thoughts(&["<think>план</think>Привет"]), "Привет");
+        assert_eq!(
+            thoughts(&["<|channel>thought и обрыв"]),
+            "",
+            "an unclosed block is dropped"
+        );
+        assert_eq!(
+            thoughts(&["a < b и <think"]),
+            "a < b и <think",
+            "a lone prefix comes back at the end"
+        );
+        assert_eq!(thoughts(&["обычный текст"]), "обычный текст");
     }
 
     #[test]

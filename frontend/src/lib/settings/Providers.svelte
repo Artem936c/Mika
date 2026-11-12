@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ModelPicker from './ModelPicker.svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import Icon from '../Icon.svelte';
@@ -124,10 +125,10 @@
     <span class="lbl">{t('providers.url')}</span>
     <input class="fld" bind:value={baseUrl} placeholder={placeholderUrl} spellcheck="false" />
   </label>
-  <label>
+  <div class="lab">
     <span class="lbl">{t('providers.model')}</span>
-    <input class="fld" bind:value={model} placeholder="gpt-4o-mini" spellcheck="false" />
-  </label>
+    <ModelPicker bind:value={model} purpose="chat" {baseUrl} {kind} placeholder="gpt-4o-mini" />
+  </div>
   <label>
     <span class="lbl">{t('providers.key')}</span>
     <input
@@ -212,10 +213,12 @@
     border-radius: 16px;
     border: 1px solid var(--line);
   }
-  label {
+  label,
+  .lab {
     display: block;
   }
-  label .lbl {
+  label .lbl,
+  .lab .lbl {
     display: block;
     margin: 14px 0 6px;
   }

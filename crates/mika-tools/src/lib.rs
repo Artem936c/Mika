@@ -154,12 +154,14 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
         input: env.input.clone(),
         bus: env.shared.bus.clone(),
         own_process: own_process(),
+        seen: Default::default(),
     };
 
     if on("apps") {
-        reg.register(Arc::new(apps::OpenAppTool::with_start_menu(
-            env.launcher.clone(),
-        )));
+        reg.register(Arc::new(
+            apps::OpenAppTool::with_start_menu(env.launcher.clone())
+                .waiting_for_window(env.windows.clone(), ui_env.own_process.clone()),
+        ));
         reg.register(Arc::new(apps::ListWindowsTool(env.windows.clone())));
         reg.register(Arc::new(apps::FocusWindowTool(env.windows.clone())));
         reg.register(Arc::new(apps::CloseAppTool(env.windows.clone())));

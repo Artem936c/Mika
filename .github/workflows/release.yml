@@ -1,0 +1,63 @@
+name: release
+
+# Builds the Windows installer and publishes a GitHub release with it, its
+# SHA-256 and `latest.json` for the in-app updater. Started by hand.
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: Release notes file in the repository
+        default: ''
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm --prefix frontend ci
+      - run: npm --prefix frontend run build
+      - name: Build the installer
+        working-directory: crates/mika-gui
+        run: npx --yes @tauri-apps/cli@2 build
+      - name: Installer, checksum and update manifest
+        id: pack
+        shell: pwsh
+        run: |
+          $version = (Get-Content crates/mika-gui/tauri.conf.json | ConvertFrom-Json).version
+          $tag = "v$version"
+          $exe = Get-ChildItem target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
+          $name = "Mika_${version}_x64-setup.exe"
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item $exe.FullName "out/$name"
+          $sha = (Get-FileHash "out/$name" -Algorithm SHA256).Hash.ToLower()
+          "$sha  $name" | Set-Content -Encoding utf8NoBOM out/SHA256SUMS.txt
+          $notes = "${{ inputs.notes }}"
+          if (-not $notes) { $notes = "docs/releases/$version.md" }
+          $text = if (Test-Path $notes) { Get-Content -Raw $notes } else { "" }
+          @{
+            version = $version
+            url     = "https://github.com/${{ github.repository }}/releases/download/$tag/$name"
+            sha256  = $sha
+            notes   = "https://github.com/${{ github.repository }}/releases/tag/$tag"
+          } | ConvertTo-Json | Set-Content -Encoding utf8NoBOM out/latest.json
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "notes=$notes" >> $env:GITHUB_OUTPUT
+          "pre=$($version.Contains('-').ToString().ToLower())" >> $env:GITHUB_OUTPUT
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pack.outputs.tag }}
+          name: Мика ${{ steps.pack.outputs.tag }}
+          body_path: ${{ steps.pack.outputs.notes }}
+          prerelease: ${{ steps.pack.outputs.pre }}
+          files: |
+            out/*.exe
+            out/SHA256SUMS.txt
+            out/latest.json

@@ -32,7 +32,11 @@ export type AvatarView = 'head' | 'full';
 
 /** Layers drawn over the emotion frame. All frames share one size and line up pixel for pixel. */
 export const EYE_LAYERS = ['eyes-half', 'eyes-shut', 'eyes-left', 'eyes-right'] as const;
-export const MOUTH_LAYERS = ['mouth-ajar', 'mouth-oo', 'mouth-shut'] as const;
+/** Mouth shapes drawn from the calm face; they fit the calm, joyful and winking frames. */
+const CALM_MOUTHS = ['mouth-ajar', 'mouth-oo', 'mouth-shut'] as const;
+/** An open, speaking mouth for each other emotion, drawn from that emotion's own face. */
+const TALK_MOUTHS = ['talk-shy', 'talk-surprise', 'talk-sad', 'talk-angry', 'talk-think', 'talk-sleepy', 'talk-worry'] as const;
+export const MOUTH_LAYERS = [...CALM_MOUTHS, ...TALK_MOUTHS] as const;
 export type EyeLayer = (typeof EYE_LAYERS)[number];
 export type MouthLayer = (typeof MOUTH_LAYERS)[number];
 
@@ -61,9 +65,13 @@ export function canBlink(e: Emotion): boolean {
   return e === 'neutral';
 }
 
-/** Emotions whose mouth sits where the neutral one does, so the mouth layers fit them. */
-export function canTalk(e: Emotion): boolean {
-  return e === 'neutral' || e === 'joy' || e === 'wink';
+/**
+ * Mouth shapes she cycles through while talking with this face. `null` is the mouth
+ * of the frame itself. Every emotion has at least one other shape.
+ */
+export function talkShapes(e: Emotion): (MouthLayer | null)[] {
+  if (e === 'neutral' || e === 'joy' || e === 'wink') return [null, ...CALM_MOUTHS];
+  return [null, `talk-${e}` as MouthLayer];
 }
 
 /** One blink: eye layers and how long each stays, ms. `null` is open eyes. */
@@ -79,14 +87,9 @@ export function blinkPause(r: number): number {
   return 2400 + Math.floor(r * 3600);
 }
 
-/**
- * Next mouth shape while she talks. `null` is the open mouth of the frame itself.
- * Never repeats the previous shape, so the lips keep moving.
- */
-export function nextMouth(prev: MouthLayer | null, r: number): MouthLayer | null {
-  const shapes: (MouthLayer | null)[] = [null, 'mouth-ajar', 'mouth-oo', 'mouth-shut'].filter(
-    (s) => s !== prev,
-  ) as (MouthLayer | null)[];
+/** Next mouth shape for face `e` while she talks; never the previous one, so the lips keep moving. */
+export function nextMouth(e: Emotion, prev: MouthLayer | null, r: number): MouthLayer | null {
+  const shapes = talkShapes(e).filter((s) => s !== prev);
   return shapes[Math.min(shapes.length - 1, Math.floor(r * shapes.length))];
 }
 

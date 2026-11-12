@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ModelPicker from './ModelPicker.svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import Icon from '../Icon.svelte';
@@ -154,10 +155,10 @@
   </div>
   <p class="hint">{t('memory.embed_sub')}</p>
   <div class="form">
-    <label>
+    <div class="lab">
       <span class="lbl">{t('memory.embed_model')}</span>
-      <input class="fld" bind:value={embedModel} placeholder="text-embedding-3-small" spellcheck="false" />
-    </label>
+      <ModelPicker bind:value={embedModel} purpose="embedding" baseUrl={embedUrl} placeholder="text-embedding-3-small" />
+    </div>
     <label>
       <span class="lbl">{t('memory.embed_url')}</span>
       <input class="fld" bind:value={embedUrl} placeholder={m.llm_base_url} spellcheck="false" />
@@ -243,10 +244,12 @@
     border-radius: 16px;
     border: 1px solid var(--line);
   }
-  label {
+  label,
+  .lab {
     display: block;
   }
-  label .lbl {
+  label .lbl,
+  .lab .lbl {
     display: block;
     margin: 12px 0 6px;
   }

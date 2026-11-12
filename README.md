@@ -1,67 +1,151 @@
-# Мика
+<p align="center">
+  <img src="docs/images/mika.png" width="220" alt="Мика">
+</p>
 
-Живой ИИ-помощник для Windows: голос и текст, 2D-персонаж с эмоциями, островок вверху экрана, действия в системе с подтверждением риска, любой LLM-провайдер. Rust, Tauri 2, Svelte.
+<h1 align="center">Мика</h1>
 
-Состояние: пре-релиз 0.2.0-pre.1 ([что в нём](docs/releases/0.2.0-pre.1.md)). Чат в островке, 60 инструментов Windows с проверкой риска, память с поиском по смыслу, напоминания, управление окнами любых программ, просмотр экрана, MCP, Telegram, озвучка, голосовой ввод и активационная фраза. Модель Live2D впереди.
+<p align="center">
+  ИИ-помощница для Windows: островок вверху экрана, чат и голос, аниме-аватар с эмоциями,<br>
+  действия в системе только через политику рисков, любой OpenAI-совместимый провайдер.
+</p>
 
-## Документы
+<p align="center">
+  <a href="https://github.com/Artem936c/Mika/releases"><img alt="Релизы" src="https://img.shields.io/github/v/release/Artem936c/Mika?include_prereleases&label=%D1%80%D0%B5%D0%BB%D0%B8%D0%B7"></a>
+  <a href="https://github.com/Artem936c/Mika/actions/workflows/ci.yml"><img alt="Проверки" src="https://github.com/Artem936c/Mika/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="Лицензия MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
+  <img alt="Windows 10/11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4">
+  <img alt="Rust, Tauri 2, Svelte 5" src="https://img.shields.io/badge/Rust%20%C2%B7%20Tauri%202%20%C2%B7%20Svelte%205-555">
+</p>
 
-- [Дизайн](docs/superpowers/specs/2026-11-10-mika-assistant-design.md)
-- [План по эпикам](docs/superpowers/plans/2026-11-10-roadmap.md)
-- Пошаговые планы: [эпик 1](docs/superpowers/plans/2026-11-10-epic-01-foundation.md), [эпик 2](docs/superpowers/plans/2026-11-10-epic-02-chat-llm.md), [эпик 3](docs/superpowers/plans/2026-11-10-epic-03-risk-policy.md), [эпик 4](docs/superpowers/plans/2026-11-10-epic-04-tools.md), [эпик 6](docs/superpowers/plans/2026-11-11-epic-06-island-visuals.md), [эпик 8](docs/superpowers/plans/2026-11-11-epic-08-window-control.md), [эпик 9](docs/superpowers/plans/2026-11-11-epic-09-daily-memory.md), [эпик 10](docs/superpowers/plans/2026-11-11-epic-10-extensions.md)
-- [Решения](docs/decisions/): границы MVP [0006](docs/decisions/0006-mvp-scope.md), основной функционал и итоги живой проверки [0009](docs/decisions/0009-core-features.md), речь через провайдеров [0010](docs/decisions/0010-voice-providers.md), режим окна и остатки [0011](docs/decisions/0011-window-mode-and-remainders.md), перетаскивание, активационная фраза, обновления [0012](docs/decisions/0012-drag-wake-updates.md)
-- [Макет интерфейса](docs/design/island-mockup.html) (открыть в браузере)
+![Чат с Микой: задача в несколько шагов](docs/images/task.jpg)
 
-## Что нужно для разработки
+## Что она умеет
 
-| Что | Команда установки |
+- **Островок вверху экрана.** Свёрнутый островок показывает состояние, ответ, погоду, трек и напоминания. Щелчок или Ctrl+Alt+M открывает чат.
+- **Окно.** Его можно оторвать в обычное окно и перетащить на другой монитор. За игрой и развёрнутой программой островок уходит назад.
+- **Задачи в несколько шагов.** Мика составляет план, проверяет каждый шаг и показывает ход в чате. Кнопка «Стоп» прерывает задачу.
+- **Окна любых программ.** Она читает окно, нажимает кнопки по подписи или цепочкой, вводит текст, нажимает клавиши. После каждого действия видит, что изменилось.
+- **Свой браузер** в отдельном профиле Edge: открыть, прочитать, нажать, заполнить. Страницы входа, банков и оплаты она не трогает.
+- **Файлы**: поиск, чтение, запись, архивы, корзина. Разбор папки — до 200 действий одним подтверждением.
+- **Память** с поиском по смыслу, архив прошлых разговоров, напоминания, таймеры, задачи по расписанию, список дел.
+- **Экран**: вопрос по снимку, текст с картинки, снимок.
+- **Сведения и система**: погода, курсы, новости, плеер, громкость, Wi-Fi, Bluetooth, яркость.
+- **Голос.**
+  - Озвучка голосом Windows или провайдера, ввод с микрофона.
+  - Активационная фраза «Мика» распознаётся на этом компьютере.
+  - Подтверждение действия голосом.
+- **Расширения**: серверы MCP (программа или HTTP), свои команды, управление из Telegram.
+- **Аватар.** Оригинальный персонаж с десятью эмоциями. Она моргает, оглядывается, говорит и реагирует на клики. Эмоцию выбирает ядро по состоянию и меткам в ответе модели.
+
+<table>
+  <tr>
+    <td><img src="docs/images/confirm.jpg" alt="Подтверждение действия"></td>
+    <td><img src="docs/images/chat.jpg" alt="Чат с карточкой погоды"></td>
+  </tr>
+  <tr>
+    <td align="center">Каждое действие — через подтверждение с уровнем риска</td>
+    <td align="center">Ответы с карточками</td>
+  </tr>
+</table>
+
+![Островок во время ответа](docs/images/speak.jpg)
+
+## Безопасность
+
+- **Политика рисков.** Каждый инструмент зарегистрирован с уровнем риска и выполняется только через неё. Без сохранённого правила Мика спрашивает. Действия высокого риска нельзя разрешить навсегда.
+- **Слепая зона.** Окна и страницы с паролями, входом, банком и оплатой не читаются и не управляются: проверка идёт в инструменте до любого действия.
+- **Ключи** провайдеров хранятся в «Диспетчере учётных данных» Windows и не попадают в настройки, журнал и тексты ошибок.
+- **Выключено по умолчанию.** Интернет-инструменты, просмотр экрана и микрофон выключены, пока ты их не включишь.
+- **MCP и Telegram.** Инструменты серверов MCP и команды из Telegram проходят ту же политику.
+
+## Установка
+
+1. Скачать установщик из [релизов](https://github.com/Artem936c/Mika/releases) и запустить. Права администратора не нужны.
+   - Установщик не подписан, поэтому SmartScreen может предупредить. Нажми «Подробнее» → «Выполнить в любом случае».
+2. На экране первого запуска выбрать провайдера и то, что Мике можно.
+3. Модели выбираются из списка провайдера, с ценой и описанием.
+
+Пример недорогого набора на [RouterAI](https://routerai.ru) (`https://routerai.ru/api/v1`):
+
+| Задача | Модель |
+|---|---|
+| Основная и зрение | `google/gemma-4-26b-a4b-it` |
+| Поиск по смыслу | `perplexity/pplx-embed-v1-0.6b` |
+| Картинки | `black-forest-labs/flux.2-klein-4b` |
+| Синтез речи | `google/gemini-3.8-flash-lite-tts`, голос `Kore` |
+| Распознавание | `qwen/qwen3-asr-0.6b` |
+
+Подойдут и OpenAI, Anthropic, Ollama и любой OpenAI-совместимый сервер.
+
+**Обновления из приложения.** На странице «Общие» указать адрес:
+
+```
+https://github.com/Artem936c/Mika/releases/latest/download/latest.json
+```
+
+Установщик скачивается только по кнопке и ставится, только если совпала контрольная сумма.
+
+## Сборка из исходников
+
+| Что | Установка |
 |---|---|
 | Rust stable | `winget install Rustlang.Rustup` |
-| Tauri CLI 2 | `cargo install tauri-cli --version "^2" --locked` |
 | MSVC Build Tools 2022 | `winget install Microsoft.VisualStudio.2022.BuildTools` |
-| WebView2 Runtime | входит в Windows 11 |
 | Node.js 24 | `winget install OpenJS.NodeJS` |
-
-## Запуск
+| WebView2 Runtime | входит в Windows 11 |
 
 ```
 npm --prefix frontend ci
 npm --prefix frontend run build
 cd crates/mika-gui
-cargo tauri dev
+npx @tauri-apps/cli@2 dev      # или cargo tauri dev
 ```
 
-Островок появится вверху основного монитора. Щелчок по нему или Ctrl+Alt+M открывает чат. Кнопка настроек в шапке чата открывает разделы: Персонаж, Провайдеры, Разрешения, Инструменты, Память, Расширения, Голос, Островок, Общие.
+Установщик: `npx @tauri-apps/cli@2 build` из `crates/mika-gui`, результат — в `target/release/bundle/nsis/`.
 
-Установщик: `cargo tauri build` из `crates/mika-gui` (без установленного Tauri CLI: `npx @tauri-apps/cli@2 build`), результат в `target/release/bundle/nsis/`.
-
-Терминальный клиент без интерфейса: `cargo run -p mika-cli`. Настройка из терминала:
+Проверки:
 
 ```
-mika-cli provider openai https://routerai.ru/api/v1 openai/gpt-oss-20b
-mika-cli key openai                      # ключ вводится строкой, уходит в Credential Manager
-mika-cli model embedding perplexity/pplx-embed-v1-0.6b
-mika-cli model vision google/gemma-4-26b-a4b-it
-mika-cli model image black-forest-labs/flux.2-klein-4b
-mika-cli model tts google/gemini-3.8-flash-lite-tts   # синтез у провайдера; "-" возвращает голос Windows
-mika-cli model tts-voice Kore
-mika-cli model stt qwen/qwen3-asr-0.6b
-mika-cli web on
-mika-cli mic on
-mika-cli status
-mika-cli probe
-mika-cli voices
-mika-cli say "Привет"
-mika-cli roundtrip "Привет"              # синтез и распознавание того же звука, с временем
-mika-cli hear                            # записать фразу с микрофона и показать текст
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+npm --prefix frontend test
+npm --prefix frontend run check
 ```
 
-На вопрос о действии отвечай «да», «разреши всегда» или «нет».
+**Предпросмотр интерфейса без Tauri.** Запустить `npm --prefix frontend run dev` и открыть `http://localhost:5173/?mock=chat`. Другие сценарии: `task`, `cards`, `reminder`, `confirm`, `high`, `speak`, `settings&page=voice`.
 
-Предпросмотр интерфейса в браузере без Tauri: `npm --prefix frontend run dev`, затем `http://localhost:5173/?mock=chat` (также `cards`, `reminder`, `confirm`, `high`, `island`, `settings&page=memory`).
+**Терминальный клиент для отладки ядра:** `cargo run -p mika-cli`. Команды: `provider`, `key`, `model`, `web`, `mic`, `status`, `probe`, `voices`, `say`, `hear`.
 
-Данные лежат в `%APPDATA%\Mika` (переменная `MIKA_DATA_DIR` меняет папку), ключи провайдеров — в «Диспетчере учётных данных» Windows под именем `Mika`.
+**Где данные:**
 
-## Что дальше
+- настройки, история и память — `%APPDATA%\Mika` (папку меняет переменная `MIKA_DATA_DIR`);
+- журнал — `%LOCALAPPDATA%\Mika\logs`;
+- ключи — «Диспетчер учётных данных», записи `Mika`.
 
-Модель Live2D (пробные сборки 0.2 и 0.5; лицензию Cubism SDK и модель выбирает пользователь), подпись установщика (нужен сертификат), сервер выпусков для обновлений.
+## Устройство
+
+| Крейт | Назначение |
+|---|---|
+| `mika-core` | Шина событий, агент, политика рисков, эмоции, память, планировщик, задачи |
+| `mika-providers` | LLM, эмбеддинги, зрение, картинки, речь, каталог моделей, MCP, Telegram |
+| `mika-audio` | Озвучка, запись с микрофона, активационная фраза |
+| `mika-tools` | Инструменты Windows: окна, файлы, браузер, экран, система |
+| `mika-cli` | Терминальный клиент |
+| `mika-gui` | Приложение Tauri 2; интерфейс на Svelte в `frontend/` |
+
+Документы на русском:
+
+- [дизайн](docs/superpowers/specs/2026-11-10-mika-assistant-design.md);
+- [план по эпикам](docs/superpowers/plans/2026-11-10-roadmap.md);
+- [решения](docs/decisions/) с итогами живых проверок;
+- [заметки к выпускам](docs/releases/).
+
+## Чего ещё нет
+
+- Модель Live2D: нужны лицензия Cubism SDK и сама модель.
+- Подпись установщика сертификатом.
+
+## Лицензия
+
+[MIT](LICENSE). Персонаж оригинальный. Картинки аватара сгенерированы моделью FLUX.2 klein по текстовому описанию.
