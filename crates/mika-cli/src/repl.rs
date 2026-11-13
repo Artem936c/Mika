@@ -75,6 +75,7 @@ impl Renderer {
             Event::Notification { app, title, text } => {
                 format!("[notification] {app} — {title}: {text}")
             }
+            Event::Remark { text, kind } => format!("[{kind}] {text}"),
             Event::UiTarget { x, y, w, h } => format!("[target] {x},{y} {w}x{h}"),
             Event::Timing { stage, ms } => format!("[time] {stage} {ms} ms"),
             Event::TaskUpdated { task } => {

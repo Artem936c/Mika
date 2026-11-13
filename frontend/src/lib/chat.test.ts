@@ -80,6 +80,13 @@ describe('new events and cards', () => {
     expect(reduceChat([], { type: 'notification', app: 'X', title: '', text: '' })).toEqual([]);
   });
 
+  it('her own remark becomes a row', () => {
+    expect(reduceChat([], { type: 'remark', text: 'Через 10 мин: Созвон', kind: 'calendar' })).toEqual([
+      { kind: 'reminder', text: 'Через 10 мин: Созвон' },
+    ]);
+    expect(reduceChat([], { type: 'remark', text: ' ', kind: 'life' })).toEqual([]);
+  });
+
   it('image card needs a path', () => {
     expect(cardData({ kind: 'image', path: 'C:\\p\\a.png' })).toEqual({ kind: 'image', path: 'C:\\p\\a.png' });
     expect(cardData({ kind: 'image' })).toBeUndefined();

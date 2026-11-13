@@ -52,20 +52,25 @@ pub fn spoken(t: &Toast) -> String {
 }
 
 /// The task of the morning summary.
-pub fn briefing_task(city: &str) -> String {
+pub fn briefing_task(city: &str, calendar: bool) -> String {
     let weather = if city.trim().is_empty() {
         "погода (спроси город, если не знаешь)".to_string()
     } else {
         format!("погода на сегодня в городе {}", city.trim())
     };
+    let meetings = if calendar {
+        "встречи из календаря на сегодня (calendar_events); "
+    } else {
+        ""
+    };
     format!(
-        "Утренняя сводка. Коротко и тепло, по пунктам: поздоровайся; {weather}; дела на сегодня (todo_list) и напоминания (reminder_list); \
+        "Утренняя сводка. Коротко и тепло, по пунктам: поздоровайся; {weather}; {meetings}дела на сегодня (todo_list) и напоминания (reminder_list); \
 курс доллара и евро; три главные новости по одной строке. Если что-то не узнать, пропусти без извинений. Вопросов в конце не задавай."
     )
 }
 
 /// Seconds since the last key press or mouse move in this session.
-fn idle_seconds() -> u64 {
+pub(crate) fn idle_seconds() -> u64 {
     use windows_sys::Win32::System::SystemInformation::GetTickCount;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
     let mut info = LASTINPUTINFO {
@@ -130,6 +135,27 @@ impl Ctx {
 
     fn on_notification(self: &Arc<Self>, t: &Toast, read_aloud: bool) {
         log::info!("notification from {}", t.app);
+        let at = chrono::Local::now().timestamp();
+        let watched = (t.app == "Telegram")
+            .then(|| self.tool_env().shared.watches.matching(&t.title, at))
+            .flatten();
+        if let Some(w) = watched {
+            self.publish_notification(t);
+            let task = mika_tools::watch::reply_task(&w, &t.app, &t.text);
+            self.session.submit_task(&task);
+            return;
+        }
+        // During focus it waits for the summary.
+        if self.tool_env().shared.focus.hold(&notice_line(t), at) {
+            return;
+        }
+        self.publish_notification(t);
+        if read_aloud && self.speaker.get() {
+            self.voice.speak(&spoken(t));
+        }
+    }
+
+    fn publish_notification(&self, t: &Toast) {
         self.bus.publish(mika_core::Event::Notification {
             app: t.app.clone(),
             title: t.title.clone(),
@@ -139,22 +165,6 @@ impl Ctx {
         self.session
             .agent
             .append_note(&format!("🔔 Уведомление: {}", notice_line(t)));
-        let watched = (t.app == "Telegram")
-            .then(|| {
-                self.tool_env()
-                    .shared
-                    .watches
-                    .matching(&t.title, chrono::Local::now().timestamp())
-            })
-            .flatten();
-        if let Some(w) = watched {
-            let task = mika_tools::watch::reply_task(&w, &t.app, &t.text);
-            self.session.submit_task(&task);
-            return;
-        }
-        if read_aloud && self.speaker.get() {
-            self.voice.speak(&spoken(t));
-        }
     }
 
     /// Gives the morning summary once a day, when someone is at the computer.
@@ -169,15 +179,25 @@ impl Ctx {
                     let c = ctx.config.lock();
                     (c.briefing.due(now), c.island.city.clone())
                 };
-                if !due || idle_seconds() > PRESENT_S || ctx.state() != AssistantState::Idle {
+                let focused = ctx
+                    .tool_env()
+                    .shared
+                    .focus
+                    .active(chrono::Local::now().timestamp());
+                if !due
+                    || focused
+                    || idle_seconds() > PRESENT_S
+                    || ctx.state() != AssistantState::Idle
+                {
                     continue;
                 }
+                let calendar = ctx.tool_env().shared.calendar.connected();
                 ctx.config.lock().briefing.last_date = now.date().format("%Y-%m-%d").to_string();
                 if let Err(e) = ctx.save_config() {
                     log::warn!("cannot save config: {e}");
                 }
                 log::info!("morning summary");
-                ctx.session.submit_task(&briefing_task(&city));
+                ctx.session.submit_task(&briefing_task(&city, calendar));
             }
         });
     }
@@ -222,7 +242,10 @@ mod tests {
         assert!(notice_line(&t).starts_with("Telegram — Аня: ааа"));
         let s = spoken(&t);
         assert!(s.ends_with('…') && s.chars().count() == SPOKEN_CHARS + 1);
-        assert!(briefing_task("Пермь").contains("в городе Пермь"));
-        assert!(briefing_task("").contains("спроси город"));
+        assert!(briefing_task("Пермь", false).contains("в городе Пермь"));
+        assert!(briefing_task("", false).contains("спроси город"));
+        assert!(!briefing_task("", false).contains("calendar_events"));
+        assert!(briefing_task("", true)
+            .contains("встречи из календаря на сегодня (calendar_events); дела"));
     }
 }

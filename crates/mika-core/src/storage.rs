@@ -86,6 +86,26 @@ const MIGRATIONS: &[&str] = &[
         model TEXT NOT NULL,
         embedding BLOB NOT NULL
     );",
+    "CREATE TABLE app_usage (
+        day TEXT NOT NULL,
+        app TEXT NOT NULL,
+        seconds INTEGER NOT NULL,
+        PRIMARY KEY (day, app)
+    );
+    CREATE TABLE doc_files (
+        path TEXT PRIMARY KEY,
+        modified INTEGER NOT NULL,
+        size INTEGER NOT NULL
+    );
+    CREATE TABLE doc_chunks (
+        id INTEGER PRIMARY KEY,
+        path TEXT NOT NULL,
+        page INTEGER NOT NULL,
+        text TEXT NOT NULL,
+        model TEXT,
+        embedding BLOB
+    );
+    CREATE INDEX doc_chunks_path ON doc_chunks(path);",
 ];
 
 /// Conversations put aside by "new conversation" get this prefix.

@@ -5,6 +5,7 @@ mod bridge;
 mod catalog;
 mod everyday;
 mod platform;
+mod rhythm;
 mod selection;
 mod settings;
 mod strings;
@@ -100,6 +101,7 @@ fn main() {
     let rect = Arc::new(Mutex::new(IslandRect::default()));
     let watch_state = state.clone();
     let emotions = mika_core::emotion::EmotionDriver::new(bus.clone());
+    let emotion_now = emotions.handle();
     let name = ctx.config.lock().assistant.name.clone();
     let avatar_on_desktop = ctx.config.lock().avatar.on_desktop;
     let monitor = ctx.config.lock().window.monitor.clone();
@@ -187,6 +189,17 @@ fn main() {
             settings::set_duck_media,
             settings::set_notifications,
             settings::set_briefing,
+            settings::get_rhythm_settings,
+            settings::set_rhythm,
+            settings::set_tracking,
+            settings::clear_app_time,
+            settings::clear_clipboard_history,
+            settings::start_focus,
+            settings::stop_focus,
+            settings::save_calendar,
+            settings::set_docs_folders,
+            settings::reindex_docs,
+            settings::set_voice_style,
             settings::remove_vosk,
             settings::save_speech_settings,
             settings::set_microphone_enabled,
@@ -232,6 +245,7 @@ fn main() {
             tray::register_listen_shortcut(app.handle());
             tray::register_selection_shortcut(app.handle());
             let _ = background.app.set(app.handle().clone());
+            let _ = background.emotion.set(emotion_now.clone());
             background.start_background();
             spawn_notifier(app.handle().clone(), bus.clone(), background.clone());
             let watched = background.clone();

@@ -4,9 +4,13 @@ pub mod apps;
 pub mod archive;
 pub mod batch;
 pub mod browser;
+pub mod calendar;
+pub mod cliphist;
 pub mod commands;
 pub mod devices;
+pub mod docs;
 pub mod files;
+pub mod focus;
 pub mod image;
 pub mod info;
 pub mod media;
@@ -23,6 +27,7 @@ pub mod sys;
 pub mod system;
 pub mod todos;
 pub mod ui;
+pub mod usage;
 pub mod watch;
 pub mod web;
 pub mod win;
@@ -123,6 +128,26 @@ const HINTS: &[(&str, &str)] = &[
     ),
     ("task_plan", "задача из нескольких действий подряд"),
     (
+        "focus_mode",
+        "не отвлекать, режим фокуса, тишина на время работы",
+    ),
+    (
+        "screen_time",
+        "сколько времени провёл за компьютером, в программах, в игре",
+    ),
+    (
+        "clipboard_history",
+        "что копировал раньше, вернуть скопированный текст",
+    ),
+    (
+        "calendar_events",
+        "встречи, созвоны, события в календаре, что сегодня по расписанию",
+    ),
+    (
+        "docs_search",
+        "вопрос по своим документам: договор, инструкция, что написано в файлах",
+    ),
+    (
         "chat_watch",
         "отвечать кому-то в Telegram за пользователя, следить за перепиской",
     ),
@@ -169,6 +194,14 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
         reg.register(Arc::new(system::SystemHealthTool(env.probe.clone())));
         reg.register(Arc::new(system::ProcessesTool(env.probe.clone())));
         reg.register(Arc::new(system::KillProcessTool(env.runner.clone())));
+        reg.register(Arc::new(usage::ScreenTimeTool {
+            store: usage::UsageStore(env.db.clone()),
+            enabled: env.shared.app_time_on.clone(),
+        }));
+        reg.register(Arc::new(cliphist::ClipboardHistoryTool {
+            history: env.shared.clips.clone(),
+            enabled: env.shared.clipboard_on.clone(),
+        }));
         reg.register(Arc::new(devices::RadioTool(env.radios.clone())));
         reg.register(Arc::new(devices::BrightnessTool(env.runner.clone())));
     }
@@ -247,6 +280,7 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
             trash: env.trash.clone(),
             user_profile: profile.clone(),
         }));
+        reg.register(Arc::new(docs::DocsSearchTool(env.shared.docs.clone())));
     }
 
     if on("browser") {
@@ -305,6 +339,10 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
         reg.register(Arc::new(todos::TodoListTool(env.db.clone())));
         reg.register(Arc::new(todos::TodoDoneTool(env.db.clone())));
         reg.register(Arc::new(todos::TodoRemoveTool(env.db.clone())));
+        reg.register(Arc::new(focus::FocusModeTool(env.shared.focus.clone())));
+        reg.register(Arc::new(calendar::CalendarTool(
+            env.shared.calendar.clone(),
+        )));
     }
 
     if on("memory") {
@@ -380,7 +418,7 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register_all(&mut reg, &env, &[]);
         let specs = reg.specs();
-        assert_eq!(specs.len(), 77);
+        assert_eq!(specs.len(), 82);
         for s in specs {
             assert_eq!(s.parameters["type"], "object", "{}", s.name);
             assert!(!s.description.is_empty());

@@ -67,7 +67,9 @@ impl Drop for Gdi {
 fn grab(
     window: Option<u64>,
     max_side: u32,
+    from_screen: bool,
 ) -> Result<(Vec<u8>, u32, u32, f32, (i32, i32)), String> {
+    super::physical_pixels();
     // SAFETY: GDI calls on handles owned by `Gdi`; buffers outlive the calls that fill them.
     unsafe {
         let hwnd = window.map(|id| HWND(id as usize as *mut core::ffi::c_void));
@@ -80,6 +82,7 @@ fn grab(
                 GetWindowRect(h, &mut r).map_err(|_| "окно закрыто или недоступно".to_string())?;
                 (r.right - r.left, r.bottom - r.top, (r.left, r.top))
             }
+            // The main monitor: it starts at (0, 0) of the screen.
             None => (
                 GetSystemMetrics(SM_CXSCREEN),
                 GetSystemMetrics(SM_CYSCREEN),
@@ -107,9 +110,12 @@ fn grab(
         gdi.bitmaps.push(full);
         let old_full = SelectObject(full_dc, full.into());
 
-        let printed = hwnd.is_some_and(|h| {
-            PrintWindow(h, full_dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool()
-        });
+        // A window drawn by itself may differ from what the screen shows; a
+        // window in front is copied from the screen, exactly where clicks land.
+        let printed = !from_screen
+            && hwnd.is_some_and(|h| {
+                PrintWindow(h, full_dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool()
+            });
         if !printed {
             BitBlt(
                 full_dc,
@@ -203,7 +209,7 @@ pub fn encode_png(rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String
     Ok(out)
 }
 
-fn ocr_engine() -> Result<OcrEngine, String> {
+pub(super) fn ocr_engine() -> Result<OcrEngine, String> {
     if let Ok(engine) = OcrEngine::TryCreateFromUserProfileLanguages() {
         return Ok(engine);
     }
@@ -278,7 +284,18 @@ fn ocr_result(
 
 impl Screen for GdiScreen {
     fn capture(&self, window: Option<u64>, max_side: u32) -> Result<Shot, String> {
-        let (rgb, width, height, factor, origin) = grab(window, max_side)?;
+        let (rgb, width, height, factor, origin) = grab(window, max_side, false)?;
+        Ok(Shot {
+            png: encode_png(&rgb, width, height)?,
+            width,
+            height,
+            factor,
+            origin,
+        })
+    }
+
+    fn capture_visible(&self, window: u64, max_side: u32) -> Result<Shot, String> {
+        let (rgb, width, height, factor, origin) = grab(Some(window), max_side, true)?;
         Ok(Shot {
             png: encode_png(&rgb, width, height)?,
             width,

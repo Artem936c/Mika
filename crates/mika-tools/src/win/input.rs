@@ -136,6 +136,7 @@ impl Input for SendInputDevice {
     }
 
     fn click(&self, x: i32, y: i32, button: MouseButton, double: bool) -> Result<(), String> {
+        super::physical_pixels();
         // SAFETY: plain call; a point off the screen is clamped by Windows.
         unsafe { SetCursorPos(x, y) }.map_err(|e| e.message())?;
         std::thread::sleep(std::time::Duration::from_millis(40));
@@ -153,6 +154,7 @@ impl Input for SendInputDevice {
     }
 
     fn wheel(&self, x: i32, y: i32, lines: i32) -> Result<(), String> {
+        super::physical_pixels();
         // SAFETY: plain call.
         unsafe { SetCursorPos(x, y) }.map_err(|e| e.message())?;
         std::thread::sleep(std::time::Duration::from_millis(40));

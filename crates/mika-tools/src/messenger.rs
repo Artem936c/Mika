@@ -10,6 +10,7 @@
 //! the chat is only opened and the user is asked; a second call with
 //! `chat_open` sends.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -30,6 +31,7 @@ const VK_ESCAPE: u16 = 0x1B;
 const VK_RETURN: u16 = 0x0D;
 const VK_CONTROL: u16 = 0x11;
 const VK_DELETE: u16 = 0x2E;
+const VK_V: u16 = 0x56;
 
 pub struct MessengerSendTool(pub ScreenEnv);
 
@@ -40,6 +42,14 @@ fn plain(text: &str) -> String {
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { ' ' })
         .collect()
+}
+
+fn text_arg(args: &Value) -> String {
+    args.get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// True when every word of the name is in the text read from the chat header.
@@ -132,10 +142,22 @@ impl MessengerSendTool {
         Ok(Some(text))
     }
 
-    async fn send_here(&self, w: &WindowInfo, text: &str) -> Result<(), ToolError> {
+    /// Types the text and sends it. With a file, the file goes first through
+    /// the clipboard, as if pasted from Explorer: Telegram opens its sending
+    /// box, the text becomes the caption, Enter sends both.
+    async fn send_here(
+        &self,
+        w: &WindowInfo,
+        text: &str,
+        file: Option<&PathBuf>,
+    ) -> Result<(), ToolError> {
         let ui = &self.0.ui;
+        let key = match file {
+            Some(f) => format!("{}\n{text}", f.display()),
+            None => text.to_string(),
+        };
         if let Some((to, sent, at)) = ui.sent.lock().clone() {
-            if to == w.id && sent == text && at.elapsed() < Duration::from_secs(90) {
+            if to == w.id && sent == key && at.elapsed() < Duration::from_secs(90) {
                 return Err(failed(
                     "это сообщение уже отправлено в Telegram только что, второй раз не отправляю",
                 ));
@@ -143,11 +165,45 @@ impl MessengerSendTool {
         }
         ui.windows.focus(w.id).map_err(failed)?;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        ui.type_text(text).await?;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        self.keys(&[VK_RETURN], 400).await?;
-        *ui.sent.lock() = Some((w.id, text.to_string(), std::time::Instant::now()));
+        let mut old = None;
+        if let Some(f) = file {
+            let clipboard = ui
+                .clipboard
+                .clone()
+                .ok_or_else(|| failed("буфер обмена недоступен"))?;
+            old = clipboard.get().ok();
+            clipboard
+                .set_files(std::slice::from_ref(f))
+                .map_err(failed)?;
+            self.keys(&[VK_CONTROL, VK_V], 1500).await?;
+        }
+        if !text.is_empty() {
+            ui.type_text(text).await?;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        self.keys(&[VK_RETURN], 600).await?;
+        if let (Some(old), Some(clipboard)) = (old, ui.clipboard.as_ref()) {
+            let _ = clipboard.set(&old);
+        }
+        *ui.sent.lock() = Some((w.id, key, std::time::Instant::now()));
         Ok(())
+    }
+
+    /// The file to attach: a path that exists and is a file.
+    fn file_arg(&self, args: &Value) -> Result<Option<PathBuf>, ToolError> {
+        let Some(raw) = args
+            .get("file")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            return Ok(None);
+        };
+        let path = crate::util::resolve_path(raw, &self.0.user_profile);
+        if !path.is_file() {
+            return Err(ToolError::BadArguments(format!("нет такого файла: {raw}")));
+        }
+        Ok(Some(path))
     }
 }
 
@@ -156,28 +212,50 @@ impl Tool for MessengerSendTool {
     fn spec(&self) -> ToolSpec {
         spec(
             "messenger_send",
-            "Написать человеку в Telegram: сама находит чат через поиск по всем чатам и отправляет текст. \
-Для Telegram используй её, а не ui_click и ui_type. Если она ответила, что чат открыт, но не проверен, \
-спроси пользователя, тот ли это чат, и после «да» вызови снова с chat_open=true.",
+            "Написать человеку в Telegram: сама находит чат через поиск по всем чатам и отправляет текст, картинку или файл. \
+Для Telegram используй её, а не ui_click, ui_type и screen_click: скрепку нажимать не нужно, файл передаётся в file. \
+Если она ответила, что чат открыт, но не проверен, спроси пользователя, тот ли это чат, и после «да» вызови снова с chat_open=true.",
             json!({
                 "type": "object",
                 "properties": {
                     "contact": { "type": "string", "description": "Имя чата или человека, как в Telegram" },
-                    "text": { "type": "string", "description": "Текст сообщения" },
+                    "text": { "type": "string", "description": "Текст сообщения так, как его написал бы пользователь: без оговорок и обрывов распознанной речи («по- они» → «они»), со знаками препинания и заглавной буквы. Известную фразу или мем пиши в его настоящем виде («они не понимают это другое» → «Вы не понимаете, это другое»). Смысл и тон не меняй, ничего от себя не добавляй" },
+                    "file": { "type": "string", "description": "Полный путь к картинке или файлу, которые нужно отправить; text тогда — подпись, можно пустую. Путь не пиши в text" },
                     "chat_open": { "type": "boolean", "description": "Нужный чат уже открыт и пользователь это подтвердил: отправить в него" }
                 },
-                "required": ["contact", "text"]
+                "required": ["contact"]
             }),
         )
     }
 
     fn assess(&self, args: &Value) -> Result<Assessment, ToolError> {
         let contact = arg_str(args, "contact")?;
-        let text = arg_str(args, "text")?;
+        let text = text_arg(args);
+        let file = self.file_arg(args)?;
+        if text.is_empty() && file.is_none() {
+            return Err(ToolError::BadArguments(
+                "нечего отправлять: нужен text или file".into(),
+            ));
+        }
+        let quoted = format!("«{}»", text.chars().take(300).collect::<String>());
+        let target = match &file {
+            Some(f) => {
+                let name = f
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    format!("файл {name}")
+                } else {
+                    format!("файл {name} с подписью {quoted}")
+                }
+            }
+            None => quoted,
+        };
         Ok(Assessment::new(
             RiskLevel::High,
             format!("Написать в Telegram: {contact}"),
-            format!("«{}»", text.chars().take(300).collect::<String>()),
+            target,
             "сообщение уйдёт человеку от твоего имени, отозвать его можно только вручную",
         )
         .with_scope("telegram"))
@@ -190,14 +268,29 @@ impl Tool for MessengerSendTool {
         _c: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let contact = arg_str(&args, "contact")?.trim().to_string();
-        let text = arg_str(&args, "text")?.to_string();
+        let text = text_arg(&args);
+        let file = self.file_arg(&args)?;
+        let what = match &file {
+            Some(f) => {
+                let name = f
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    format!("файл «{name}»")
+                } else {
+                    format!("файл «{name}» с подписью «{text}»")
+                }
+            }
+            None => format!("«{text}»"),
+        };
         let w = self.telegram().ok_or_else(|| {
             failed("Telegram не открыт: открой его через open_app («телеграм») и повтори")
         })?;
         if arg_bool(&args, "chat_open") {
-            self.send_here(&w, &text).await?;
+            self.send_here(&w, &text, file.as_ref()).await?;
             return Ok(ToolOutput::new(format!(
-                "Отправила в открытый чат «{contact}»: «{text}»."
+                "Отправила в открытый чат «{contact}»: {what}."
             )));
         }
         let ui = &self.0.ui;
@@ -219,9 +312,9 @@ impl Tool for MessengerSendTool {
         let was_there = before.as_deref().is_some_and(|b| header_names(b, &contact));
         match after {
             Some(header) if header_names(&header, &contact) && !was_there => {
-                self.send_here(&w, &text).await?;
+                self.send_here(&w, &text, file.as_ref()).await?;
                 Ok(ToolOutput::new(format!(
-                    "Открыла чат «{contact}» (в заголовке: {}) и отправила: «{text}».",
+                    "Открыла чат «{contact}» (в заголовке: {}) и отправила: {what}.",
                     header.split_whitespace().collect::<Vec<_>>().join(" ")
                 )))
             }
@@ -381,6 +474,39 @@ mod tests {
         assert!(out.contains("отправила"), "{out}");
         assert_eq!(f.typed.lock().last().unwrap(), "Привет");
         assert!(t.0.enabled.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn a_picture_goes_through_the_clipboard_with_its_caption() {
+        let (t, f) = tool();
+        let d = tempfile::tempdir().unwrap();
+        let cat = d.path().join("кот.jpg");
+        std::fs::write(&cat, b"jpg").unwrap();
+        *f.clipboard.lock() = "старый текст".into();
+        let args = json!({"contact": "АлкоГЕЙмеры", "file": cat.to_string_lossy(), "text": "Котик", "chat_open": true});
+        let a = t.assess(&args).unwrap();
+        assert!(
+            a.target.contains("файл кот.jpg с подписью «Котик»"),
+            "{}",
+            a.target
+        );
+        let out = run(&t, args).await.unwrap().text;
+        assert!(out.contains("файл «кот.jpg» с подписью «Котик»"), "{out}");
+        assert_eq!(*f.clip_files.lock(), vec![cat.clone()]);
+        let chords = f.chords.lock().clone();
+        let paste = chords
+            .iter()
+            .position(|c| *c == vec![VK_CONTROL, VK_V])
+            .unwrap();
+        let enter = chords.iter().rposition(|c| *c == vec![VK_RETURN]).unwrap();
+        assert!(paste < enter);
+        assert_eq!(f.typed.lock().last().unwrap(), "Котик");
+        // The user's own clipboard text comes back.
+        assert_eq!(*f.clipboard.lock(), "старый текст");
+        assert!(t
+            .assess(&json!({"contact": "А", "file": "C:\\нет\\такого.jpg"}))
+            .is_err());
+        assert!(t.assess(&json!({"contact": "А"})).is_err());
     }
 
     #[tokio::test]

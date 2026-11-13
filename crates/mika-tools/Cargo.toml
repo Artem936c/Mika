@@ -12,6 +12,7 @@ log.workspace = true
 parking_lot.workspace = true
 png.workspace = true
 chrono.workspace = true
+flate2.workspace = true
 futures.workspace = true
 regex.workspace = true
 reqwest.workspace = true

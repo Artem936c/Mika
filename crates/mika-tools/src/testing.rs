@@ -28,6 +28,14 @@ pub struct Fakes {
     pub focused: Mutex<Vec<u64>>,
     pub closed: Mutex<Vec<u64>>,
     pub clipboard: Mutex<String>,
+    /// A real picture for every capture: PNG, width, height.
+    pub picture: Mutex<Option<(Vec<u8>, u32, u32)>>,
+    /// Windows moved to a monitor.
+    pub moved: Mutex<Vec<(u64, usize)>>,
+    /// Files put into the clipboard.
+    pub clip_files: Mutex<Vec<PathBuf>>,
+    /// Vision answers in turn; when used up, a description of the question.
+    pub vision_seq: Mutex<Vec<String>>,
     pub start_apps: Mutex<Vec<(String, String)>>,
     pub ocr_text: Mutex<String>,
     /// OCR answers in turn; when used up, `ocr_text`.
@@ -180,6 +188,16 @@ impl Windows for Fake {
         self.0.placed.lock().push((id, placement));
         Ok(())
     }
+    fn monitors(&self) -> usize {
+        2
+    }
+    fn to_monitor(&self, id: u64, n: usize) -> Result<(), String> {
+        if n == 0 || n > 2 {
+            return Err(format!("монитора {n} нет: их 2"));
+        }
+        self.0.moved.lock().push((id, n));
+        Ok(())
+    }
 }
 
 impl Ui for Fake {
@@ -230,6 +248,15 @@ impl Input for Fake {
 impl Screen for Fake {
     fn capture(&self, window: Option<u64>, max_side: u32) -> Result<Shot, String> {
         self.0.captures.lock().push(window);
+        if let Some((png, width, height)) = self.0.picture.lock().clone() {
+            return Ok(Shot {
+                png,
+                width,
+                height,
+                factor: 1.0,
+                origin: (10, 20),
+            });
+        }
         // A 3200 px wide screen: shrinks when a limit is given.
         let factor = if max_side == 0 { 1.0 } else { 2.0 };
         Ok(Shot {
@@ -260,6 +287,10 @@ impl Screen for Fake {
 #[async_trait]
 impl Vision for Fake {
     async fn ask(&self, png: &[u8], question: &str) -> Result<String, String> {
+        let mut seq = self.0.vision_seq.lock();
+        if !seq.is_empty() {
+            return Ok(seq.remove(0));
+        }
         Ok(format!("вижу {} байт, вопрос: {question}", png.len()))
     }
 }
@@ -309,6 +340,10 @@ impl Clipboard for Fake {
     }
     fn set(&self, text: &str) -> Result<(), String> {
         *self.0.clipboard.lock() = text.into();
+        Ok(())
+    }
+    fn set_files(&self, paths: &[PathBuf]) -> Result<(), String> {
+        *self.0.clip_files.lock() = paths.to_vec();
         Ok(())
     }
 }
@@ -426,6 +461,12 @@ pub fn env_with(db: Arc<Db>, user_profile: &str) -> (ToolEnv, Arc<Fakes>) {
             bus: EventBus::new(64),
             tasks: mika_core::task::TaskBoard::new(EventBus::new(64)),
             watches: Default::default(),
+            focus: Default::default(),
+            clips: Default::default(),
+            clipboard_on: Default::default(),
+            app_time_on: Default::default(),
+            calendar: Default::default(),
+            docs: crate::docs::DocIndex::new(db.clone(), None),
         },
         db,
     };

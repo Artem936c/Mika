@@ -36,6 +36,8 @@
     vosk_bytes: number;
     follow_up: boolean;
     duck_media: boolean;
+    tts_style: string;
+    tone_by_mood: boolean;
   }
 
   let { name }: { name: string } = $props();
@@ -72,6 +74,17 @@
     try {
       await invoke('set_duck_media', { value: v });
       s.duck_media = v;
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  async function saveStyle(mood?: boolean) {
+    if (!s) return;
+    try {
+      const toneByMood = mood ?? s.tone_by_mood;
+      await invoke('set_voice_style', { style: s.tts_style, toneByMood });
+      s.tone_by_mood = toneByMood;
     } catch (e) {
       fail(e);
     }
@@ -315,8 +328,14 @@
         {/if}
       {/if}
     </div>
+    <div class="lab">
+      <span class="lbl">{t('voice.style')}</span>
+      <textarea class="fld style" rows="2" maxlength="500" bind:value={s.tts_style} placeholder={t('voice.style_placeholder')} onchange={() => saveStyle()}></textarea>
+      <p class="hint">{t('voice.style_sub')}</p>
+    </div>
     <Switch checked={s.tts_cache} title={t('voice.cache')} sub={t('voice.cache_sub', { size: cacheSize })} onchange={setCache} />
   {/if}
+  <Switch checked={s.tone_by_mood} title={t('voice.mood')} sub={t('voice.mood_sub')} onchange={(v) => saveStyle(v)} />
   <div class="acts">
     <button class="bt" onclick={testVoice}>{t('voice.test')}</button>
     {#if s.tts === 'provider' && s.tts_cache_bytes > 0}
@@ -471,6 +490,11 @@
     display: flex;
     gap: 8px;
     margin-top: 14px;
+  }
+  .style {
+    width: 100%;
+    resize: vertical;
+    font: inherit;
   }
   .hint {
     margin: 12px 2px 0;

@@ -216,6 +216,12 @@ export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
       const head = [app, title].filter(Boolean).join(' — ');
       return [...finishStreaming(items), { kind: 'reminder', text: body ? `${head}: ${body}` : head }];
     }
+    case 'remark': {
+      // Her own short line: a break, the end of focus, a meeting soon, a greeting.
+      const text = str(e.text)?.trim();
+      if (!text) return items;
+      return [...finishStreaming(items), { kind: 'reminder', text }];
+    }
     default:
       return items;
   }
@@ -270,6 +276,11 @@ const TOOL_GROUPS: Record<string, MessageKey> = {
   app_volume: 'tool.volume',
   system_health: 'tool.system',
   chat_watch: 'tool.message',
+  focus_mode: 'tool.todo',
+  calendar_events: 'tool.reminder',
+  screen_time: 'tool.system',
+  clipboard_history: 'tool.clipboard',
+  docs_search: 'tool.files',
   screen_click: 'tool.screen',
   search_text: 'tool.files',
   disk_usage: 'tool.files',

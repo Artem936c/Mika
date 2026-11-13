@@ -63,6 +63,36 @@ impl Emotion {
         }
     }
 
+    /// Pitch and pace of the local voice for this emotion, in percent of the usual.
+    pub fn prosody(self) -> (i8, i8) {
+        match self {
+            Emotion::Neutral | Emotion::Think => (0, 0),
+            Emotion::Joy => (8, 6),
+            Emotion::Wink => (6, 4),
+            Emotion::Surprise => (12, 8),
+            Emotion::Shy => (4, -6),
+            Emotion::Sad => (-8, -12),
+            Emotion::Sleepy => (-6, -15),
+            Emotion::Worry => (4, 6),
+            Emotion::Angry => (-4, 8),
+        }
+    }
+
+    /// One line about the tone for a provider voice that takes instructions.
+    pub fn tone_line(self) -> Option<&'static str> {
+        Some(match self {
+            Emotion::Neutral | Emotion::Think => return None,
+            Emotion::Joy => "Сейчас радостно, с улыбкой в голосе.",
+            Emotion::Wink => "Сейчас игриво и с лёгкой хитринкой.",
+            Emotion::Surprise => "Сейчас удивлённо и живо.",
+            Emotion::Shy => "Сейчас смущённо, чуть тише и мягче.",
+            Emotion::Sad => "Сейчас грустно и тихо, медленнее.",
+            Emotion::Sleepy => "Сейчас сонно и неторопливо.",
+            Emotion::Worry => "Сейчас встревоженно и серьёзно.",
+            Emotion::Angry => "Сейчас недовольно, но без грубости.",
+        })
+    }
+
     /// Slot name from a reply tag: the English slot name or its Russian word, any case.
     pub fn from_tag(tag: &str) -> Option<Emotion> {
         let t = tag.trim().to_lowercase();
@@ -495,6 +525,17 @@ mod tests {
         assert_eq!(Emotion::from_tag("файл.txt"), None);
         for e in Emotion::ALL {
             assert_eq!(Emotion::from_tag(e.as_str()), Some(e));
+        }
+    }
+
+    #[test]
+    fn calm_faces_keep_the_usual_voice_and_moods_change_it() {
+        assert_eq!(Emotion::Neutral.prosody(), (0, 0));
+        assert_eq!(Emotion::Neutral.tone_line(), None);
+        assert!(Emotion::Joy.prosody().0 > 0 && Emotion::Sad.prosody().1 < 0);
+        for e in Emotion::ALL {
+            let (pitch, rate) = e.prosody();
+            assert!(pitch.abs() <= 20 && rate.abs() <= 20, "{e:?}");
         }
     }
 

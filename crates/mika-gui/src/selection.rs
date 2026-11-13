@@ -88,6 +88,8 @@ pub fn grab(ctx: &Ctx) -> Result<Selection, String> {
         return Err(crate::strings::tr("selection.blind"));
     }
     wait_keys_up(Duration::from_millis(1500));
+    // Her mark and the text she puts back are not the user's copies.
+    env.shared.clips.pause_for(3000);
     let old = env.clipboard.get().ok();
     // A mark tells a real copy from an empty selection.
     let mark = format!("\u{2063}mika-{}", std::process::id());
@@ -136,6 +138,7 @@ pub fn paste(ctx: &Ctx, sel: &Selection, text: &str) -> Result<(), String> {
     }
     env.windows.focus(alive.id)?;
     std::thread::sleep(Duration::from_millis(250));
+    env.shared.clips.pause_for(3000);
     let old = env.clipboard.get().ok();
     env.clipboard.set(text)?;
     env.input.chord(&[VK_CONTROL, VK_V])?;

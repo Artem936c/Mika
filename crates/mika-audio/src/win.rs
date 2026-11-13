@@ -16,7 +16,7 @@ use windows::Media::SpeechSynthesis::{SpeechSynthesizer, VoiceInformation};
 use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
-use crate::speech::{FirstSound, RemoteSynth, Voice, VoiceInfo};
+use crate::speech::{prosody_ssml, FirstSound, RemoteSynth, ToneSource, Voice, VoiceInfo};
 
 /// One sentence never plays longer than this, whatever the player reports.
 const MAX_SENTENCE_PLAY: Duration = Duration::from_secs(90);
@@ -95,6 +95,8 @@ struct Sentence {
     asked: std::time::Instant,
     /// The first sentence after a stop: its time to the first sound is reported.
     first: bool,
+    /// Pitch and pace in percent for the local voice.
+    tone: (i8, i8),
 }
 
 enum Cmd {
@@ -115,6 +117,7 @@ pub struct WindowsVoice {
     fresh: AtomicBool,
     /// Sentences queued and not yet said or dropped.
     pending: Arc<AtomicUsize>,
+    tone: Mutex<Option<ToneSource>>,
 }
 
 /// Counts a sentence as done when the worker lets go of it.
@@ -164,6 +167,7 @@ impl WindowsVoice {
             observer,
             fresh: AtomicBool::new(true),
             pending,
+            tone: Mutex::new(None),
         }
     }
 }
@@ -202,6 +206,8 @@ struct Engine {
     synth: SpeechSynthesizer,
     player: MediaPlayer,
     ended: mpsc::Receiver<()>,
+    /// Language of the chosen voice, for SSML.
+    language: String,
 }
 
 impl Engine {
@@ -225,10 +231,11 @@ impl Engine {
             synth,
             player,
             ended,
+            language: String::new(),
         })
     }
 
-    fn configure(&self, voice: &str, rate: f32) -> windows::core::Result<()> {
+    fn configure(&mut self, voice: &str, rate: f32) -> windows::core::Result<()> {
         let voices = all_voices()?;
         let infos: Vec<VoiceInfo> = voices.iter().filter_map(info).collect();
         if let Some(chosen) = pick(&infos, voice) {
@@ -237,6 +244,7 @@ impl Engine {
                 .find(|v| v.DisplayName().is_ok_and(|n| n == chosen.name.as_str()))
             {
                 self.synth.SetVoice(v)?;
+                self.language = chosen.language.clone();
             }
         }
         self.synth
@@ -248,13 +256,32 @@ impl Engine {
     fn play(
         &self,
         text: &str,
+        tone: (i8, i8),
         stopped: impl Fn() -> bool,
         ready: impl FnOnce(),
     ) -> windows::core::Result<()> {
-        let stream = self
-            .synth
-            .SynthesizeTextToStreamAsync(&HSTRING::from(text))?
-            .join()?;
+        let plain = || {
+            self.synth
+                .SynthesizeTextToStreamAsync(&HSTRING::from(text))?
+                .join()
+        };
+        let stream = if tone == (0, 0) {
+            plain()?
+        } else {
+            let ssml = prosody_ssml(text, &self.language, tone);
+            // A voice that does not take the markup still says the text.
+            match self
+                .synth
+                .SynthesizeSsmlToStreamAsync(&HSTRING::from(ssml))
+                .and_then(|op| op.join())
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("tone markup not taken: {}", e.message());
+                    plain()?
+                }
+            }
+        };
         if stopped() {
             return Ok(());
         }
@@ -346,7 +373,7 @@ fn worker(
         };
         if engine.is_none() {
             match Engine::new() {
-                Ok(e) => {
+                Ok(mut e) => {
                     if let Err(err) = e.configure(&settings.0, settings.1) {
                         log::warn!("voice settings not applied: {}", err.message());
                     }
@@ -358,7 +385,7 @@ fn worker(
                 }
             }
         }
-        let Some(e) = engine.as_ref() else { continue };
+        let Some(e) = engine.as_mut() else { continue };
         match cmd {
             Cmd::Configure(voice, rate) => {
                 if let Err(err) = e.configure(&voice, rate) {
@@ -404,9 +431,9 @@ fn worker(
                     Some(Ok(())) => Ok(()),
                     Some(Err(why)) => {
                         log::warn!("remote speech failed, using the Windows voice: {why}");
-                        e.play(&s.text, stopped, ready)
+                        e.play(&s.text, s.tone, stopped, ready)
                     }
-                    None => e.play(&s.text, stopped, ready),
+                    None => e.play(&s.text, s.tone, stopped, ready),
                 };
                 if let Err(err) = result {
                     log::warn!("speech failed: {}", err.message());
@@ -450,7 +477,12 @@ impl Voice for WindowsVoice {
             remote,
             asked: std::time::Instant::now(),
             first: self.fresh.swap(false, Ordering::Relaxed),
+            tone: self.tone.lock().as_ref().map_or((0, 0), |t| t()),
         }));
+    }
+
+    fn set_tone(&self, tone: Option<ToneSource>) {
+        *self.tone.lock() = tone;
     }
 
     fn set_observer(&self, observer: Option<FirstSound>) {

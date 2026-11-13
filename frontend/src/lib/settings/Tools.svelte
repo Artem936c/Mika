@@ -2,6 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import Switch from '../Switch.svelte';
+  import Rhythm from './Rhythm.svelte';
   import { isMessageKey, t } from '../i18n';
 
   interface ToolSettings {
@@ -50,7 +51,9 @@
 
   function setNotify(change: Partial<ToolSettings['notifications']>) {
     if (!s) return;
-    run('set_notifications', { ...s.notifications, ...change });
+    const n = { ...s.notifications, ...change };
+    // Tauri takes command arguments in camelCase.
+    run('set_notifications', { enabled: n.enabled, onlyMessengers: n.only_messengers, readAloud: n.read_aloud });
   }
 
   function setBriefing(enabled: boolean) {
@@ -106,6 +109,8 @@
     <span>{t('tools.briefing_time')}</span>
     <input class="fld" type="time" bind:value={briefingTime} onchange={() => s && setBriefing(s.briefing_enabled)} />
   </div>
+
+  <Rhythm />
 
   <div class="lbl">{t('tools.feed')}</div>
   <div class="line">

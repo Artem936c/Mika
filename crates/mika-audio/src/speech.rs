@@ -42,6 +42,31 @@ pub trait Voice: Send + Sync {
     fn busy(&self) -> bool {
         false
     }
+    /// Pitch and pace in percent for each new sentence of the local voice, so
+    /// her tone follows her mood. `None`: always the usual voice.
+    fn set_tone(&self, _tone: Option<ToneSource>) {}
+}
+
+/// Pitch and pace in percent of the usual, asked for each sentence.
+pub type ToneSource = Arc<dyn Fn() -> (i8, i8) + Send + Sync>;
+
+/// SSML that says `text` with the pitch and pace changed by these percents.
+pub fn prosody_ssml(text: &str, language: &str, (pitch, rate): (i8, i8)) -> String {
+    let escaped = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;");
+    let lang = if language.trim().is_empty() {
+        "ru-RU"
+    } else {
+        language.trim()
+    };
+    format!(
+        "<speak version=\"1.0\" xmlns=\"http://www.w3.org/2001/10/synthesis\" xml:lang=\"{lang}\">\
+<prosody pitch=\"{pitch:+}%\" rate=\"{rate:+}%\">{escaped}</prosody></speak>"
+    )
 }
 
 /// Gets the time to the first sound of a spoken answer.
@@ -292,6 +317,16 @@ mod tests {
         assert!(parts.len() >= 2);
         // The cut waits for the end of the word that crosses the limit.
         assert!(parts.iter().all(|p| p.chars().count() <= MAX_SENTENCE + 30));
+    }
+
+    #[test]
+    fn tone_goes_into_ssml_and_text_is_escaped() {
+        assert_eq!(
+            prosody_ssml("A & <b>", "", (8, -6)),
+            "<speak version=\"1.0\" xmlns=\"http://www.w3.org/2001/10/synthesis\" xml:lang=\"ru-RU\">\
+<prosody pitch=\"+8%\" rate=\"-6%\">A &amp; &lt;b&gt;</prosody></speak>"
+        );
+        assert!(prosody_ssml("x", "en-US", (0, 0)).contains("xml:lang=\"en-US\""));
     }
 
     #[test]

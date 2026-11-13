@@ -161,6 +161,21 @@ export async function install(scenario: string) {
             briefing_enabled: false,
             briefing_time: '08:30',
           };
+        case 'get_rhythm_settings':
+          return {
+            rhythm: { breaks: true, break_every_min: 50, lively: true },
+            tracking: { app_time: true, clipboard: true },
+            clip_count: 7,
+            focus_left_s: params.has('focus') ? 1260 : null,
+            calendar_enabled: true,
+            remind_min: 10,
+            has_calendar_url: true,
+            calendar_events: 42,
+            calendar_read_at: '10:45',
+            calendar_error: null,
+            docs_folders: [String.raw`~\Documents\Работа`, String.raw`D:\Договоры`],
+            docs: { files: 128, chunks: 2310, embedded: 2310, running: false, last_run: 0, error: null, progress: null },
+          };
         case 'get_island_settings':
           return { city: 'Пермь', hide_in_games: true, monitor: '', monitors: [String.raw`\\.\DISPLAY1`, String.raw`\\.\DISPLAY2`] };
         case 'idle_info':

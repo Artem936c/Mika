@@ -1,16 +1,18 @@
 use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindow, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SetForegroundWindow,
-    SetWindowPos, ShowWindow, GW_OWNER, SWP_NOACTIVATE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE,
-    SW_RESTORE, WM_CLOSE,
+    EnumWindows, GetForegroundWindow, GetWindow, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW,
+    SetForegroundWindow, SetWindowPos, ShowWindow, GW_OWNER, SWP_NOACTIVATE, SWP_NOZORDER,
+    SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_CLOSE,
 };
 
 use crate::sys::{Placement, WindowInfo, Windows};
@@ -151,6 +153,7 @@ impl Windows for WinWindows {
     }
 
     fn place(&self, id: u64, placement: Placement) -> Result<(), String> {
+        super::physical_pixels();
         let h = hwnd(id);
         // SAFETY: plain calls on a window handle; a stale handle just fails.
         unsafe {
@@ -188,5 +191,121 @@ impl Windows for WinWindows {
             }
         }
         Ok(())
+    }
+
+    fn monitors(&self) -> usize {
+        monitor_areas().len()
+    }
+
+    fn to_monitor(&self, id: u64, n: usize) -> Result<(), String> {
+        super::physical_pixels();
+        let areas = monitor_areas();
+        let count = areas.len();
+        let target = n
+            .checked_sub(1)
+            .and_then(|i| areas.get(i))
+            .ok_or_else(|| format!("монитора {n} нет: их {count}"))?;
+        let h = hwnd(id);
+        // SAFETY: plain calls on a window handle; a stale handle just fails.
+        unsafe {
+            let monitor = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let from = if GetMonitorInfoW(monitor, &mut info).as_bool() {
+                info.rcWork
+            } else {
+                RECT::default()
+            };
+            // A maximized window keeps its old monitor until restored.
+            let _ = ShowWindow(h, SW_RESTORE);
+            let mut r = RECT::default();
+            GetWindowRect(h, &mut r).map_err(|_| "окно закрыто или недоступно".to_string())?;
+            let (x, y, w, hgt) = moved(
+                (r.left, r.top, r.right - r.left, r.bottom - r.top),
+                rect_tuple(from),
+                rect_tuple(*target),
+            );
+            SetWindowPos(h, None, x, y, w, hgt, SWP_NOZORDER | SWP_NOACTIVATE)
+                .map_err(|e| format!("не удалось перенести окно: {}", e.message()))?;
+        }
+        Ok(())
+    }
+}
+
+fn rect_tuple(r: RECT) -> (i32, i32, i32, i32) {
+    (r.left, r.top, r.right - r.left, r.bottom - r.top)
+}
+
+/// The window's box on another monitor: the same offset from the corner of
+/// the work area, shrunk and pulled in to fit.
+pub fn moved(
+    window: (i32, i32, i32, i32),
+    from: (i32, i32, i32, i32),
+    to: (i32, i32, i32, i32),
+) -> (i32, i32, i32, i32) {
+    let w = window.2.min(to.2);
+    let h = window.3.min(to.3);
+    let x = (to.0 + (window.0 - from.0).max(0)).min(to.0 + to.2 - w);
+    let y = (to.1 + (window.1 - from.1).max(0)).min(to.1 + to.3 - h);
+    (x, y, w, h)
+}
+
+unsafe extern "system" fn collect_monitor(
+    m: HMONITOR,
+    _dc: HDC,
+    _r: *mut RECT,
+    lparam: LPARAM,
+) -> BOOL {
+    // SAFETY: lparam is the &mut Vec passed by `monitor_areas` for the duration of the call.
+    let out = &mut *(lparam.0 as *mut Vec<(bool, RECT)>);
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetMonitorInfoW(m, &mut info).as_bool() {
+        out.push((info.dwFlags & MONITORINFOF_PRIMARY != 0, info.rcWork));
+    }
+    BOOL(1)
+}
+
+/// Work areas of the monitors: the main one first, the rest from left to right.
+fn monitor_areas() -> Vec<RECT> {
+    let mut found: Vec<(bool, RECT)> = Vec::new();
+    // SAFETY: the callback only pushes into `found`, which outlives the call.
+    let _ = unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect_monitor),
+            LPARAM(&mut found as *mut _ as isize),
+        )
+    };
+    found.sort_by_key(|(primary, r)| (!primary, r.left, r.top));
+    found.into_iter().map(|(_, r)| r).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_window_keeps_its_offset_and_fits_the_other_monitor() {
+        let left = (0, 0, 1920, 1040);
+        let right = (1920, 0, 2560, 1400);
+        assert_eq!(
+            moved((100, 50, 800, 600), left, right),
+            (2020, 50, 800, 600)
+        );
+        // Too big for a small monitor: shrunk and pulled in.
+        assert_eq!(
+            moved((2000, 100, 2400, 1300), right, left),
+            (0, 0, 1920, 1040)
+        );
+        assert_eq!(
+            moved((1800, 10, 400, 300), left, right),
+            (3720, 10, 400, 300)
+        );
     }
 }

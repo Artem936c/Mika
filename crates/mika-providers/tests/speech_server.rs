@@ -116,6 +116,31 @@ async fn synthesis_sends_voice_and_keeps_a_wav_as_is() {
 }
 
 #[tokio::test]
+async fn the_voice_in_words_goes_as_instructions() {
+    let wav = b"RIFF\x24\0\0\0WAVEfmt sound".to_vec();
+    let (base, request) = serve("200 OK", "audio/wav", wav.clone()).await;
+    let l = live(&base, |c| {
+        c.voice.tts_model = "openai/gpt-4o-mini-tts".into();
+        c.voice.tts_voice = "coral".into();
+        c.voice.tts_cache = false;
+    });
+    let out = l
+        .synthesize_with("Привет", "Молодой тёплый голос. Сейчас радостно.")
+        .await
+        .unwrap();
+    assert_eq!(out, wav);
+    let req = request.await.unwrap();
+    let body = String::from_utf8_lossy(&req);
+    let json: serde_json::Value =
+        serde_json::from_str(&body[body.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+    assert_eq!(
+        json["instructions"],
+        "Молодой тёплый голос. Сейчас радостно."
+    );
+    assert_eq!(json["voice"], "coral");
+}
+
+#[tokio::test]
 async fn headerless_sound_is_wrapped_into_wav() {
     let (base, _request) = serve("200 OK", "audio/pcm", vec![1, 0, 2, 0, 3, 0]).await;
     let l = live(&base, |c| c.voice.tts_model = "m".into());

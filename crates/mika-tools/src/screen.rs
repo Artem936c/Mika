@@ -81,6 +81,15 @@ impl ScreenEnv {
         Ok(View { window: None })
     }
 
+    /// A window brought to the front, as the screen shows it.
+    async fn capture_visible(&self, window: u64, max_side: u32) -> Result<Shot, ToolError> {
+        let screen = self.screen.clone();
+        tokio::task::spawn_blocking(move || screen.capture_visible(window, max_side))
+            .await
+            .map_err(|e| failed(e.to_string()))?
+            .map_err(failed)
+    }
+
     async fn capture(&self, view: &View, max_side: u32) -> Result<Shot, ToolError> {
         let (screen, id) = (self.screen.clone(), view.window.as_ref().map(|w| w.id));
         tokio::task::spawn_blocking(move || screen.capture(id, max_side))
@@ -248,8 +257,21 @@ impl ScreenClickTool {
             .and_then(|n| crate::grid::cell(pic.width, pic.height, cols, rows, n)))
     }
 
-    /// Point of `target` on the picture by the vision model: a cell, then a
-    /// cell inside it. Picture pixels.
+    async fn ask(
+        &self,
+        png: &[u8],
+        question: &str,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
+        tokio::select! {
+            _ = cancel.cancelled() => Err(ToolError::Cancelled),
+            a = self.vision.ask(png, question) => a.map_err(failed),
+        }
+    }
+
+    /// Point of `target` on the picture by the vision model. Picture pixels.
+    /// A point is used only after the model, shown a crosshair on it, does not
+    /// say it is wrong: first by the grid, then by pixels named outright.
     async fn by_vision(
         &self,
         png: &[u8],
@@ -257,7 +279,84 @@ impl ScreenClickTool {
         cancel: &CancellationToken,
     ) -> Result<Option<(f32, f32)>, ToolError> {
         let pic = crate::grid::decode(png).ok_or_else(|| failed("снимок не читается"))?;
-        let Some(first) = self.ask_cell(&pic, GRID, target, cancel).await? else {
+        let mut seen = false;
+        if let Some(p) = self.grid_point(&pic, target, cancel).await? {
+            seen = true;
+            if self.point_holds(&pic, p, target, cancel).await? {
+                return Ok(Some(p));
+            }
+        }
+        if let Some(p) = self.named_point(&pic, target, cancel).await? {
+            seen = true;
+            if self.point_holds(&pic, p, target, cancel).await? {
+                return Ok(Some(p));
+            }
+        }
+        if seen {
+            return Err(failed(format!(
+                "не уверена, где «{target}»: модель со зрением дважды указала место, но при проверке там другое. \
+Ничего не нажала. Не повторяй это нажатие: спроси пользователя или сделай по-другому (клавиши, ui_read, messenger_send с file)."
+            )));
+        }
+        Ok(None)
+    }
+
+    /// The point named outright in pixels of the picture.
+    async fn named_point(
+        &self,
+        pic: &crate::grid::Picture,
+        target: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<(f32, f32)>, ToolError> {
+        let png = crate::grid::encode(pic).ok_or_else(|| failed("снимок не собрался"))?;
+        let question = format!(
+            "Снимок {}×{} пикселей. Где середина «{target}»? Ответь только двумя числами: x и y в пикселях этого снимка \
+от левого верхнего угла, например «120 340». Если такого нет, ответь «0 0».",
+            pic.width, pic.height
+        );
+        let answer = self.ask(&png, &question, cancel).await?;
+        Ok(crate::grid::two_numbers(&answer)
+            .filter(|(x, y)| (*x > 0 || *y > 0) && *x < pic.width && *y < pic.height)
+            .map(|(x, y)| (x as f32, y as f32)))
+    }
+
+    /// Whether the model, shown a crosshair on the point, agrees it is the target.
+    /// An unclear answer counts as yes.
+    async fn point_holds(
+        &self,
+        pic: &crate::grid::Picture,
+        (x, y): (f32, f32),
+        target: &str,
+        cancel: &CancellationToken,
+    ) -> Result<bool, ToolError> {
+        let r = 110.0;
+        let (near, at) = crate::grid::crop(
+            pic,
+            crate::grid::Area {
+                x: x - r,
+                y: y - r,
+                w: 2.0 * r,
+                h: 2.0 * r,
+            },
+        );
+        let marked =
+            crate::grid::crosshair(&near, (x - at.x).round() as i64, (y - at.y).round() as i64);
+        let png = crate::grid::encode(&marked).ok_or_else(|| failed("снимок не собрался"))?;
+        let question = format!(
+            "На снимке красное перекрестие. Его центр стоит на «{target}»? Ответь одним словом: да или нет."
+        );
+        let answer = self.ask(&png, &question, cancel).await?;
+        Ok(crate::grid::yes(&answer) != Some(false))
+    }
+
+    /// The point by the grid: a cell, then a cell inside it.
+    async fn grid_point(
+        &self,
+        pic: &crate::grid::Picture,
+        target: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<(f32, f32)>, ToolError> {
+        let Some(first) = self.ask_cell(pic, GRID, target, cancel).await? else {
             return Ok(None);
         };
         // The cell with half a cell around it: the thing may sit on a line.
@@ -267,7 +366,7 @@ impl ScreenClickTool {
             w: first.w * 2.0,
             h: first.h * 2.0,
         };
-        let (part, at) = crate::grid::crop(&pic, around);
+        let (part, at) = crate::grid::crop(pic, around);
         let fine = self.ask_cell(&part, FINE_GRID, target, cancel).await?;
         let (x, y) = match fine {
             Some(c) => {
@@ -338,10 +437,7 @@ impl Tool for ScreenClickTool {
         // A covered window cannot take a click where it is seen.
         self.env.ui.windows.focus(w.id).map_err(failed)?;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let view = View {
-            window: Some(w.clone()),
-        };
-        let shot = self.env.capture(&view, 0).await?;
+        let shot = self.env.capture_visible(w.id, 0).await?;
         let screen = self.env.screen.clone();
         let png = shot.png.clone();
         let words = tokio::task::spawn_blocking(move || screen.ocr_words(&png))
@@ -353,7 +449,7 @@ impl Tool for ScreenClickTool {
             let (x, y) = a.center();
             ((x * shot.factor, y * shot.factor), "по надписи")
         } else {
-            let small = self.env.capture(&view, VISION_MAX_SIDE).await?;
+            let small = self.env.capture_visible(w.id, VISION_MAX_SIDE).await?;
             match self.by_vision(&small.png, &target, &cancel).await {
                 Ok(Some((x, y))) => (
                     (x * small.factor, y * small.factor),
@@ -365,11 +461,7 @@ impl Tool for ScreenClickTool {
                         truncate(&w.title, 60)
                     )))
                 }
-                Err(e) => {
-                    return Err(failed(format!(
-                        "надписи «{target}» в окне нет, а модель со зрением не ответила: {e}"
-                    )))
-                }
+                Err(e) => return Err(e),
             }
         };
         let (x, y) = (
@@ -537,6 +629,52 @@ mod tests {
              Снимок уменьшен: для ui_click координаты со снимка умножай на 2.00."
         );
         assert_eq!(*f.captures.lock(), vec![Some(7)]);
+    }
+
+    #[tokio::test]
+    async fn a_guessed_point_is_clicked_only_after_the_crosshair_check() {
+        let (env, vision, f) = screen_env("C:\\Users\\me");
+        let pic = crate::grid::Picture {
+            rgb: vec![230; 400 * 300 * 3],
+            width: 400,
+            height: 300,
+        };
+        *f.picture.lock() = Some((crate::grid::encode(&pic).unwrap(), 400, 300));
+        let tool = ScreenClickTool { env, vision };
+        // The grid points wrong, the named pixels are right.
+        *f.vision_seq.lock() = vec![
+            "5".into(),
+            "1".into(),
+            "нет".into(),
+            "x=200, y=150".into(),
+            "Да".into(),
+        ];
+        let out = run(&tool, json!({"target": "скрепка", "window": "игра"}))
+            .await
+            .unwrap()
+            .text;
+        assert!(out.starts_with("Нажала «скрепка» (по картинке"), "{out}");
+        assert_eq!(
+            f.clicks.lock().clone(),
+            vec![(210, 170, crate::sys::MouseButton::Left, false)]
+        );
+        // Both guesses fail the check: no click at all.
+        f.clicks.lock().clear();
+        *f.vision_seq.lock() = vec![
+            "5".into(),
+            "1".into(),
+            "нет".into(),
+            "200 150".into(),
+            "нет".into(),
+        ];
+        let err = run(&tool, json!({"target": "скрепка", "window": "игра"}))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Ничего не нажала"), "{err}");
+        assert!(f.clicks.lock().is_empty());
+        assert_eq!(crate::grid::two_numbers("(12; 7)"), Some((12, 7)));
+        assert_eq!(crate::grid::yes("Нет."), Some(false));
+        assert_eq!(crate::grid::yes("может"), None);
     }
 
     #[tokio::test]

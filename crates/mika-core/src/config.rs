@@ -22,6 +22,70 @@ pub struct Config {
     pub updates: UpdatesConfig,
     pub notifications: NotificationsConfig,
     pub briefing: BriefingConfig,
+    pub rhythm: RhythmConfig,
+    pub tracking: TrackingConfig,
+    pub calendar: CalendarConfig,
+    pub docs: DocsConfig,
+}
+
+/// Breaks and her small lines of her own.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RhythmConfig {
+    /// Suggest a break after long work without a pause.
+    pub breaks: bool,
+    /// Minutes of work after which a break is suggested.
+    pub break_every_min: u32,
+    /// Greetings, «уже поздно», joy at a finished task. Made without the model.
+    pub lively: bool,
+}
+
+impl Default for RhythmConfig {
+    fn default() -> Self {
+        Self {
+            breaks: false,
+            break_every_min: 50,
+            lively: true,
+        }
+    }
+}
+
+/// Things she keeps track of on this computer only. Off until the user turns them on.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrackingConfig {
+    /// Time in each program: the process name of the window in front.
+    pub app_time: bool,
+    /// The last copied texts, in memory until she exits.
+    pub clipboard: bool,
+}
+
+/// Meetings from a calendar published as an ICS link. The link is a secret:
+/// it lives in the secret store under `CALENDAR_SECRET_KEY`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CalendarConfig {
+    pub enabled: bool,
+    /// Minutes before a meeting when she reminds of it; 0 means no reminders.
+    pub remind_min: u32,
+}
+
+impl Default for CalendarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            remind_min: 10,
+        }
+    }
+}
+
+pub const CALENDAR_SECRET_KEY: &str = "calendar.ics_url";
+
+/// Folders whose documents she reads to answer questions about them.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DocsConfig {
+    pub folders: Vec<String>,
 }
 
 /// Notifications of other programs. Off until the user turns them on.
@@ -232,6 +296,12 @@ pub struct VoiceConfig {
     pub follow_up: bool,
     /// Other programs get quieter while she listens and speaks.
     pub duck_media: bool,
+    /// The voice in words for the provider: age, timbre, manner. Sent as
+    /// `instructions`, which `gpt-4o-mini-tts` understands.
+    pub tts_style: String,
+    /// Her tone follows her emotion: pitch and pace of the Windows voice,
+    /// a line about the mood for the provider.
+    pub tone_by_mood: bool,
 }
 
 impl Default for VoiceConfig {
@@ -251,6 +321,8 @@ impl Default for VoiceConfig {
             wake_enabled: false,
             follow_up: true,
             duck_media: true,
+            tts_style: String::new(),
+            tone_by_mood: true,
         }
     }
 }
@@ -680,5 +752,19 @@ mod tests {
         assert!(!b.due(at("2026-11-13 11:00")));
         assert!(!NotificationsConfig::default().enabled);
         assert!(!BriefingConfig::default().enabled);
+    }
+
+    #[test]
+    fn rhythm_tracking_calendar_and_docs_start_safe() {
+        let c = Config::default();
+        assert!(!c.rhythm.breaks && c.rhythm.lively && c.rhythm.break_every_min == 50);
+        assert!(!c.tracking.app_time && !c.tracking.clipboard);
+        assert!(!c.calendar.enabled && c.calendar.remind_min == 10);
+        assert!(c.docs.folders.is_empty());
+        assert!(c.voice.tone_by_mood && c.voice.tts_style.is_empty());
+        let (_d, p) = tmp();
+        std::fs::write(&p, "[voice]\nspeak_replies = false\n").unwrap();
+        let old = Config::load(&p).unwrap();
+        assert!(old.voice.tone_by_mood && !old.calendar.enabled);
     }
 }

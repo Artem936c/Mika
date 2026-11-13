@@ -77,6 +77,12 @@ pub enum Event {
         title: String,
         text: String,
     },
+    /// A short line of her own, made without the model: a break, the end of
+    /// focus, a meeting soon, a greeting. `kind`: `break`, `focus`, `calendar`, `life`.
+    Remark {
+        text: String,
+        kind: String,
+    },
     /// Screen rectangle of the element about to be clicked, physical pixels.
     UiTarget {
         x: i32,

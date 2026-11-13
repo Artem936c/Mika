@@ -265,6 +265,70 @@ pub fn parse_answer(text: &str) -> Option<Answer> {
     }
 }
 
+/// Word stems of a cleaned phrase: Latin made Cyrillic, the first four letters,
+/// words of one or two letters dropped. «алкогеймерам» and «алкогеймеры» match.
+fn stems(cleaned: &str) -> Vec<String> {
+    cleaned
+        .split(' ')
+        .filter(|w| w.chars().count() >= 3)
+        .map(|w| {
+            let w = if w.is_ascii() {
+                translit(w)
+            } else {
+                w.to_string()
+            };
+            w.chars().take(4).collect()
+        })
+        .collect()
+}
+
+/// Latin letters read the Russian way: recognition writes «телеграм», the
+/// action name says «Telegram». Digits stay.
+fn translit(word: &str) -> String {
+    let mut out = String::new();
+    for c in word.chars() {
+        let ru = match c {
+            'a' => "а",
+            'b' => "б",
+            'c' | 'k' | 'q' => "к",
+            'd' => "д",
+            'e' => "е",
+            'f' => "ф",
+            'g' => "г",
+            'h' => "х",
+            'i' => "и",
+            'j' => "дж",
+            'l' => "л",
+            'm' => "м",
+            'n' => "н",
+            'o' => "о",
+            'p' => "п",
+            'r' => "р",
+            's' => "с",
+            't' => "т",
+            'u' => "у",
+            'v' | 'w' => "в",
+            'x' => "кс",
+            'y' => "й",
+            'z' => "з",
+            other => {
+                out.push(other);
+                continue;
+            }
+        };
+        out.push_str(ru);
+    }
+    out
+}
+
+/// Whether the spoken phrase names the action: every word of the name is
+/// there, endings and the alphabet aside.
+fn says_name(spoken: &str, name: &str) -> bool {
+    let want = stems(&clean(name));
+    let got = stems(spoken);
+    !want.is_empty() && want.iter().all(|w| got.contains(w))
+}
+
 /// What a spoken phrase means for an open request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VoiceAnswer {
@@ -289,8 +353,7 @@ pub fn voice_answer(text: &str, assessment: &Assessment) -> VoiceAnswer {
         return VoiceAnswer::Answer(Answer::Deny);
     }
     if assessment.level == crate::tools::RiskLevel::High {
-        let name = clean(&assessment.summary);
-        return if !name.is_empty() && t.contains(&name) {
+        return if says_name(&t, &assessment.summary) {
             VoiceAnswer::Answer(Answer::Once)
         } else {
             VoiceAnswer::NeedName(assessment.summary.clone())
@@ -346,6 +409,30 @@ mod tests {
             voice_answer("Да, выключить компьютер.", &a),
             VoiceAnswer::Answer(Answer::Once)
         );
+    }
+
+    #[test]
+    fn the_name_matches_despite_endings_and_alphabet() {
+        let a = risk(RiskLevel::High, "Написать в Telegram: алкогеймеры");
+        for phrase in [
+            "Написать в телеграм алкогеймеры.",
+            "Да, напиши в Телеграме алкогеймерам",
+            "написать в Telegram алкогеймеры",
+        ] {
+            assert_eq!(
+                voice_answer(phrase, &a),
+                VoiceAnswer::Answer(Answer::Once),
+                "{phrase}"
+            );
+        }
+        for phrase in ["Да", "написать в телеграм", "отправь алкогеймерам"]
+        {
+            assert!(
+                matches!(voice_answer(phrase, &a), VoiceAnswer::NeedName(_)),
+                "{phrase}"
+            );
+        }
+        assert_eq!(translit("telegram2"), "телеграм2");
     }
 
     #[test]

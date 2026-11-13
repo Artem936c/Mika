@@ -170,6 +170,43 @@ fn label(p: &mut Picture, x: i64, y: i64, n: u32, scale: i64) {
     }
 }
 
+/// A crosshair over the point: two lines in a dark outline, a gap in the middle
+/// so the thing under it stays visible.
+pub fn crosshair(p: &Picture, x: i64, y: i64) -> Picture {
+    let mut out = p.clone();
+    let (arm, gap) = (16, 5);
+    for (dx, dy, w, h) in [
+        (-arm - gap, -1, arm, 3),
+        (gap, -1, arm, 3),
+        (-1, -arm - gap, 3, arm),
+        (-1, gap, 3, arm),
+    ] {
+        fill(&mut out, x + dx - 1, y + dy - 1, w + 2, h + 2, [0, 0, 0]);
+        fill(&mut out, x + dx, y + dy, w, h, [255, 30, 30]);
+    }
+    out
+}
+
+/// The first two whole numbers of an answer: `x=120, y=340` → (120, 340).
+pub fn two_numbers(answer: &str) -> Option<(u32, u32)> {
+    let mut nums = answer
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<u32>().ok());
+    Some((nums.next()?, nums.next()?))
+}
+
+/// A yes or no from a model's answer; `None` when it is neither.
+pub fn yes(answer: &str) -> Option<bool> {
+    let a = answer.trim().to_lowercase();
+    let first: String = a.chars().take_while(|c| c.is_alphabetic()).collect();
+    match first.as_str() {
+        "да" | "yes" => Some(true),
+        "нет" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 /// Draws grid lines and the number of each cell in its top left corner.
 pub fn draw_grid(p: &Picture, cols: u32, rows: u32) -> Picture {
     let mut out = p.clone();

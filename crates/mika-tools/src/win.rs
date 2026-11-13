@@ -7,6 +7,7 @@ mod http;
 mod input;
 mod launcher;
 mod media;
+pub mod pdf;
 mod power;
 mod probe;
 mod radio;
@@ -23,6 +24,7 @@ use mika_core::storage::Db;
 
 use crate::sys::{Shared, ToolEnv};
 
+pub use clipboard::{excluded_from_history, sequence as clipboard_sequence};
 pub use runner::ProcessRunner;
 
 impl ToolEnv {
@@ -76,6 +78,19 @@ fn with_com<T: Send + 'static>(
     })
     .join()
     .map_err(|_| "системный вызов упал".to_string())?
+}
+
+/// This thread sees and sets every coordinate in real screen pixels, on every
+/// monitor whatever its scale. Without it a picture and a click may be counted
+/// in different pixels when monitors have different scaling.
+pub(crate) fn physical_pixels() {
+    use windows::Win32::UI::HiDpi::{
+        SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    // SAFETY: changes only the calling thread's DPI mode.
+    unsafe {
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
 }
 
 fn wide(s: &str) -> windows::core::HSTRING {

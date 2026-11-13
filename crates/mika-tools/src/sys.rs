@@ -90,6 +90,15 @@ pub trait Windows: Send + Sync {
     /// The window the user works in now.
     fn foreground(&self) -> Option<WindowInfo>;
     fn place(&self, id: u64, placement: Placement) -> Result<(), String>;
+    /// How many monitors there are.
+    fn monitors(&self) -> usize {
+        1
+    }
+    /// Moves the window to monitor `n` (from 1: the main one, then from left to
+    /// right), keeping its place and size there as far as they fit.
+    fn to_monitor(&self, _id: u64, _n: usize) -> Result<(), String> {
+        Err("перенос между мониторами здесь недоступен".into())
+    }
 }
 
 /// Screen rectangle in physical pixels.
@@ -180,6 +189,11 @@ pub trait Screen: Send + Sync {
     /// A window, or the whole primary screen. `max_side` shrinks the picture
     /// so that its longer side fits; 0 keeps the real size.
     fn capture(&self, window: Option<u64>, max_side: u32) -> Result<Shot, String>;
+    /// The window as it is seen on the screen now, pixel for pixel where a
+    /// click lands. For a window brought to the front before clicking.
+    fn capture_visible(&self, window: u64, max_side: u32) -> Result<Shot, String> {
+        self.capture(Some(window), max_side)
+    }
     /// Text found on a PNG picture.
     fn ocr(&self, png: &[u8]) -> Result<String, String>;
     /// Words found on a PNG picture with their boxes.
@@ -227,6 +241,10 @@ pub trait Radios: Send + Sync {
 pub trait Clipboard: Send + Sync {
     fn get(&self) -> Result<String, String>;
     fn set(&self, text: &str) -> Result<(), String>;
+    /// Files, as Explorer copies them: a program pastes them as attachments.
+    fn set_files(&self, _paths: &[PathBuf]) -> Result<(), String> {
+        Err("копирование файлов в буфер здесь недоступно".into())
+    }
 }
 
 /// One clickable or editable element of a web page, numbered for the model.
@@ -373,4 +391,16 @@ pub struct Shared {
     pub tasks: mika_core::task::TaskBoard,
     /// People whose messages she answers for the user; the notification reader uses it too.
     pub watches: crate::watch::ChatWatches,
+    /// Focus mode: the tool turns it on, the app keeps quiet meanwhile.
+    pub focus: crate::focus::Focus,
+    /// Copied texts, filled by the app while `clipboard_on` is set.
+    pub clips: crate::cliphist::ClipHistory,
+    /// `tracking.clipboard` from the config.
+    pub clipboard_on: Arc<AtomicBool>,
+    /// `tracking.app_time` from the config.
+    pub app_time_on: Arc<AtomicBool>,
+    /// Meetings read from the calendar link by the app.
+    pub calendar: crate::calendar::CalendarState,
+    /// Pieces of the user's documents.
+    pub docs: crate::docs::DocIndex,
 }

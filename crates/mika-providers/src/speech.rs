@@ -158,6 +158,28 @@ impl SpeechToText for Live {
 #[async_trait]
 impl TextToSpeech for Live {
     async fn synthesize(&self, text: &str) -> Result<Vec<u8>, String> {
+        let style = self.speech_settings().tts_style;
+        self.synthesize_with(text, style.trim()).await
+    }
+}
+
+impl Live {
+    /// Speech with `instructions`: the voice and tone in words, as
+    /// `gpt-4o-mini-tts` takes them. A provider that refuses the field gets the
+    /// request again without it.
+    pub async fn synthesize_with(&self, text: &str, instructions: &str) -> Result<Vec<u8>, String> {
+        let instructions = instructions.trim();
+        match self.speak_once(text, instructions).await {
+            Err(e) if !instructions.is_empty() && e.starts_with("синтез речи ответил 4") =>
+            {
+                log::warn!("speech provider refused instructions, asking without them: {e}");
+                self.speak_once(text, "").await
+            }
+            other => other,
+        }
+    }
+
+    async fn speak_once(&self, text: &str, instructions: &str) -> Result<Vec<u8>, String> {
         let voice = self.speech_settings();
         let model = voice.tts_model.trim().to_string();
         if model.is_empty() {
@@ -165,10 +187,16 @@ impl TextToSpeech for Live {
         }
         let base = self.base(&voice.speech_base_url);
         let name = voice.tts_voice.trim();
+        // The same words said in another tone are another sound.
+        let voice_key = if instructions.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}|{instructions}")
+        };
         let sound_key = SoundKey {
             base_url: &base,
             model: &model,
-            voice: name,
+            voice: &voice_key,
             text,
         };
         let cache = self.speech_cache().filter(|_| voice.tts_cache);
@@ -180,6 +208,9 @@ impl TextToSpeech for Live {
         let mut body = json!({ "model": model, "input": text });
         if !name.is_empty() {
             body["voice"] = json!(name);
+        }
+        if !instructions.is_empty() {
+            body["instructions"] = json!(instructions);
         }
         let mut req = self
             .http()

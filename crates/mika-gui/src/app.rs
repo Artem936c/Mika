@@ -9,7 +9,7 @@ use mika_core::commands::CommandStore;
 use mika_core::config::{mcp_token_key, Config, TtsEngine, TELEGRAM_SECRET_KEY};
 use mika_core::confirm::Confirmations;
 use mika_core::gate::Gate;
-use mika_core::llm::{SpeechToText, TextToSpeech};
+use mika_core::llm::SpeechToText;
 use mika_core::memory::Memory;
 use mika_core::paths::{config_path, database_path};
 use mika_core::policy::{AuditLog, PolicyGate, RuleStore};
@@ -39,6 +39,17 @@ pub fn speech_locale(language: &str) -> String {
         "uk" => "uk-UA".into(),
         other => format!("{other}-{}", other.to_uppercase()),
     }
+}
+
+/// What a provider voice is told besides the text: the voice in the user's
+/// words and the tone of the moment. Empty when there is nothing to say.
+pub fn voice_instructions(style: &str, tone: Option<&str>) -> String {
+    [style.trim(), tone.unwrap_or("")]
+        .iter()
+        .filter(|s| !s.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// How one MCP server did at the last start: its tool count or the error.
@@ -96,6 +107,12 @@ pub struct Ctx {
     duck_turn: std::sync::atomic::AtomicU64,
     /// Text the user selected in another program and sent here by the shortcut.
     pub selection: Mutex<Option<crate::selection::Selection>>,
+    /// Her face now; set in `setup`. Her voice follows it.
+    pub emotion: std::sync::OnceLock<mika_core::emotion::EmotionHandle>,
+    /// Read the calendar link again now.
+    pub calendar_wake: Arc<tokio::sync::Notify>,
+    /// Look over the documents now.
+    pub docs_wake: Arc<tokio::sync::Notify>,
 }
 
 /// How an attempt to hear a phrase ended.
@@ -178,6 +195,8 @@ impl Ctx {
         let speech = live.clone();
         let voice_state = state.clone();
         let memory = Memory::new(db.clone(), Some(Arc::new(live.clone())));
+        let docs = mika_tools::docs::DocIndex::new(db.clone(), Some(Arc::new(live.clone())));
+        let tracking = config.lock().tracking.clone();
         let task_board = mika_core::task::TaskBoard::new(bus.clone());
         let env = ToolEnv::windows(
             db.clone(),
@@ -191,6 +210,12 @@ impl Ctx {
                 bus: bus.clone(),
                 tasks: task_board.clone(),
                 watches: Default::default(),
+                focus: Default::default(),
+                clips: Default::default(),
+                clipboard_on: Arc::new(AtomicBool::new(tracking.clipboard)),
+                app_time_on: Arc::new(AtomicBool::new(tracking.app_time)),
+                calendar: Default::default(),
+                docs,
             },
         );
         let speaker = speaker.with_audible(audible(env.volume.clone()));
@@ -266,6 +291,9 @@ impl Ctx {
             )),
             duck_turn: std::sync::atomic::AtomicU64::new(0),
             selection: Mutex::new(None),
+            emotion: std::sync::OnceLock::new(),
+            calendar_wake: Default::default(),
+            docs_wake: Default::default(),
         })
     }
 
@@ -358,6 +386,9 @@ impl Ctx {
         self.restart_telegram();
         self.start_notifications();
         self.start_briefing();
+        self.start_rhythm();
+        self.start_calendar();
+        self.start_docs();
     }
 
     /// Rebuilds the tool set from the current settings and connected MCP servers.
@@ -427,15 +458,27 @@ impl Ctx {
     /// Points the voice at the provider or back at Windows, as the settings say.
     pub fn apply_voice_engine(&self) {
         let v = self.config.lock().voice.clone();
+        let emotion = self.emotion.get().cloned().filter(|_| v.tone_by_mood);
+        // The face of the moment the sentence is asked for, when tone follows mood.
+        let mood = move || {
+            emotion
+                .as_ref()
+                .map_or(mika_core::emotion::Emotion::Neutral, |e| e.get())
+        };
         if v.tts == TtsEngine::Provider && !v.tts_model.trim().is_empty() {
             let live = self.live.clone();
+            let style = v.tts_style.trim().to_string();
+            let mood = mood.clone();
             // Runs on the voice's own thread, so blocking on the request is fine.
             self.voice.set_remote(Some(Arc::new(move |text: &str| {
-                tauri::async_runtime::block_on(live.synthesize(text))
+                let instructions = voice_instructions(&style, mood().tone_line());
+                tauri::async_runtime::block_on(live.synthesize_with(text, &instructions))
             })));
         } else {
             self.voice.set_remote(None);
         }
+        self.voice
+            .set_tone(Some(Arc::new(move || mood().prosody())));
     }
 
     pub fn set_input_device(&self, name: &str) {
@@ -844,5 +887,19 @@ mod tests {
         assert_eq!(super::speech_locale("en"), "en-US");
         assert_eq!(super::speech_locale("de"), "de-DE");
         assert_eq!(super::speech_locale("en-GB"), "en-GB");
+    }
+
+    #[test]
+    fn provider_voice_hears_the_style_and_the_mood() {
+        use super::voice_instructions;
+        assert_eq!(voice_instructions("", None), "");
+        assert_eq!(
+            voice_instructions(" Молодой тёплый голос. ", Some("Сейчас радостно.")),
+            "Молодой тёплый голос. Сейчас радостно."
+        );
+        assert_eq!(
+            voice_instructions("", Some("Сейчас грустно.")),
+            "Сейчас грустно."
+        );
     }
 }

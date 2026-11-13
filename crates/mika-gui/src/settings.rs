@@ -143,6 +143,173 @@ pub fn set_briefing(ctx: CtxState<'_>, enabled: bool, time: String) -> Result<()
     ctx.save_config()
 }
 
+// ---- rhythm of the day ----
+
+#[derive(serde::Serialize)]
+pub struct RhythmSettings {
+    rhythm: mika_core::config::RhythmConfig,
+    tracking: mika_core::config::TrackingConfig,
+    clip_count: usize,
+    /// Seconds of focus left, when it runs.
+    focus_left_s: Option<i64>,
+    calendar_enabled: bool,
+    remind_min: u32,
+    has_calendar_url: bool,
+    calendar_events: usize,
+    /// `HH:MM` of the last good read.
+    calendar_read_at: Option<String>,
+    calendar_error: Option<String>,
+    docs_folders: Vec<String>,
+    docs: mika_tools::docs::IndexStatus,
+}
+
+#[tauri::command]
+pub fn get_rhythm_settings(ctx: CtxState<'_>) -> RhythmSettings {
+    let c = ctx.config.lock().clone();
+    let shared = &ctx.tool_env().shared;
+    let (calendar_events, read, calendar_error) = shared.calendar.status();
+    RhythmSettings {
+        rhythm: c.rhythm,
+        tracking: c.tracking,
+        clip_count: shared.clips.len(),
+        focus_left_s: shared.focus.left(chrono::Local::now().timestamp()),
+        calendar_enabled: c.calendar.enabled,
+        remind_min: c.calendar.remind_min,
+        has_calendar_url: has_secret(&ctx, mika_core::config::CALENDAR_SECRET_KEY),
+        calendar_events,
+        calendar_read_at: read
+            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string()),
+        calendar_error,
+        docs_folders: c.docs.folders,
+        docs: shared.docs.status(),
+    }
+}
+
+/// Breaks and her lines of her own.
+#[tauri::command]
+pub fn set_rhythm(
+    ctx: CtxState<'_>,
+    breaks: bool,
+    break_every_min: u32,
+    lively: bool,
+) -> Result<(), String> {
+    {
+        let mut c = ctx.config.lock();
+        c.rhythm.breaks = breaks;
+        c.rhythm.break_every_min = break_every_min.clamp(15, 240);
+        c.rhythm.lively = lively;
+    }
+    ctx.save_config()
+}
+
+/// Time in programs and copied texts. Turning the history off forgets it.
+#[tauri::command]
+pub fn set_tracking(ctx: CtxState<'_>, app_time: bool, clipboard: bool) -> Result<(), String> {
+    {
+        let mut c = ctx.config.lock();
+        c.tracking.app_time = app_time;
+        c.tracking.clipboard = clipboard;
+    }
+    let shared = &ctx.tool_env().shared;
+    shared
+        .app_time_on
+        .store(app_time, std::sync::atomic::Ordering::Relaxed);
+    shared
+        .clipboard_on
+        .store(clipboard, std::sync::atomic::Ordering::Relaxed);
+    if !clipboard {
+        shared.clips.clear();
+    }
+    ctx.save_config()
+}
+
+#[tauri::command]
+pub fn clear_app_time(ctx: CtxState<'_>) -> Result<(), String> {
+    mika_tools::usage::UsageStore(ctx.db.clone())
+        .clear()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn clear_clipboard_history(ctx: CtxState<'_>) {
+    ctx.tool_env().shared.clips.clear();
+}
+
+#[tauri::command]
+pub fn start_focus(ctx: CtxState<'_>, minutes: u64) {
+    ctx.tool_env()
+        .shared
+        .focus
+        .start(minutes, chrono::Local::now().timestamp());
+}
+
+/// Ends focus now; what came meanwhile is told at once.
+#[tauri::command]
+pub fn stop_focus(ctx: CtxState<'_>) {
+    if let Some(held) = ctx.tool_env().shared.focus.stop() {
+        if !held.is_empty() {
+            ctx.session
+                .agent
+                .append_note(&format!("Пока шёл фокус, пришло:\n{}", held.join("\n")));
+        }
+        ctx.remark(&mika_tools::focus::summary(&held), "focus", true);
+    }
+}
+
+/// The calendar: on or off, minutes before a meeting, and the link.
+/// `url`: `None` keeps the stored link, an empty string deletes it.
+#[tauri::command]
+pub fn save_calendar(
+    ctx: CtxState<'_>,
+    enabled: bool,
+    remind_min: u32,
+    url: Option<String>,
+) -> Result<(), String> {
+    if let Some(u) = url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        if !u.starts_with("https://") && !u.starts_with("webcal://") {
+            return Err(crate::strings::tr("error.calendar_url"));
+        }
+    }
+    store_secret(&ctx, mika_core::config::CALENDAR_SECRET_KEY, url)?;
+    {
+        let mut c = ctx.config.lock();
+        c.calendar.enabled = enabled;
+        c.calendar.remind_min = remind_min.min(120);
+    }
+    ctx.save_config()?;
+    ctx.calendar_wake.notify_one();
+    Ok(())
+}
+
+/// Folders of documents; each must exist. The index follows at once.
+#[tauri::command]
+pub fn set_docs_folders(ctx: CtxState<'_>, folders: Vec<String>) -> Result<(), String> {
+    let folders: Vec<String> = folders
+        .into_iter()
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty())
+        .collect();
+    for (raw, path) in folders
+        .iter()
+        .zip(crate::rhythm::folder_paths(&folders, ctx.user_profile()))
+    {
+        if !path.is_dir() {
+            return Err(crate::strings::tr("error.docs_folder").replace("{path}", raw));
+        }
+    }
+    ctx.config.lock().docs.folders = folders;
+    ctx.save_config()?;
+    ctx.docs_wake.notify_one();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn reindex_docs(ctx: CtxState<'_>) {
+    ctx.docs_wake.notify_one();
+}
+
 #[tauri::command]
 pub fn set_news_feed(ctx: CtxState<'_>, value: String) -> Result<(), String> {
     let value = value.trim().to_string();
@@ -703,6 +870,21 @@ pub struct VoiceSettings {
     vosk_bytes: u64,
     follow_up: bool,
     duck_media: bool,
+    tts_style: String,
+    tone_by_mood: bool,
+}
+
+/// The voice in words for the provider, and whether tone follows her mood.
+#[tauri::command]
+pub fn set_voice_style(ctx: CtxState<'_>, style: String, tone_by_mood: bool) -> Result<(), String> {
+    {
+        let mut c = ctx.config.lock();
+        c.voice.tts_style = style.trim().chars().take(500).collect();
+        c.voice.tone_by_mood = tone_by_mood;
+    }
+    ctx.save_config()?;
+    ctx.apply_voice_engine();
+    Ok(())
 }
 
 /// Async: listing voices waits for Windows and must not block the UI thread.
@@ -762,6 +944,8 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
         vosk_bytes,
         follow_up: c.follow_up,
         duck_media: c.duck_media,
+        tts_style: c.tts_style,
+        tone_by_mood: c.tone_by_mood,
     })
 }
 

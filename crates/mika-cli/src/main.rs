@@ -77,6 +77,7 @@ async fn run() {
     let shared_config = Arc::new(Mutex::new(config.clone()));
     let live = Live::new(shared_config, secrets);
     let memory = Memory::new(db.clone(), Some(Arc::new(live.clone())));
+    let docs = mika_tools::docs::DocIndex::new(db.clone(), Some(Arc::new(live.clone())));
     let task_board = mika_core::task::TaskBoard::new(bus.clone());
     let env = mika_tools::ToolEnv::windows(
         db.clone(),
@@ -90,6 +91,12 @@ async fn run() {
             bus: bus.clone(),
             tasks: task_board.clone(),
             watches: Default::default(),
+            focus: Default::default(),
+            clips: Default::default(),
+            clipboard_on: Default::default(),
+            app_time_on: Arc::new(AtomicBool::new(config.tracking.app_time)),
+            calendar: Default::default(),
+            docs,
         },
     );
     let mut registry = ToolRegistry::new();

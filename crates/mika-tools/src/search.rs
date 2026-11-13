@@ -41,7 +41,7 @@ fn is_text_file(p: &Path) -> bool {
 }
 
 /// The file as text: UTF-8, or UTF-16 with its mark. `None` for binary data.
-fn read_text(bytes: &[u8]) -> Option<String> {
+pub(crate) fn read_text(bytes: &[u8]) -> Option<String> {
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         let units: Vec<u16> = rest
             .as_chunks::<2>()

@@ -1018,20 +1018,44 @@ impl Tool for ArrangeWindowTool {
     fn spec(&self) -> ToolSpec {
         spec(
             "arrange_window",
-            "Разложить окно по экрану: в левую, правую, верхнюю или нижнюю половину, развернуть, свернуть, вернуть обычный размер.",
+            "Разложить окно по экрану: перенести на другой монитор, в левую, правую, верхнюю или нижнюю половину, развернуть, свернуть, вернуть обычный размер. \
+Для переноса между мониторами используй её, а не PowerShell.",
             props(
-                &[(
-                    "placement",
-                    json!({ "type": "string", "enum": ["left", "right", "top", "bottom", "maximize", "minimize", "restore"] }),
-                )],
-                &["placement"],
+                &[
+                    (
+                        "placement",
+                        json!({ "type": "string", "enum": ["left", "right", "top", "bottom", "maximize", "minimize", "restore"] }),
+                    ),
+                    (
+                        "monitor",
+                        json!({ "type": "integer", "description": "Перенести на этот монитор: 1 — основной, дальше слева направо. Без него — где окно сейчас" }),
+                    ),
+                ],
+                &[],
             ),
         )
     }
 
     fn assess(&self, args: &Value) -> Result<Assessment, ToolError> {
         let w = self.0.target(args)?;
-        let (_, where_) = placement(arg_str(args, "placement")?)?;
+        let monitor = args.get("monitor").and_then(Value::as_u64);
+        let raw = arg_str_opt(args, "placement").unwrap_or("");
+        if raw.is_empty() && monitor.is_none() {
+            return Err(ToolError::BadArguments(
+                "нужно placement или monitor".into(),
+            ));
+        }
+        let mut where_ = String::new();
+        if let Some(m) = monitor {
+            where_.push_str(&format!("на монитор {m}"));
+        }
+        if !raw.is_empty() {
+            let (_, w2) = placement(raw)?;
+            if !where_.is_empty() {
+                where_.push_str(", ");
+            }
+            where_.push_str(w2);
+        }
         Ok(Assessment::new(
             RiskLevel::Low,
             "Переставить окно",
@@ -1047,11 +1071,24 @@ impl Tool for ArrangeWindowTool {
         _c: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let w = self.0.target(&args)?;
-        let (p, where_) = placement(arg_str(&args, "placement")?)?;
-        self.0.windows.place(w.id, p).map_err(failed)?;
+        let mut done = Vec::new();
+        if let Some(m) = args.get("monitor").and_then(Value::as_u64) {
+            self.0
+                .windows
+                .to_monitor(w.id, m as usize)
+                .map_err(failed)?;
+            done.push(format!("на мониторе {m}"));
+        }
+        let raw = arg_str_opt(&args, "placement").unwrap_or("");
+        if !raw.is_empty() {
+            let (p, where_) = placement(raw)?;
+            self.0.windows.place(w.id, p).map_err(failed)?;
+            done.push(where_.to_string());
+        }
         Ok(ToolOutput::new(format!(
-            "Окно {} теперь {where_}.",
-            label(&w)
+            "Окно {} теперь {}.",
+            label(&w),
+            done.join(", ")
         )))
     }
 }
@@ -1321,6 +1358,28 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(*f.placed.lock(), vec![(7, Placement::Left)]);
+        let out = run(
+            &ArrangeWindowTool(e.clone()),
+            json!({"window": "notepad", "monitor": 2, "placement": "maximize"}),
+        )
+        .await
+        .unwrap()
+        .text;
+        assert!(
+            out.contains("на мониторе 2, развёрнуто") || out.contains("на мониторе 2"),
+            "{out}"
+        );
+        assert_eq!(*f.moved.lock(), vec![(7, 2)]);
+        assert_eq!(f.placed.lock().last(), Some(&(7, Placement::Maximize)));
+        assert!(run(
+            &ArrangeWindowTool(e.clone()),
+            json!({"window": "notepad", "monitor": 3})
+        )
+        .await
+        .is_err());
+        assert!(ArrangeWindowTool(e.clone())
+            .assess(&json!({"window": "notepad"}))
+            .is_err());
         assert!(ArrangeWindowTool(e)
             .assess(&json!({"placement": "sideways"}))
             .is_err());

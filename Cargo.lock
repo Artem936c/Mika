@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "mika-audio"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "cpal",
  "log",
@@ -2481,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "mika-cli"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "chrono",
  "env_logger",
@@ -2497,7 +2497,7 @@ dependencies = [
 
 [[package]]
 name = "mika-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2519,7 +2519,7 @@ dependencies = [
 
 [[package]]
 name = "mika-gui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2547,7 +2547,7 @@ dependencies = [
 
 [[package]]
 name = "mika-providers"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2565,11 +2565,12 @@ dependencies = [
 
 [[package]]
 name = "mika-tools"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arboard",
  "async-trait",
  "chrono",
+ "flate2",
  "futures",
  "log",
  "mika-core",
