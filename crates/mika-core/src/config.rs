@@ -302,6 +302,8 @@ pub struct VoiceConfig {
     /// Her tone follows her emotion: pitch and pace of the Windows voice,
     /// a line about the mood for the provider.
     pub tone_by_mood: bool,
+    /// A long reply is not read out: she says a short retelling of it.
+    pub brief_long: bool,
 }
 
 impl Default for VoiceConfig {
@@ -323,6 +325,7 @@ impl Default for VoiceConfig {
             duck_media: true,
             tts_style: String::new(),
             tone_by_mood: true,
+            brief_long: true,
         }
     }
 }
@@ -762,6 +765,7 @@ mod tests {
         assert!(!c.calendar.enabled && c.calendar.remind_min == 10);
         assert!(c.docs.folders.is_empty());
         assert!(c.voice.tone_by_mood && c.voice.tts_style.is_empty());
+        assert!(c.voice.brief_long);
         let (_d, p) = tmp();
         std::fs::write(&p, "[voice]\nspeak_replies = false\n").unwrap();
         let old = Config::load(&p).unwrap();

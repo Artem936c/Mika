@@ -52,6 +52,55 @@ fn text_arg(args: &Value) -> String {
         .to_string()
 }
 
+/// A Windows path to a file of a known kind inside a text, and the text
+/// without it. A text that only announced the file («Прикрепляю картинку:»)
+/// becomes empty.
+pub fn attachment_in(text: &str) -> Option<(String, PathBuf)> {
+    static PATH: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = PATH.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?i)[a-z]:\\[^\[\]\n"«»<>|?*]*?\.(jpe?g|png|gif|webp|bmp|mp4|mov|avi|mp3|ogg|pdf|docx?|xlsx?|pptx?|zip|rar|7z|txt)\b"#,
+        )
+        .expect("path pattern")
+    });
+    let m = re.find(text)?;
+    let path = PathBuf::from(m.as_str().trim());
+    let rest = format!("{}{}", &text[..m.start()], &text[m.end()..]);
+    let rest = rest
+        .trim()
+        .trim_matches(|c: char| c == '[' || c == ']' || c == '(' || c == ')')
+        .trim()
+        .trim_end_matches(':')
+        .trim()
+        .to_string();
+    let words: Vec<String> = rest
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect();
+    let announces = words.len() <= 4
+        && words.iter().any(|w| {
+            [
+                "прикрепл",
+                "прикреп",
+                "отправл",
+                "файл",
+                "картинк",
+                "вложени",
+                "attach",
+            ]
+            .iter()
+            .any(|stem| w.starts_with(stem))
+        });
+    let rest = if rest.is_empty() || announces {
+        String::new()
+    } else {
+        rest
+    };
+    Some((rest, path))
+}
+
 /// True when every word of the name is in the text read from the chat header.
 pub fn header_names(header: &str, contact: &str) -> bool {
     let header = plain(header);
@@ -145,7 +194,7 @@ impl MessengerSendTool {
     /// Types the text and sends it. With a file, the file goes first through
     /// the clipboard, as if pasted from Explorer: Telegram opens its sending
     /// box, the text becomes the caption, Enter sends both.
-    async fn send_here(
+    pub(crate) async fn send_here(
         &self,
         w: &WindowInfo,
         text: &str,
@@ -189,6 +238,20 @@ impl MessengerSendTool {
         Ok(())
     }
 
+    /// The text and the file to send. A small model often writes the path of
+    /// a picture into the text («[Прикрепляю картинку: C:\\…\\кот.jpg]»)
+    /// instead of `file`: such a path to an existing file becomes the file.
+    fn parts(&self, args: &Value) -> Result<(String, Option<PathBuf>), ToolError> {
+        let text = text_arg(args);
+        if let Some(file) = self.file_arg(args)? {
+            return Ok((text, Some(file)));
+        }
+        match attachment_in(&text) {
+            Some((rest, path)) if path.is_file() => Ok((rest, Some(path))),
+            _ => Ok((text, None)),
+        }
+    }
+
     /// The file to attach: a path that exists and is a file.
     fn file_arg(&self, args: &Value) -> Result<Option<PathBuf>, ToolError> {
         let Some(raw) = args
@@ -230,8 +293,7 @@ impl Tool for MessengerSendTool {
 
     fn assess(&self, args: &Value) -> Result<Assessment, ToolError> {
         let contact = arg_str(args, "contact")?;
-        let text = text_arg(args);
-        let file = self.file_arg(args)?;
+        let (text, file) = self.parts(args)?;
         if text.is_empty() && file.is_none() {
             return Err(ToolError::BadArguments(
                 "нечего отправлять: нужен text или file".into(),
@@ -268,8 +330,7 @@ impl Tool for MessengerSendTool {
         _c: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let contact = arg_str(&args, "contact")?.trim().to_string();
-        let text = text_arg(&args);
-        let file = self.file_arg(&args)?;
+        let (text, file) = self.parts(&args)?;
         let what = match &file {
             Some(f) => {
                 let name = f
@@ -507,6 +568,37 @@ mod tests {
             .assess(&json!({"contact": "А", "file": "C:\\нет\\такого.jpg"}))
             .is_err());
         assert!(t.assess(&json!({"contact": "А"})).is_err());
+    }
+
+    #[test]
+    fn a_path_written_into_the_text_is_found() {
+        let (rest, path) = attachment_in(
+            r"[Прикрепляю картинку: C:\Users\artem\Pictures\Mika\2026-11-13T15-09-06 Милый и пушистый рыжий котёнок.jpg]",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        assert!(
+            path.ends_with("2026-11-13T15-09-06 Милый и пушистый рыжий котёнок.jpg"),
+            "{path:?}"
+        );
+        let (rest, _) = attachment_in(r"Смотрите, какой кот! C:\Pics\кот.PNG").unwrap();
+        assert_eq!(rest, "Смотрите, какой кот!");
+        assert!(attachment_in("Встречаемся в 15:00 у входа").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_path_in_the_text_of_an_existing_file_is_sent_as_the_file() {
+        let (t, f) = tool();
+        let d = tempfile::tempdir().unwrap();
+        let cat = d.path().join("кот.jpg");
+        std::fs::write(&cat, b"jpg").unwrap();
+        let text = format!("[Прикрепить файл: {}]", cat.display());
+        let args = json!({"contact": "А", "text": text, "chat_open": true});
+        assert!(t.assess(&args).unwrap().target.starts_with("файл кот.jpg"));
+        run(&t, args).await.unwrap();
+        assert_eq!(*f.clip_files.lock(), vec![cat]);
+        // Nothing typed besides the paste: the announcement is not sent as text.
+        assert!(f.typed.lock().is_empty(), "{:?}", f.typed.lock());
     }
 
     #[tokio::test]

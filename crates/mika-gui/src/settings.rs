@@ -872,6 +872,15 @@ pub struct VoiceSettings {
     duck_media: bool,
     tts_style: String,
     tone_by_mood: bool,
+    brief_long: bool,
+}
+
+/// A long reply retold briefly aloud, or read out whole.
+#[tauri::command]
+pub fn set_brief_speech(ctx: CtxState<'_>, value: bool) -> Result<(), String> {
+    ctx.config.lock().voice.brief_long = value;
+    ctx.speaker.set_brief(value);
+    ctx.save_config()
 }
 
 /// The voice in words for the provider, and whether tone follows her mood.
@@ -946,6 +955,7 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
         duck_media: c.duck_media,
         tts_style: c.tts_style,
         tone_by_mood: c.tone_by_mood,
+        brief_long: c.brief_long,
     })
 }
 

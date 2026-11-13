@@ -250,6 +250,9 @@ export async function install(scenario: string) {
             vosk_bytes: 141_000_000,
             follow_up: true,
             duck_media: true,
+            tts_style: '',
+            tone_by_mood: true,
+            brief_long: true,
           };
         case 'test_microphone':
           return 'какая сегодня погода';

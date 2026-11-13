@@ -100,7 +100,10 @@ impl Tool for GenerateImageTool {
             .await
             .map_err(|e| failed(e.to_string()))?;
         Ok(
-            ToolOutput::new(format!("Картинка готова: {}", path.display()))
+            ToolOutput::new(format!(
+                "Картинка готова: {}. Чтобы отправить её в Telegram, вызови messenger_send с file — этим путём.",
+                path.display()
+            ))
                 .with_data(json!({ "kind": "image", "path": path.display().to_string() })),
         )
     }

@@ -67,6 +67,35 @@ pub enum AgentError {
     Cancelled,
     #[error("слишком много шагов подряд, остановилась")]
     TooManySteps,
+    #[error("модель зациклилась и повторяла одно и то же: ответ остановлен. Попробуй сказать иначе или выбери другую модель")]
+    Looping,
+}
+
+/// Longest reply text of one step, characters: past it the model is rambling.
+const MAX_REPLY: usize = 12_000;
+
+/// Whether a reply went round in circles: among its last lines only one or
+/// two different ones, or it grew past any sensible length.
+pub fn looping(text: &str) -> bool {
+    if text.chars().count() > MAX_REPLY {
+        return true;
+    }
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() < 10 {
+        return false;
+    }
+    let last = &lines[lines.len() - 10..];
+    let mut distinct: Vec<&str> = Vec::new();
+    for l in last {
+        if !distinct.contains(l) {
+            distinct.push(l);
+        }
+    }
+    distinct.len() <= 2
 }
 
 pub fn system_prompt(assistant: &AssistantConfig) -> String {
@@ -382,6 +411,11 @@ impl Agent {
         *self.provider.write() = provider;
     }
 
+    /// The model the agent talks to now.
+    pub fn provider(&self) -> Arc<dyn LlmProvider> {
+        self.provider.read().clone()
+    }
+
     /// Replaces the tool set, for example when an MCP server connects.
     pub fn set_registry(&self, registry: Arc<ToolRegistry>) {
         *self.registry.write() = registry;
@@ -638,6 +672,10 @@ impl Agent {
                         self.bus.publish(Event::EmotionCue { emotion });
                     }
                     route(self, &mut text, clean);
+                    if looping(&text) {
+                        log::warn!("the model is looping, the reply is stopped");
+                        return Err(AgentError::Looping);
+                    }
                 }
                 Some(Ok(LlmChunk::ToolCall(c))) => calls.push(c),
             }
@@ -773,6 +811,35 @@ pub fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_going_round_in_circles_is_caught() {
+        let circle = "Wait, I'll call task_plan.
+
+Actually, I'll call generate_image.
+
+"
+        .repeat(6);
+        assert!(looping(&format!(
+            "Начинаю.
+{circle}"
+        )));
+        let list: String = (1..=12)
+            .map(|i| {
+                format!(
+                    "{i}. пункт номер {i}
+"
+                )
+            })
+            .collect();
+        assert!(!looping(&list));
+        assert!(!looping(
+            "Да.
+Да.
+Да."
+        ));
+        assert!(looping(&"а".repeat(MAX_REPLY + 1)));
+    }
     use crate::gate::LowRiskOnlyGate;
     use crate::llm::{LlmStream, Role};
     use crate::tools::{EchoTool, TimeTool};

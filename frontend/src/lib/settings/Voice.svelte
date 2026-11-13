@@ -38,6 +38,7 @@
     duck_media: boolean;
     tts_style: string;
     tone_by_mood: boolean;
+    brief_long: boolean;
   }
 
   let { name }: { name: string } = $props();
@@ -85,6 +86,16 @@
       const toneByMood = mood ?? s.tone_by_mood;
       await invoke('set_voice_style', { style: s.tts_style, toneByMood });
       s.tone_by_mood = toneByMood;
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  async function setBrief(v: boolean) {
+    if (!s) return;
+    try {
+      await invoke('set_brief_speech', { value: v });
+      s.brief_long = v;
     } catch (e) {
       fail(e);
     }
@@ -335,6 +346,7 @@
     </div>
     <Switch checked={s.tts_cache} title={t('voice.cache')} sub={t('voice.cache_sub', { size: cacheSize })} onchange={setCache} />
   {/if}
+  <Switch checked={s.brief_long} title={t('voice.brief')} sub={t('voice.brief_sub')} onchange={setBrief} />
   <Switch checked={s.tone_by_mood} title={t('voice.mood')} sub={t('voice.mood_sub')} onchange={(v) => saveStyle(v)} />
   <div class="acts">
     <button class="bt" onclick={testVoice}>{t('voice.test')}</button>

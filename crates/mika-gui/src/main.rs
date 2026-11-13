@@ -200,6 +200,7 @@ fn main() {
             settings::set_docs_folders,
             settings::reindex_docs,
             settings::set_voice_style,
+            settings::set_brief_speech,
             settings::remove_vosk,
             settings::save_speech_settings,
             settings::set_microphone_enabled,

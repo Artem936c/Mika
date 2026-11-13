@@ -96,3 +96,47 @@ pub(crate) fn physical_pixels() {
 fn wide(s: &str) -> windows::core::HSTRING {
     windows::core::HSTRING::from(s)
 }
+
+#[cfg(test)]
+mod live {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use crate::sys::Windows;
+
+    /// Pastes a picture into a real window with the same code that sends one
+    /// to Telegram, and presses Enter. `MIKA_PASTE_FILE` is the picture,
+    /// `MIKA_PASTE_TITLE` and `MIKA_PASTE_PROCESS` name the window.
+    #[tokio::test]
+    #[ignore = "pastes into a real window and presses Enter"]
+    async fn live_paste_a_picture_into_a_window() {
+        let file = PathBuf::from(std::env::var("MIKA_PASTE_FILE").expect("MIKA_PASTE_FILE"));
+        let title = std::env::var("MIKA_PASTE_TITLE").expect("MIKA_PASTE_TITLE");
+        let process = std::env::var("MIKA_PASTE_PROCESS").expect("MIKA_PASTE_PROCESS");
+        let windows: Arc<dyn Windows> = Arc::new(super::wnd::WinWindows);
+        let w = windows
+            .list()
+            .into_iter()
+            .find(|w| w.title == title && w.process == process)
+            .expect("the window");
+        let ui = crate::ui::UiEnv {
+            windows,
+            ui: Arc::new(super::uia::UiaUi::new()),
+            input: Arc::new(super::input::SendInputDevice),
+            bus: mika_core::EventBus::new(8),
+            own_process: String::new(),
+            seen: Default::default(),
+            clipboard: Some(Arc::new(super::clipboard::WinClipboard)),
+            sent: Default::default(),
+        };
+        let tool = crate::messenger::MessengerSendTool(crate::screen::ScreenEnv {
+            ui,
+            screen: Arc::new(super::screen::GdiScreen),
+            enabled: Default::default(),
+            user_profile: String::new(),
+        });
+        tool.send_here(&w, "Тест Мики: картинка через буфер обмена", Some(&file))
+            .await
+            .unwrap();
+    }
+}

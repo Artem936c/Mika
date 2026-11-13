@@ -146,6 +146,35 @@ pub trait LlmProvider: Send + Sync {
     async fn stream(&self, req: LlmRequest) -> Result<LlmStream, LlmError>;
 }
 
+/// One short answer without tools: the whole text the model streams back,
+/// trimmed. `None` on an error, an empty answer or after `timeout`.
+pub async fn complete(
+    provider: &dyn LlmProvider,
+    system: &str,
+    user: &str,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    use futures::StreamExt;
+    let req = LlmRequest {
+        messages: vec![ChatMessage::system(system), ChatMessage::user(user)],
+        tools: Vec::new(),
+    };
+    let collect = async {
+        let mut stream = provider.stream(req).await.ok()?;
+        let mut text = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(LlmChunk::Text(t)) => text.push_str(&t),
+                Ok(LlmChunk::ToolCall(_)) => {}
+                Err(_) => return None,
+            }
+        }
+        let text = text.trim().to_string();
+        (!text.is_empty()).then_some(text)
+    };
+    tokio::time::timeout(timeout, collect).await.ok().flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

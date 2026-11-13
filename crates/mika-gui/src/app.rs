@@ -27,6 +27,11 @@ use tokio_util::sync::CancellationToken;
 
 pub const CONVERSATION: &str = "main";
 
+/// How a long reply is retold for the voice.
+const RETELL_PROMPT: &str = "Перескажи ответ помощника для озвучки голосом: одна-две короткие разговорные фразы, не больше 200 знаков, от первого лица, о себе в женском роде, по-русски. Главное — суть и итог. Без списков, ссылок, путей к файлам, кода и эмодзи. Ничего нового не добавляй. Ответь только пересказом.";
+/// Longest reply sent for retelling, characters.
+const RETELL_INPUT: usize = 6000;
+
 /// Locale for the Windows recognizer from the recognition language: `ru` → `ru-RU`.
 pub fn speech_locale(language: &str) -> String {
     let l = language.trim();
@@ -241,6 +246,23 @@ impl Ctx {
         agent.set_task_board(task_board);
 
         let agent = Arc::new(agent);
+        // A long reply is retold for the voice by the same model.
+        let teller = Arc::downgrade(&agent);
+        let speaker = speaker.with_summarizer(Arc::new(move |reply: String| {
+            let agent = teller.upgrade();
+            Box::pin(async move {
+                let provider = agent?.provider();
+                let reply: String = reply.chars().take(RETELL_INPUT).collect();
+                mika_core::llm::complete(
+                    provider.as_ref(),
+                    RETELL_PROMPT,
+                    &reply,
+                    std::time::Duration::from_secs(12),
+                )
+                .await
+            })
+        }));
+        speaker.set_brief(config.lock().voice.brief_long);
         let hinted = Arc::downgrade(&agent);
         agent.add_prompt_extra(Arc::new(move || {
             hinted
