@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::Deserialize;
@@ -118,6 +118,39 @@ pub fn island_hit(cursor: (i32, i32), origin: (i32, i32), scale: f64, rect: Isla
     let bottom = origin.1 as f64 + (rect.y + rect.h + HIT_PAD) * scale;
     let (cx, cy) = (cursor.0 as f64, cursor.1 as f64);
     cx >= left && cx < right && cy >= top && cy < bottom
+}
+
+/// Where Mika is about to click in another program, physical pixels
+/// `[x, y, w, h]`, and until when. The spot may lie under the island: the
+/// picture she found it on leaves her windows out (decision 0025).
+type Passing = Option<(Instant, [i32; 4])>;
+
+static PASSING: Mutex<Passing> = parking_lot::const_mutex(None);
+
+/// How long the island lets clicks through the spot of her click: the pause
+/// before the click, a UI Automation try and the click itself fit inside.
+const PASS_HOLD: Duration = Duration::from_secs(5);
+
+/// Margin around that spot, physical pixels.
+const PASS_PAD: i32 = 8;
+
+/// Mika shows where she is about to click (`Event::UiTarget`): the island lets
+/// clicks through that spot for a while, so her click lands in the window she
+/// aims at, not in the island. Elsewhere the island takes clicks as before.
+pub fn pass_clicks_at(x: i32, y: i32, w: i32, h: i32) {
+    *PASSING.lock() = Some((Instant::now() + PASS_HOLD, [x, y, w, h]));
+}
+
+/// Whether a click at `cursor` goes through the island to the spot Mika is
+/// clicking.
+fn passes_through(cursor: (i32, i32), now: Instant, passing: Passing) -> bool {
+    passing.is_some_and(|(until, [x, y, w, h])| {
+        now < until
+            && cursor.0 >= x - PASS_PAD
+            && cursor.0 < x + w + PASS_PAD
+            && cursor.1 >= y - PASS_PAD
+            && cursor.1 < y + h + PASS_PAD
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -714,7 +747,8 @@ pub fn spawn_click_through(
                 }
                 if let Some(cursor) = cursor_position() {
                     let p = *placement.lock();
-                    let inside = island_hit(cursor, p.origin, p.scale, *rect.lock());
+                    let inside = island_hit(cursor, p.origin, p.scale, *rect.lock())
+                        && !passes_through(cursor, Instant::now(), *PASSING.lock());
                     if inside_prev != Some(inside) {
                         if let Err(e) = window.set_ignore_cursor_events(!inside) {
                             log::warn!("set_ignore_cursor_events failed: {e}");
@@ -976,5 +1010,20 @@ mod tests {
     #[test]
     fn hit_with_empty_rect_is_false_outside_pad() {
         assert!(!island_hit((960, 36), (460, 0), 1.0, IslandRect::default()));
+    }
+
+    #[test]
+    fn mikas_click_goes_through_the_island_at_its_spot_only() {
+        let now = Instant::now();
+        // She clicks a 24×24 spot under the island.
+        let passing = Some((now + PASS_HOLD, [948, 24, 24, 24]));
+        assert!(passes_through((960, 36), now, passing));
+        assert!(passes_through((940, 24), now, passing));
+        // The user's click elsewhere on the island is the island's.
+        assert!(!passes_through((900, 36), now, passing));
+        assert!(!passes_through((960, 57), now, passing));
+        // Not for ever, and not before she shows a spot.
+        assert!(!passes_through((960, 36), now + PASS_HOLD, passing));
+        assert!(!passes_through((960, 36), now, None));
     }
 }

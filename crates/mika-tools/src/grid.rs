@@ -187,22 +187,54 @@ pub fn crosshair(p: &Picture, x: i64, y: i64) -> Picture {
     out
 }
 
-/// The first two whole numbers of an answer: `x=120, y=340` → (120, 340).
+/// The first two numbers of an answer, whole parts only: `x=120, y=340` and
+/// `x=120.5, y=340.0` → (120, 340). A dot always starts a fraction; a comma
+/// only before a single digit (`120,5`), since `120,340` is a pair.
 pub fn two_numbers(answer: &str) -> Option<(u32, u32)> {
-    let mut nums = answer
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse::<u32>().ok());
-    Some((nums.next()?, nums.next()?))
+    let chars: Vec<char> = answer.chars().collect();
+    let digit_at = |k: usize| chars.get(k).is_some_and(|c| c.is_ascii_digit());
+    let mut nums = Vec::new();
+    let mut i = 0;
+    while i < chars.len() && nums.len() < 2 {
+        if !digit_at(i) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while digit_at(i) {
+            i += 1;
+        }
+        if let Ok(n) = chars[start..i].iter().collect::<String>().parse::<u32>() {
+            nums.push(n);
+        }
+        let fraction = match chars.get(i) {
+            Some('.') => digit_at(i + 1),
+            Some(',') => digit_at(i + 1) && !digit_at(i + 2),
+            _ => false,
+        };
+        if fraction {
+            i += 1;
+            while digit_at(i) {
+                i += 1;
+            }
+        }
+    }
+    Some((*nums.first()?, *nums.get(1)?))
 }
 
-/// A yes or no from a model's answer; `None` when it is neither.
+/// A yes or no from a model's answer; `None` when it is neither. Marks before
+/// the first word (`**Нет**`, `«Да»`) are skipped; «не…», «no», «nope» mean no.
 pub fn yes(answer: &str) -> Option<bool> {
-    let a = answer.trim().to_lowercase();
-    let first: String = a.chars().take_while(|c| c.is_alphabetic()).collect();
+    let first: String = answer
+        .chars()
+        .skip_while(|c| !c.is_alphabetic())
+        .take_while(|c| c.is_alphabetic())
+        .flat_map(char::to_lowercase)
+        .collect();
     match first.as_str() {
         "да" | "yes" => Some(true),
-        "нет" | "no" => Some(false),
+        "no" | "nope" | "not" => Some(false),
+        w if w.starts_with("не") => Some(false),
         _ => None,
     }
 }
@@ -317,6 +349,38 @@ mod tests {
         assert!(cell(800, 600, 8, 6, 49).is_none() && cell(800, 600, 8, 6, 0).is_none());
         assert_eq!(first_number("Клетка 17."), Some(17));
         assert_eq!(first_number("нет"), None);
+    }
+
+    #[test]
+    fn only_a_plain_yes_is_yes() {
+        for a in ["Да", "да.", "**Да**", "«Да»", "\"Yes\"", " - yes, it is"] {
+            assert_eq!(yes(a), Some(true), "{a}");
+        }
+        for a in [
+            "Нет.",
+            "**Нет**",
+            "«Нет»",
+            "Не то, это поле ввода",
+            "Неверно",
+            "Nope",
+            "No, it is the input field",
+        ] {
+            assert_eq!(yes(a), Some(false), "{a}");
+        }
+        for a in ["", "  ", "может", "Ответ: да", "Дальше"] {
+            assert_eq!(yes(a), None, "{a}");
+        }
+    }
+
+    #[test]
+    fn two_numbers_drop_fractions_and_keep_pairs() {
+        assert_eq!(two_numbers("x=412.5, y=230.0"), Some((412, 230)));
+        assert_eq!(two_numbers("x = 412,5; y = 230,0"), Some((412, 230)));
+        assert_eq!(two_numbers("(412,230)"), Some((412, 230)));
+        assert_eq!(two_numbers("120 340"), Some((120, 340)));
+        assert_eq!(two_numbers("(12; 7)"), Some((12, 7)));
+        assert_eq!(two_numbers("x=412.5"), None);
+        assert_eq!(two_numbers("нет"), None);
     }
 
     #[test]

@@ -30,11 +30,12 @@ struct Inner {
 pub struct Focus(Arc<Mutex<Inner>>);
 
 impl Focus {
+    /// Starts focus, or moves the end of the running one. What waited is kept:
+    /// a focus that ran out but was not summed up yet goes on with it, and it
+    /// is listed when this one ends.
     pub fn start(&self, minutes: u64, at: i64) -> i64 {
         let until = at + minutes.clamp(1, MAX_MINUTES) as i64 * 60;
-        let mut s = self.0.lock();
-        s.until = Some(until);
-        s.held.clear();
+        self.0.lock().until = Some(until);
         until
     }
 
@@ -92,6 +93,39 @@ pub fn summary(held: &[String]) -> String {
     }
     if held.len() > 10 {
         text.push_str(&format!("\n…и ещё {}", held.len() - 10));
+    }
+    text
+}
+
+/// Notifications read out at the end of focus, at most.
+const SPOKEN_LINES: usize = 3;
+/// Longest notification read out, characters: as when one comes outside focus.
+const SPOKEN_CHARS: usize = 220;
+
+/// What she says aloud when focus ends. The texts of notifications sound only
+/// when the user lets notifications be read aloud, a few and cut short; the
+/// whole list stays in the chat.
+pub fn spoken_summary(held: &[String], read_aloud: bool) -> String {
+    if held.is_empty() {
+        return summary(held);
+    }
+    let mut text = format!("Фокус закончился. Уведомлений: {}.", held.len());
+    if !read_aloud {
+        text.push_str(" Список в чате.");
+        return text;
+    }
+    for line in held.iter().take(SPOKEN_LINES) {
+        let line = line.trim();
+        text.push(' ');
+        text.extend(line.chars().take(SPOKEN_CHARS));
+        if line.chars().count() > SPOKEN_CHARS {
+            text.push('…');
+        } else if !line.ends_with(['.', '!', '?', '…']) {
+            text.push('.');
+        }
+    }
+    if held.len() > SPOKEN_LINES {
+        text.push_str(" Остальное в чате.");
     }
     text
 }
@@ -193,6 +227,50 @@ mod tests {
         assert_eq!(f.expired(1700), None);
         assert!(summary(&held).contains("пришло 1:\n• Telegram — Аня"));
         assert!(summary(&[]).contains("ничего не пришло"));
+    }
+
+    #[test]
+    fn starting_again_keeps_what_waited() {
+        let f = Focus::default();
+        f.start(10, 1000);
+        assert!(f.hold("Telegram — Аня: привет", 1100));
+        // «Продли фокус ещё на 20 минут» while it runs.
+        assert_eq!(f.start(20, 1200), 2400);
+        assert!(f.hold("Telegram — Боря: ты где?", 1300));
+        // The start button pressed after the end, before the loop summed it up.
+        assert_eq!(f.expired(2300), None);
+        f.start(5, 2500);
+        let held = f.expired(2800).unwrap();
+        assert_eq!(held, ["Telegram — Аня: привет", "Telegram — Боря: ты где?"]);
+        // A new focus after a summed-up one starts empty.
+        f.start(5, 3000);
+        assert_eq!(f.expired(3300).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_spoken_summary_keeps_texts_quiet_unless_allowed() {
+        let long = format!("Telegram — Аня: {}", "очень ".repeat(60));
+        let held = vec![
+            "Telegram — Аня: мой пароль от почты qwerty".to_string(),
+            long.clone(),
+            "Почта — Банк: код 1234!".to_string(),
+            "Telegram — Боря: привет".to_string(),
+        ];
+        let quiet = spoken_summary(&held, false);
+        assert_eq!(quiet, "Фокус закончился. Уведомлений: 4. Список в чате.");
+        let aloud = spoken_summary(&held, true);
+        assert!(
+            aloud.starts_with(
+                "Фокус закончился. Уведомлений: 4. Telegram — Аня: мой пароль от почты qwerty. "
+            ),
+            "{aloud}"
+        );
+        assert!(aloud.contains("код 1234! "), "{aloud}");
+        assert!(!aloud.contains("Боря"), "{aloud}");
+        assert!(aloud.ends_with("Остальное в чате."), "{aloud}");
+        assert!(aloud.contains('…') && !aloud.contains(&long), "{aloud}");
+        assert!(aloud.chars().count() < 3 * SPOKEN_CHARS + 100);
+        assert_eq!(spoken_summary(&[], false), summary(&[]));
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ import {
   ISLAND_SHAPES,
   SETTINGS_SHAPE,
   islandRect,
+  noticeOf,
   opensChat,
   reduceState,
   shapeFor,
@@ -108,5 +109,32 @@ describe('opensChat', () => {
 
   it('treats a missing target as a click on the body', () => {
     expect(opensChat(null)).toBe(true);
+  });
+});
+
+describe('noticeOf', () => {
+  it('shows a fired reminder, but not a scheduled task', () => {
+    expect(noticeOf({ type: 'reminder_fired', id: 1, text: 'чайник', kind: 'remind', late_s: 0 })).toBe('чайник');
+    expect(noticeOf({ type: 'reminder_fired', id: 2, text: 'сделай', kind: 'task', late_s: 0 })).toBeNull();
+  });
+
+  it('shows her lines about a meeting, a break and the end of focus', () => {
+    expect(noticeOf({ type: 'remark', text: 'Через 10 мин: Созвон', kind: 'calendar' })).toBe('Через 10 мин: Созвон');
+    expect(noticeOf({ type: 'remark', text: 'Пора размяться', kind: 'break' })).toBe('Пора размяться');
+    expect(noticeOf({ type: 'remark', text: 'Фокус закончился. За это время ничего не пришло.', kind: 'focus' })).toBe(
+      'Фокус закончился. За это время ничего не пришло.',
+    );
+  });
+
+  it('shows only the head of the focus list', () => {
+    const text = 'Фокус закончился. За это время пришло 2:\n• Telegram — Аня: привет\n• Почта — счёт';
+    expect(noticeOf({ type: 'remark', text, kind: 'focus' })).toBe('Фокус закончился. За это время пришло 2.');
+  });
+
+  it('keeps greetings and the late-night line in the chat', () => {
+    expect(noticeOf({ type: 'remark', text: 'Уже поздно', kind: 'life' })).toBeNull();
+    expect(noticeOf({ type: 'remark', text: '  ', kind: 'calendar' })).toBeNull();
+    expect(noticeOf({ type: 'assistant_delta', text: 'привет' })).toBeNull();
+    expect(noticeOf(null)).toBeNull();
   });
 });

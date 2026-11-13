@@ -12,7 +12,9 @@ use crate::config::AssistantConfig;
 use crate::emotion::Emotion;
 use crate::events::{Event, EventBus};
 use crate::gate::{Gate, GateDecision};
-use crate::llm::{ChatMessage, LlmChunk, LlmError, LlmProvider, LlmRequest, ToolCall};
+use crate::llm::{
+    ChatMessage, LlmChunk, LlmError, LlmProvider, LlmRequest, ThoughtFilter, ToolCall,
+};
 use crate::memory::Recall;
 use crate::state::{AssistantState, StateHandle};
 use crate::storage::Db;
@@ -74,28 +76,47 @@ pub enum AgentError {
 /// Longest reply text of one step, characters: past it the model is rambling.
 const MAX_REPLY: usize = 12_000;
 
-/// Whether a reply went round in circles: among its last lines only one or
-/// two different ones, or it grew past any sensible length.
-pub fn looping(text: &str) -> bool {
-    if text.chars().count() > MAX_REPLY {
-        return true;
+/// Longest raw text of one step, characters, with reasoning and tool calls
+/// written as text. They never reach the reply, so `MAX_REPLY` does not see them,
+/// and some providers set no token limit.
+const MAX_RAW: usize = 60_000;
+
+/// How many last lines are compared to notice a loop.
+const LOOP_LINES: usize = 30;
+
+/// Whether a text goes round in circles: among its last `LOOP_LINES` finished
+/// lines only one or two different ones. Code blocks, table rows and lines
+/// without letters or digits do not count: an empty table, a checklist or a
+/// picture of symbols repeats its lines on purpose.
+fn repeating(text: &str) -> bool {
+    let finished = text.rfind('\n').map_or("", |at| &text[..at]);
+    let mut code = false;
+    let mut lines: Vec<&str> = Vec::new();
+    for line in finished.lines().map(str::trim) {
+        if line.starts_with("```") {
+            code = !code;
+            continue;
+        }
+        if code || line.starts_with('|') || !line.chars().any(char::is_alphanumeric) {
+            continue;
+        }
+        lines.push(line);
     }
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    if lines.len() < 10 {
+    if lines.len() < LOOP_LINES {
         return false;
     }
-    let last = &lines[lines.len() - 10..];
     let mut distinct: Vec<&str> = Vec::new();
-    for l in last {
+    for l in &lines[lines.len() - LOOP_LINES..] {
         if !distinct.contains(l) {
             distinct.push(l);
         }
     }
     distinct.len() <= 2
+}
+
+/// Whether a reply went round in circles or grew past any sensible length.
+pub fn looping(text: &str) -> bool {
+    text.chars().count() > MAX_REPLY || repeating(text)
 }
 
 pub fn system_prompt(assistant: &AssistantConfig) -> String {
@@ -127,94 +148,6 @@ pub fn system_prompt(assistant: &AssistantConfig) -> String {
 
 /// Longest text between `[` and `]` that can still be an emotion tag.
 const MAX_TAG: usize = 16;
-
-/// Reasoning that some models write into the reply text, as (open, close) markers:
-/// Gemma's thought channel and the `<think>` tags of Qwen and DeepSeek.
-/// Blocks that never reach the user: thoughts, and Gemma's own tool-call and
-/// tool-result tokens when it writes them into the text instead of the
-/// tool channel (`<|tool_call>[]`).
-const THOUGHT_MARKERS: &[(&str, &str)] = &[
-    ("<|channel>", "<channel|>"),
-    ("<think>", "</think>"),
-    ("<|tool_call>", "<tool_call|>"),
-    ("<|tool_response>", "<tool_response|>"),
-];
-
-/// Cuts reasoning blocks out of streamed text. A marker may arrive split across
-/// chunks, so a tail that could start one is held back.
-#[derive(Debug, Default)]
-pub struct ThoughtFilter {
-    held: String,
-    /// Index into `THOUGHT_MARKERS` of the open block.
-    inside: Option<usize>,
-}
-
-impl ThoughtFilter {
-    /// Length in bytes of the longest tail of `s` that is a proper prefix of one of `marks`.
-    fn partial_tail(s: &str, marks: &[&str]) -> usize {
-        marks
-            .iter()
-            .flat_map(|m| {
-                (1..m.len())
-                    .filter(|k| m.is_char_boundary(*k))
-                    .map(move |k| &m[..k])
-            })
-            .filter(|p| s.ends_with(p))
-            .map(str::len)
-            .max()
-            .unwrap_or(0)
-    }
-
-    pub fn push(&mut self, chunk: &str) -> String {
-        self.held.push_str(chunk);
-        let mut out = String::new();
-        loop {
-            match self.inside {
-                None => {
-                    let found = THOUGHT_MARKERS
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, (open, _))| self.held.find(open).map(|at| (at, i)))
-                        .min();
-                    if let Some((at, i)) = found {
-                        out.push_str(&self.held[..at]);
-                        self.held.drain(..at + THOUGHT_MARKERS[i].0.len());
-                        self.inside = Some(i);
-                        continue;
-                    }
-                    let opens: Vec<&str> = THOUGHT_MARKERS.iter().map(|(o, _)| *o).collect();
-                    let keep = Self::partial_tail(&self.held, &opens);
-                    let cut = self.held.len() - keep;
-                    out.push_str(&self.held[..cut]);
-                    self.held.drain(..cut);
-                    return out;
-                }
-                Some(i) => {
-                    let close = THOUGHT_MARKERS[i].1;
-                    if let Some(at) = self.held.find(close) {
-                        self.held.drain(..at + close.len());
-                        self.inside = None;
-                        continue;
-                    }
-                    let keep = Self::partial_tail(&self.held, &[close]);
-                    let cut = self.held.len() - keep;
-                    self.held.drain(..cut);
-                    return out;
-                }
-            }
-        }
-    }
-
-    /// Text still held when the stream ends; an unclosed block is dropped.
-    pub fn finish(&mut self) -> String {
-        let held = std::mem::take(&mut self.held);
-        if self.inside.take().is_some() {
-            String::new()
-        } else {
-            held
-        }
-    }
-}
 
 /// Words of a reply that promise an action without doing it: «подожди
 /// секунду», «сейчас попробую». A small model says them and ends its turn.
@@ -629,6 +562,10 @@ impl Agent {
             s = provider.stream(req) => s?,
         };
         let mut text = String::new();
+        // Everything the model streamed in this step, with the reasoning and the
+        // calls written as text that `text` never gets: a loop can hide there.
+        let mut raw = String::new();
+        let mut raw_chars = 0;
         let mut calls = Vec::new();
         let mut tags = TagFilter::default();
         let mut thoughts = ThoughtFilter::default();
@@ -667,12 +604,15 @@ impl Agent {
                 }
                 Some(Err(e)) => return Err(e.into()),
                 Some(Ok(LlmChunk::Text(t))) => {
+                    raw_chars += t.chars().count();
+                    raw.push_str(&t);
                     let (clean, cues) = tags.push(&thoughts.push(&t));
                     for emotion in cues {
                         self.bus.publish(Event::EmotionCue { emotion });
                     }
                     route(self, &mut text, clean);
-                    if looping(&text) {
+                    let raw_loop = raw_chars > MAX_RAW || (t.contains('\n') && repeating(&raw));
+                    if raw_loop || looping(&text) {
                         log::warn!("the model is looping, the reply is stopped");
                         return Err(AgentError::Looping);
                     }
@@ -819,7 +759,7 @@ mod tests {
 Actually, I'll call generate_image.
 
 "
-        .repeat(6);
+        .repeat(LOOP_LINES / 2 + 1);
         assert!(looping(&format!(
             "Начинаю.
 {circle}"
@@ -839,6 +779,29 @@ Actually, I'll call generate_image.
 Да."
         ));
         assert!(looping(&"а".repeat(MAX_REPLY + 1)));
+    }
+
+    #[test]
+    fn lines_repeated_on_purpose_are_not_a_loop() {
+        let replies = [
+            format!("| День | Дело |\n|---|---|\n{}", "|  |  |\n".repeat(40)),
+            "- [ ]\n".repeat(40),
+            format!("```\n{}```\n", "# # # #\n # # # #\n".repeat(20)),
+            format!("```\n{}```\n", "x = 1\n".repeat(40)),
+            "# # # #\n # # # #\n".repeat(20),
+            "Я молодец!\n".repeat(20),
+            format!("Вот таблица:\n{}Заполняй.\n", "|  |  |\n".repeat(12)),
+        ];
+        for reply in replies {
+            assert!(!looping(&reply), "{reply}");
+        }
+    }
+
+    #[test]
+    fn an_unfinished_last_line_does_not_count() {
+        let lines = "Wait, I'll call task_plan.\n".repeat(LOOP_LINES - 1);
+        assert!(!repeating(&format!("{lines}Wait, I'll call task_plan.")));
+        assert!(repeating(&format!("{lines}Wait, I'll call task_plan.\n")));
     }
     use crate::gate::LowRiskOnlyGate;
     use crate::llm::{LlmStream, Role};
@@ -995,6 +958,53 @@ Actually, I'll call generate_image.
         let (a, _rx, _) = agent(p.clone());
         a.handle("x", CancellationToken::new()).await.unwrap();
         assert!(tool_results(&p.requests.lock()[1])[0].contains("неверные аргументы"));
+    }
+
+    #[tokio::test]
+    async fn a_loop_inside_an_unclosed_thought_block_is_stopped() {
+        let mut script = vec![text("<|channel>thought\n")];
+        for _ in 0..LOOP_LINES {
+            script.push(text("Wait, I'll call task_plan.\n"));
+            script.push(text("Actually, I'll call generate_image.\n"));
+        }
+        let (a, _rx, _) = agent(FakeProvider::new(vec![Some(script)]));
+        assert_eq!(
+            a.handle("x", CancellationToken::new()).await,
+            Err(AgentError::Looping)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_endless_answer_out_of_sight_is_stopped() {
+        // Calls written as text are held back from the reply until the stream ends.
+        let calls: Script =
+            std::iter::once(text("[{\"name\": \"echo\", \"arguments\": {\"text\": \""))
+                .chain((0..MAX_RAW / 10).map(|i| text(&format!("слово {i:>4} "))))
+                .collect();
+        // So is an unclosed thought block, line after different line.
+        let thinking: Script = std::iter::once(text("<think>"))
+            .chain((0..MAX_RAW / 100).map(|i| text(&format!("{i:>4}: {}\n", "думаю ".repeat(16)))))
+            .collect();
+        for script in [calls, thinking] {
+            let (a, _rx, _) = agent(FakeProvider::new(vec![Some(script)]));
+            assert_eq!(
+                a.handle("x", CancellationToken::new()).await,
+                Err(AgentError::Looping)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn long_reasoning_before_an_answer_is_not_a_loop() {
+        let script: Script = std::iter::once(text("<think>"))
+            .chain((0..200).map(|i| text(&format!("Шаг {i}: проверяю вариант {i}.\n"))))
+            .chain([text("</think>Ответ: 42.")])
+            .collect();
+        let (a, _rx, _) = agent(FakeProvider::new(vec![Some(script)]));
+        assert_eq!(
+            a.handle("x", CancellationToken::new()).await,
+            Ok("Ответ: 42.".into())
+        );
     }
 
     struct DenyAll;
@@ -1328,38 +1338,6 @@ Actually, I'll call generate_image.
             filter(&["[", "wink", "]", " ", "Ха"]),
             ("Ха".into(), vec![Emotion::Wink])
         );
-    }
-
-    fn thoughts(chunks: &[&str]) -> String {
-        let mut f = ThoughtFilter::default();
-        let mut out: String = chunks.iter().map(|c| f.push(c)).collect();
-        out.push_str(&f.finish());
-        out
-    }
-
-    #[test]
-    fn thought_blocks_are_cut_even_when_split() {
-        assert_eq!(
-            thoughts(&["<|channel>thought\nсчитаю…<channel|>Ответ: 51"]),
-            "Ответ: 51"
-        );
-        assert_eq!(
-            thoughts(&["Сейчас <|chan", "nel>thought думаю<chan", "nel|> готово"]),
-            "Сейчас  готово"
-        );
-        assert_eq!(thoughts(&["<think>план</think>Привет"]), "Привет");
-        assert_eq!(thoughts(&["<|channel>thought и обрыв"]), "");
-        assert_eq!(
-            thoughts(&["<|tool_call>[]"]),
-            "",
-            "an unclosed block is dropped"
-        );
-        assert_eq!(
-            thoughts(&["a < b и <think"]),
-            "a < b и <think",
-            "a lone prefix comes back at the end"
-        );
-        assert_eq!(thoughts(&["обычный текст"]), "обычный текст");
     }
 
     #[test]

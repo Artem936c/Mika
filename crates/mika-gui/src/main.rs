@@ -43,6 +43,8 @@ fn spawn_notifier(app: tauri::AppHandle, bus: EventBus, ctx: Arc<app::Ctx>) {
                     tray::show_state(&app, &name, to);
                 }
                 Ok(Event::UiTarget { x, y, w, h }) => {
+                    // First, before the frame waits for the main thread.
+                    window::pass_clicks_at(x, y, w, h);
                     if let Err(e) = window::flash_target(&app, x, y, w, h) {
                         log::warn!("target frame failed: {e}");
                     }

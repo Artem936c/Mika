@@ -8,7 +8,7 @@
   import { bubbleFor, lingerMs, type Bubble } from './lib/bubble';
   import { reducePending, type Pending } from './lib/confirm';
   import { t } from './lib/i18n';
-  import { reduceState, type AssistantState } from './lib/island';
+  import { noticeOf, reduceState, type AssistantState } from './lib/island';
 
   let current = $state<AssistantState>('idle');
   let emotion = $state<Emotion>('neutral');
@@ -42,8 +42,9 @@
     if (e?.type === 'assistant_delta' && typeof e.text === 'string') reply += e.text;
     if (e?.type === 'tool_started' && typeof e.summary === 'string') work = e.summary;
     if (e?.type === 'tool_finished') work = '';
-    if (e?.type === 'reminder_fired' && typeof e.text === 'string' && (payload as { kind?: string }).kind !== 'task') {
-      lingering = e.text;
+    const noticed = noticeOf(payload);
+    if (noticed !== null) {
+      lingering = noticed;
       clearTimeout(lingerTimer);
       lingerTimer = setTimeout(() => (lingering = ''), lingerMs(lingering));
     }

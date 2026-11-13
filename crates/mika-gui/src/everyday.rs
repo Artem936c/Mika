@@ -2,8 +2,9 @@
 //! keeps up for the user, the morning summary.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use mika_core::config::CALENDAR_SECRET_KEY;
 use mika_core::AssistantState;
 use mika_tools::notify::{is_messenger, is_private, Toast, ToastReader};
 
@@ -13,6 +14,8 @@ use crate::app::Ctx;
 const NOTIFY_EVERY: Duration = Duration::from_secs(2);
 /// How often the summary time is checked.
 const BRIEFING_EVERY: Duration = Duration::from_secs(30);
+/// How long the summary waits for the first read of the calendar link.
+const CALENDAR_WAIT: Duration = Duration::from_secs(300);
 /// The summary waits for someone at the computer: input within this time.
 const PRESENT_S: u64 = 120;
 /// Longest text said aloud for one notification, characters.
@@ -67,6 +70,20 @@ pub fn briefing_task(city: &str, calendar: bool) -> String {
         "Утренняя сводка. Коротко и тепло, по пунктам: поздоровайся; {weather}; {meetings}дела на сегодня (todo_list) и напоминания (reminder_list); \
 курс доллара и евро; три главные новости по одной строке. Если что-то не узнать, пропусти без извинений. Вопросов в конце не задавай."
     )
+}
+
+/// Whether the summary lists meetings, or `None` while it waits for the first
+/// read of the calendar link: at start-up the calendar is read a little later
+/// than the summary is due. After `CALENDAR_WAIT` it goes without meetings.
+pub(crate) fn briefing_calendar(
+    calendar_on: bool,
+    read_once: bool,
+    waited: Duration,
+) -> Option<bool> {
+    if !calendar_on || read_once {
+        return Some(calendar_on);
+    }
+    (waited >= CALENDAR_WAIT).then_some(false)
 }
 
 /// Seconds since the last key press or mouse move in this session.
@@ -150,7 +167,8 @@ impl Ctx {
             return;
         }
         self.publish_notification(t);
-        if read_aloud && self.speaker.get() {
+        // Muted Windows hears nothing: the synthesizer is not asked for silence.
+        if read_aloud && crate::rhythm::speaks(&self.speaker) {
             self.voice.speak(&spoken(t));
         }
     }
@@ -171,13 +189,18 @@ impl Ctx {
     pub fn start_briefing(self: &Arc<Self>) {
         let me = Arc::downgrade(self);
         tauri::async_runtime::spawn(async move {
+            let mut waiting: Option<Instant> = None;
             loop {
                 tokio::time::sleep(BRIEFING_EVERY).await;
                 let Some(ctx) = me.upgrade() else { break };
                 let now = chrono::Local::now().naive_local();
-                let (due, city) = {
+                let (due, city, calendar_on) = {
                     let c = ctx.config.lock();
-                    (c.briefing.due(now), c.island.city.clone())
+                    (
+                        c.briefing.due(now),
+                        c.island.city.clone(),
+                        c.calendar.enabled,
+                    )
                 };
                 let focused = ctx
                     .tool_env()
@@ -191,7 +214,20 @@ impl Ctx {
                 {
                     continue;
                 }
-                let calendar = ctx.tool_env().shared.calendar.connected();
+                // The same test as the calendar reader's: on, with a link.
+                let calendar_on = calendar_on
+                    && ctx
+                        .secrets
+                        .get(CALENDAR_SECRET_KEY)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|s| !s.expose().trim().is_empty());
+                let waited = waiting.get_or_insert_with(Instant::now).elapsed();
+                let read_once = ctx.tool_env().shared.calendar.connected();
+                let Some(calendar) = briefing_calendar(calendar_on, read_once, waited) else {
+                    continue;
+                };
+                waiting = None;
                 ctx.config.lock().briefing.last_date = now.date().format("%Y-%m-%d").to_string();
                 if let Err(e) = ctx.save_config() {
                     log::warn!("cannot save config: {e}");
@@ -247,5 +283,21 @@ mod tests {
         assert!(!briefing_task("", false).contains("calendar_events"));
         assert!(briefing_task("", true)
             .contains("встречи из календаря на сегодня (calendar_events); дела"));
+    }
+
+    #[test]
+    fn the_summary_waits_for_the_first_calendar_read() {
+        let start = Duration::ZERO;
+        // On, with a link, not read yet: wait instead of going without meetings.
+        assert_eq!(briefing_calendar(true, false, start), None);
+        assert_eq!(
+            briefing_calendar(true, false, CALENDAR_WAIT - Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(briefing_calendar(true, true, start), Some(true));
+        assert_eq!(briefing_calendar(false, false, start), Some(false));
+        assert_eq!(briefing_calendar(false, true, start), Some(false));
+        // The link never answers: the summary goes on its own.
+        assert_eq!(briefing_calendar(true, false, CALENDAR_WAIT), Some(false));
     }
 }

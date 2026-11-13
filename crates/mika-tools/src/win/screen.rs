@@ -5,7 +5,7 @@ use windows::Globalization::Language;
 use windows::Graphics::Imaging::BitmapDecoder;
 use windows::Media::Ocr::OcrEngine;
 use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
     ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER,
@@ -13,11 +13,15 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::Com::COINIT_MULTITHREADED;
+use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, GetWindowRect, IsIconic, SM_CXSCREEN, SM_CYSCREEN,
+    GetAncestor, GetSystemMetrics, GetWindowDisplayAffinity, GetWindowLongW, GetWindowRect,
+    IsIconic, IsWindowVisible, SetWindowDisplayAffinity, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
+    SM_CXSCREEN, SM_CYSCREEN, WDA_EXCLUDEFROMCAPTURE, WDA_NONE, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
 };
 
 use super::with_com;
+use super::wnd::{process_id, top_level};
 use crate::sys::{OcrWord, Screen, Shot};
 
 pub struct GdiScreen;
@@ -61,8 +65,191 @@ impl Drop for Gdi {
     }
 }
 
+/// Keeps this process's windows (the island, the avatar, the click frame) out
+/// of screen captures while it lives; the monitor still shows them. A picture
+/// for clicking must show the window under them, not Mika's own text.
+struct OwnWindowsHidden {
+    hidden: Vec<HWND>,
+    /// Visible windows of this process that Windows would not leave out: the
+    /// picture shows them, so they are painted over.
+    shown: Vec<HWND>,
+}
+
+impl OwnWindowsHidden {
+    fn new() -> Self {
+        // SAFETY: plain query.
+        let own = unsafe { GetCurrentProcessId() };
+        let (mut hidden, mut shown) = (Vec::new(), Vec::new());
+        for h in top_level() {
+            if process_id(h) != own {
+                continue;
+            }
+            // SAFETY: plain calls on a window of this process; a closed one just fails.
+            unsafe {
+                if !IsWindowVisible(h).as_bool() {
+                    continue;
+                }
+                let mut now = 0u32;
+                if GetWindowDisplayAffinity(h, &mut now).is_err() {
+                    shown.push(h);
+                    continue;
+                }
+                // Already kept out of captures, or shown black in them.
+                if now != WDA_NONE.0 {
+                    continue;
+                }
+                match SetWindowDisplayAffinity(h, WDA_EXCLUDEFROMCAPTURE) {
+                    Ok(()) => hidden.push(h),
+                    Err(e) => {
+                        log::warn!(
+                            "own window stays in the capture, painted over: {}",
+                            e.message()
+                        );
+                        shown.push(h);
+                    }
+                }
+            }
+        }
+        if !hidden.is_empty() {
+            // The next composed frame leaves them out.
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        Self { hidden, shown }
+    }
+}
+
+impl Drop for OwnWindowsHidden {
+    fn drop(&mut self) {
+        for h in &self.hidden {
+            // SAFETY: undoes the change made in `new` on a window of this process.
+            let _ = unsafe { SetWindowDisplayAffinity(*h, WDA_NONE) };
+        }
+    }
+}
+
+/// Whether a window of this process with these extended styles would take a
+/// click Mika makes where it lies. Her topmost windows let it through: the
+/// avatar and the click frame always, the island at the spot of the click,
+/// which the app keeps clear while she clicks (`Event::UiTarget`). Her
+/// ordinary window (the island turned into a window) takes it.
+fn takes_own_click(ex_style: u32) -> bool {
+    ex_style & (WS_EX_TRANSPARENT.0 | WS_EX_TOPMOST.0) == 0
+}
+
+/// Side of the squares checked for a cover, picture pixels.
+const COVER_CELL: u32 = 8;
+/// Colour of the parts of a window that lie under another program's window.
+const COVER_GREY: u8 = 128;
+
+/// Paints grey every square of the picture whose middle `covered` names as
+/// someone else's. Returns how many squares were painted.
+fn paint_covered(
+    rgb: &mut [u8],
+    width: u32,
+    height: u32,
+    mut covered: impl FnMut(u32, u32) -> bool,
+) -> usize {
+    let mut painted = 0;
+    for y0 in (0..height).step_by(COVER_CELL as usize) {
+        for x0 in (0..width).step_by(COVER_CELL as usize) {
+            let (x1, y1) = ((x0 + COVER_CELL).min(width), (y0 + COVER_CELL).min(height));
+            if !covered((x0 + x1) / 2, (y0 + y1) / 2) {
+                continue;
+            }
+            painted += 1;
+            for y in y0..y1 {
+                let row = ((y * width + x0) * 3) as usize;
+                rgb[row..row + ((x1 - x0) * 3) as usize].fill(COVER_GREY);
+            }
+        }
+    }
+    painted
+}
+
+fn overlaps(a: &RECT, b: &RECT) -> bool {
+    a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+}
+
+fn holds(r: &RECT, p: POINT) -> bool {
+    p.x >= r.left && p.x < r.right && p.y >= r.top && p.y < r.bottom
+}
+
+/// Whether the point of the target is covered: by a window of Mika's that is
+/// in the way, or by another program's window that takes the click there
+/// (`theirs_at`, asked only inside `others`).
+fn covered_at(
+    p: POINT,
+    mine: &[RECT],
+    others: &[RECT],
+    theirs_at: impl FnOnce(POINT) -> bool,
+) -> bool {
+    mine.iter().any(|r| holds(r, p)) || (others.iter().any(|r| holds(r, p)) && theirs_at(p))
+}
+
+/// Paints over the parts of `target` that other windows cover on the screen:
+/// a click there lands in them, and their content is neither the target's text
+/// to click nor the target's picture for the vision model. Other programs'
+/// windows that let clicks through (hidden panels, transparent overlays) and
+/// the target's own pop-ups do not count. Mika's windows count when the
+/// picture shows them (`shown`) or when they would take the click.
+fn paint_over_others(
+    target: HWND,
+    rgb: &mut [u8],
+    (width, height): (u32, u32),
+    factor: f32,
+    origin: (i32, i32),
+    shown: &[HWND],
+) {
+    // SAFETY: plain queries on window handles; a closed window just fails.
+    unsafe {
+        let own = GetCurrentProcessId();
+        let theirs = process_id(target);
+        let mut area = RECT::default();
+        if GetWindowRect(target, &mut area).is_err() {
+            return;
+        }
+        let (mut mine, mut others) = (Vec::new(), Vec::new());
+        for h in top_level() {
+            if h == target {
+                break;
+            }
+            let pid = process_id(h);
+            if pid == theirs || !IsWindowVisible(h).as_bool() {
+                continue;
+            }
+            let mut r = RECT::default();
+            if GetWindowRect(h, &mut r).is_err() || !overlaps(&r, &area) {
+                continue;
+            }
+            if pid != own {
+                others.push(r);
+            } else if shown.contains(&h) || takes_own_click(GetWindowLongW(h, GWL_EXSTYLE) as u32) {
+                mine.push(r);
+            }
+        }
+        if mine.is_empty() && others.is_empty() {
+            return;
+        }
+        let painted = paint_covered(rgb, width, height, |x, y| {
+            let p = POINT {
+                x: origin.0 + (x as f32 * factor) as i32,
+                y: origin.1 + (y as f32 * factor) as i32,
+            };
+            covered_at(p, &mine, &others, |p| {
+                let root = GetAncestor(WindowFromPoint(p), GA_ROOT);
+                let pid = process_id(root);
+                root != target && pid != theirs && pid != own
+            })
+        });
+        if painted > 0 {
+            log::debug!("capture: {painted} squares under other windows painted over");
+        }
+    }
+}
+
 /// Pixels as RGB, the picture size, the shrink factor and the screen position
-/// of the top left corner.
+/// of the top left corner. Taken `from_screen`, the picture leaves out Mika's
+/// windows and paints over other programs' windows lying on the target.
 #[allow(clippy::type_complexity)]
 fn grab(
     window: Option<u64>,
@@ -116,7 +303,12 @@ fn grab(
             && hwnd.is_some_and(|h| {
                 PrintWindow(h, full_dc, PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT)).as_bool()
             });
+        let mut shown = Vec::new();
         if !printed {
+            let hidden = from_screen.then(OwnWindowsHidden::new);
+            if let Some(h) = &hidden {
+                shown.clone_from(&h.shown);
+            }
             BitBlt(
                 full_dc,
                 0,
@@ -191,6 +383,16 @@ fn grab(
         let mut rgb = Vec::with_capacity(out_w as usize * out_h as usize * 3);
         for [b, g, r, _] in bgra.as_chunks::<4>().0 {
             rgb.extend_from_slice(&[*r, *g, *b]);
+        }
+        if let (true, Some(h)) = (from_screen, hwnd) {
+            paint_over_others(
+                h,
+                &mut rgb,
+                (out_w as u32, out_h as u32),
+                factor,
+                origin,
+                &shown,
+            );
         }
         Ok((rgb, out_w as u32, out_h as u32, factor, origin))
     }
@@ -325,6 +527,7 @@ impl Screen for GdiScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::WS_EX_LAYERED;
 
     #[test]
     fn fit_keeps_small_pictures_and_shrinks_large_ones() {
@@ -363,6 +566,69 @@ mod tests {
         let apps = super::super::audio::CoreAudioVolume.apps();
         println!("mixer: {apps:?}");
         assert!(apps.is_ok());
+    }
+
+    #[test]
+    fn squares_under_other_windows_are_painted_over() {
+        // 20×10: the right half belongs to another window.
+        let (w, h) = (20u32, 10u32);
+        let mut rgb = vec![0u8; (w * h * 3) as usize];
+        let mut asked = Vec::new();
+        let painted = paint_covered(&mut rgb, w, h, |x, y| {
+            asked.push((x, y));
+            x >= 10
+        });
+        // Squares of 8: columns 0–7, 8–15, 16–19; rows 0–7, 8–9.
+        assert_eq!(
+            asked,
+            vec![(4, 4), (12, 4), (18, 4), (4, 9), (12, 9), (18, 9)]
+        );
+        assert_eq!(painted, 4);
+        let px = |x: u32, y: u32| rgb[((y * w + x) * 3) as usize];
+        assert_eq!(
+            (px(7, 0), px(8, 0), px(19, 9), px(0, 9)),
+            (0, COVER_GREY, COVER_GREY, 0)
+        );
+        let r = |l, t, rr, b| RECT {
+            left: l,
+            top: t,
+            right: rr,
+            bottom: b,
+        };
+        assert!(overlaps(&r(0, 0, 10, 10), &r(9, 9, 20, 20)));
+        assert!(!overlaps(&r(0, 0, 10, 10), &r(10, 0, 20, 10)));
+        assert!(holds(&r(0, 0, 10, 10), POINT { x: 0, y: 9 }));
+        assert!(!holds(&r(0, 0, 10, 10), POINT { x: 10, y: 5 }));
+    }
+
+    #[test]
+    fn mikas_windows_in_the_way_are_painted_over_too() {
+        let r = |l, t, rr, b| RECT {
+            left: l,
+            top: t,
+            right: rr,
+            bottom: b,
+        };
+        let at = |x, y| POINT { x, y };
+        // Her window in the way covers the point whoever takes the click.
+        let mine = [r(0, 0, 100, 50)];
+        assert!(covered_at(at(10, 10), &mine, &[], |_| unreachable!()));
+        assert!(!covered_at(at(10, 60), &mine, &[], |_| unreachable!()));
+        // Another program's window covers it only where it takes the click.
+        let others = [r(0, 0, 100, 100)];
+        assert!(covered_at(at(10, 60), &mine, &others, |_| true));
+        assert!(!covered_at(at(10, 60), &mine, &others, |_| false));
+        assert!(!covered_at(at(200, 60), &mine, &others, |_| unreachable!()));
+
+        // Her ordinary window takes the click; topmost or click-through ones
+        // (the island, the avatar, the frame) let it through.
+        assert!(takes_own_click(0));
+        assert!(takes_own_click(WS_EX_LAYERED.0));
+        assert!(!takes_own_click(WS_EX_TOPMOST.0 | WS_EX_LAYERED.0));
+        assert!(!takes_own_click(WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0));
+        assert!(!takes_own_click(
+            WS_EX_TOPMOST.0 | WS_EX_TRANSPARENT.0 | WS_EX_LAYERED.0
+        ));
     }
 
     #[test]

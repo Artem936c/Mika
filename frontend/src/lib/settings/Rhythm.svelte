@@ -3,6 +3,7 @@
   import { onDestroy, onMount } from 'svelte';
   import Switch from '../Switch.svelte';
   import { t } from '../i18n';
+  import { calendarArgs, linkAfterSave, rhythmArgs, uniqueFolders, withFolder, withoutFolder, type Rhythm } from '../rhythm';
 
   interface DocsStatus {
     files: number;
@@ -15,7 +16,7 @@
   }
 
   interface RhythmSettings {
-    rhythm: { breaks: boolean; break_every_min: number; lively: boolean };
+    rhythm: Rhythm;
     tracking: { app_time: boolean; clipboard: boolean };
     clip_count: number;
     focus_left_s: number | null;
@@ -37,17 +38,21 @@
   let error = $state('');
   let timer: ReturnType<typeof setInterval> | undefined;
 
+  // A folder written twice in config.toml must not break the keyed list.
+  const folders = $derived(s ? uniqueFolders(s.docs_folders) : []);
+
   onMount(() => {
     load();
     // Focus time and the reading of documents move while the page is open.
-    timer = setInterval(load, 3000);
+    timer = setInterval(() => load(), 3000);
   });
   onDestroy(() => clearInterval(timer));
 
-  async function load() {
+  /** `sync`: the number fields take the saved values. Not on each poll: the user may be typing. */
+  async function load(sync = false) {
     try {
       const fresh = await invoke<RhythmSettings>('get_rhythm_settings');
-      if (!s) {
+      if (!s || sync) {
         every = fresh.rhythm.break_every_min;
         remind = fresh.remind_min;
       }
@@ -57,42 +62,57 @@
     }
   }
 
-  async function run(command: string, args: Record<string, unknown> = {}) {
+  /** True when the command went through. */
+  async function run(command: string, args: Record<string, unknown> = {}): Promise<boolean> {
     try {
       await invoke(command, args);
-      error = '';
-      await load();
     } catch (e) {
       error = String(e);
+      return false;
     }
+    error = '';
+    // The core clamps the minutes: the fields show what it kept.
+    await load(true);
+    return true;
+  }
+
+  function setRhythm(change: Partial<Rhythm>) {
+    if (!s) return;
+    run('set_rhythm', rhythmArgs(s.rhythm, every, change));
   }
 
   // Tauri takes command arguments in camelCase.
-  function setRhythm(change: Partial<RhythmSettings['rhythm']>) {
-    if (!s) return;
-    const r = { ...s.rhythm, break_every_min: every, ...change };
-    run('set_rhythm', { breaks: r.breaks, breakEveryMin: r.break_every_min, lively: r.lively });
-  }
-
   function setTracking(change: Partial<RhythmSettings['tracking']>) {
     if (!s) return;
     const r = { ...s.tracking, ...change };
     run('set_tracking', { appTime: r.app_time, clipboard: r.clipboard });
   }
 
-  function saveCalendar(enabled: boolean) {
-    const url = calendarUrl.trim();
-    run('save_calendar', { enabled, remindMin: remind, url: url ? url : null });
-    calendarUrl = '';
+  async function saveCalendar(enabled: boolean) {
+    if (!s) return;
+    const sent = calendarUrl;
+    const saved = await run('save_calendar', calendarArgs(enabled, remind, s.remind_min, sent));
+    calendarUrl = linkAfterSave(saved, sent, calendarUrl);
   }
 
-  function setFolders(folders: string[]) {
-    run('set_docs_folders', { folders });
+  // One change of the folders at a time: each sends the whole list, and a
+  // network folder may take a while to answer.
+  let savingFolders = $state(false);
+
+  async function setFolders(next: string[]) {
+    if (savingFolders) return;
+    savingFolders = true;
+    try {
+      await run('set_docs_folders', { folders: uniqueFolders(next) });
+    } finally {
+      savingFolders = false;
+    }
   }
 
   function addFolder() {
-    if (!s || !newFolder.trim()) return;
-    setFolders([...s.docs_folders, newFolder.trim()]);
+    if (!s || savingFolders) return;
+    const next = withFolder(s.docs_folders, newFolder);
+    if (next) setFolders(next);
     newFolder = '';
   }
 
@@ -129,9 +149,8 @@
     {/if}
     <Switch checked={s.rhythm.lively} title={t('tools.lively')} sub={t('tools.lively_sub')} onchange={(v) => setRhythm({ lively: v })} />
     <Switch checked={s.tracking.app_time} title={t('tools.app_time')} sub={t('tools.app_time_sub')} onchange={(v) => setTracking({ app_time: v })} />
-    {#if s.tracking.app_time}
-      <div class="line"><button class="bt" onclick={() => run('clear_app_time')}>{t('tools.app_time_clear')}</button></div>
-    {/if}
+    <!-- Turning counting off keeps what was counted: it can be wiped either way. -->
+    <div class="line"><button class="bt" onclick={() => run('clear_app_time')}>{t('tools.app_time_clear')}</button></div>
     <Switch checked={s.tracking.clipboard} title={t('tools.clipboard')} sub={t('tools.clipboard_sub')} onchange={(v) => setTracking({ clipboard: v })} />
     {#if s.tracking.clipboard}
       <div class="line time">
@@ -173,18 +192,18 @@
   <div class="lbl">{t('tools.docs')}</div>
   <p class="hint">{t('tools.docs_sub')}</p>
   <div class="folders">
-    {#each s.docs_folders as f (f)}
+    {#each folders as f (f)}
       <div class="folder">
         <span class="path">{f}</span>
-        <button class="bt small" onclick={() => s && setFolders(s.docs_folders.filter((x) => x !== f))}>{t('tools.docs_remove')}</button>
+        <button class="bt small" disabled={savingFolders} onclick={() => s && setFolders(withoutFolder(s.docs_folders, f))}>{t('tools.docs_remove')}</button>
       </div>
     {/each}
   </div>
   <div class="line field">
     <input class="fld" spellcheck="false" placeholder={t('tools.docs_placeholder')} bind:value={newFolder} onkeydown={(e) => e.key === 'Enter' && addFolder()} />
-    <button class="bt" onclick={addFolder}>{t('tools.docs_add')}</button>
+    <button class="bt" disabled={savingFolders} onclick={addFolder}>{t('tools.docs_add')}</button>
   </div>
-  {#if s.docs_folders.length}
+  {#if folders.length}
     <div class="line time">
       {#if s.docs.running}
         <span>

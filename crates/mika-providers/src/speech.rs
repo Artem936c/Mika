@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use mika_core::config::SPEECH_SECRET_KEY;
 use mika_core::llm::{SpeechToText, TextToSpeech};
 use mika_core::speech_cache::SoundKey;
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 
 use crate::factory::redact;
@@ -12,6 +13,11 @@ use crate::live::Live;
 
 /// Longest wait for one phrase.
 const SPEECH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Address and model of the speech providers that refused `instructions`:
+/// until the app restarts they get every phrase without them at once, not
+/// after a refused request.
+static NO_INSTRUCTIONS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// Sample rate assumed for sound that came without a header.
 const RAW_PCM_RATE: u32 = 24_000;
 
@@ -166,14 +172,29 @@ impl TextToSpeech for Live {
 impl Live {
     /// Speech with `instructions`: the voice and tone in words, as
     /// `gpt-4o-mini-tts` takes them. A provider that refuses the field gets the
-    /// request again without it.
+    /// request again without it, and later phrases go to it without it at once.
     pub async fn synthesize_with(&self, text: &str, instructions: &str) -> Result<Vec<u8>, String> {
         let instructions = instructions.trim();
+        let voice = self.speech_settings();
+        let provider = (
+            self.base(&voice.speech_base_url),
+            voice.tts_model.trim().to_string(),
+        );
+        if instructions.is_empty() || NO_INSTRUCTIONS.lock().contains(&provider) {
+            return self.speak_once(text, "").await;
+        }
         match self.speak_once(text, instructions).await {
-            Err(e) if !instructions.is_empty() && e.starts_with("синтез речи ответил 4") =>
-            {
+            Err(e) if e.starts_with("синтез речи ответил 4") => {
                 log::warn!("speech provider refused instructions, asking without them: {e}");
-                self.speak_once(text, "").await
+                let sound = self.speak_once(text, "").await;
+                // Too many requests is not a refusal of the field.
+                if sound.is_ok() && !e.starts_with("синтез речи ответил 429") {
+                    let mut refused = NO_INSTRUCTIONS.lock();
+                    if !refused.contains(&provider) {
+                        refused.push(provider);
+                    }
+                }
+                sound
             }
             other => other,
         }

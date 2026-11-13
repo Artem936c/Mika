@@ -219,6 +219,7 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
         seen: Default::default(),
         clipboard: Some(env.clipboard.clone()),
         sent: Default::default(),
+        clips: env.shared.clips.clone(),
     };
 
     if on("apps") {
@@ -316,6 +317,7 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
         reg.register(Arc::new(web::WeatherTool {
             http: env.http.clone(),
             enabled: web.clone(),
+            home: env.shared.home_city.clone(),
         }));
         reg.register(Arc::new(info::RatesTool {
             http: env.http.clone(),

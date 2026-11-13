@@ -2,7 +2,7 @@
 //! pieces of text, with vectors when an embedding model is set, and the pieces
 //! closest to a question go to the model with their file and page.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use mika_core::gate::Approval;
 use mika_core::llm::ToolSpec;
 use mika_core::memory::{cosine, decode_vector, encode_vector, Embedder};
-use mika_core::storage::rusqlite::params;
+use mika_core::storage::rusqlite::{self, params};
 use mika_core::storage::Db;
 use mika_core::tools::{arg_str, spec, Assessment, RiskLevel, Tool, ToolError, ToolOutput};
 use parking_lot::Mutex;
@@ -40,6 +40,11 @@ const MAX_CHUNKS: usize = 8000;
 /// Size of one piece, characters.
 const CHUNK: usize = 1000;
 const EMBED_BATCH: usize = 64;
+/// Longest text sent for one vector, characters: pieces read by older versions
+/// could be far longer than `CHUNK`, and the model refuses them.
+const EMBED_CHARS: usize = 2000;
+/// Known text that tells a model refusing some piece from one that answers nothing.
+const PROBE: &str = "проверка";
 /// Longest text unpacked from a DOCX, bytes.
 const MAX_XML: u64 = 50 * 1024 * 1024;
 
@@ -230,6 +235,50 @@ pub fn html_text(html: &str) -> String {
     unescape_xml(&out)
 }
 
+/// Windows-1251 letters and signs from 0x80 to 0xBF; 0xC0..0xFF are А..я in order.
+const CP1251_HIGH: [char; 64] = [
+    '\u{0402}', '\u{0403}', '\u{201A}', '\u{0453}', '\u{201E}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{20AC}', '\u{2030}', '\u{0409}', '\u{2039}', '\u{040A}', '\u{040C}', '\u{040B}', '\u{040F}',
+    '\u{0452}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{0098}', '\u{2122}', '\u{0459}', '\u{203A}', '\u{045A}', '\u{045C}', '\u{045B}', '\u{045F}',
+    '\u{00A0}', '\u{040E}', '\u{045E}', '\u{0408}', '\u{00A4}', '\u{0490}', '\u{00A6}', '\u{00A7}',
+    '\u{0401}', '\u{00A9}', '\u{0404}', '\u{00AB}', '\u{00AC}', '\u{00AD}', '\u{00AE}', '\u{0407}',
+    '\u{00B0}', '\u{00B1}', '\u{0406}', '\u{0456}', '\u{0491}', '\u{00B5}', '\u{00B6}', '\u{00B7}',
+    '\u{0451}', '\u{2116}', '\u{0454}', '\u{00BB}', '\u{0458}', '\u{0405}', '\u{0455}', '\u{0457}',
+];
+
+fn cp1251(b: u8) -> char {
+    match b {
+        0..=0x7F => b as char,
+        0x80..=0xBF => CP1251_HIGH[(b - 0x80) as usize],
+        _ => char::from_u32(0x0410 + (b - 0xC0) as u32).unwrap_or('\u{FFFD}'),
+    }
+}
+
+/// Whether bytes are UTF-8, maybe with stray damage: more letters beyond ASCII
+/// decode than bytes fail. Russian in Windows-1251 fails on nearly every letter.
+fn mostly_utf8(bytes: &[u8]) -> bool {
+    let (mut good, mut bad) = (0usize, 0usize);
+    for chunk in bytes.utf8_chunks() {
+        good += chunk.valid().chars().filter(|c| !c.is_ascii()).count();
+        bad += chunk.invalid().len();
+    }
+    bad == 0 || good > bad
+}
+
+/// Text of a plain file. A file that is not UTF-8 is read as Windows-1251:
+/// that is how Russian Excel and 1C save CSV and text.
+fn plain_text(bytes: &[u8]) -> Option<String> {
+    let text = crate::search::read_text(bytes)?;
+    if bytes.starts_with(&[0xFF, 0xFE])
+        || bytes.starts_with(&[0xEF, 0xBB, 0xBF])
+        || mostly_utf8(bytes)
+    {
+        return Some(text);
+    }
+    Some(bytes.iter().map(|&b| cp1251(b)).collect())
+}
+
 /// Pages of a document: (page number from 1, or 0 for a file without pages, text).
 pub fn extract(path: &Path) -> Result<Vec<(u32, String)>, String> {
     let ext = ext_of(path);
@@ -246,7 +295,7 @@ pub fn extract(path: &Path) -> Result<Vec<(u32, String)>, String> {
         }
         _ => {
             let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-            let text = crate::search::read_text(&bytes).ok_or("в файле не текст")?;
+            let text = plain_text(&bytes).ok_or("в файле не текст")?;
             let text = if ext.starts_with("htm") {
                 html_text(&text)
             } else {
@@ -280,15 +329,26 @@ pub fn chunks(text: &str) -> Vec<String> {
             flush(&mut cur, &mut cur_len, &mut out);
         }
         if len > CHUNK {
-            // A long paragraph is cut at spaces.
-            for word in para.split(' ') {
-                let w = word.chars().count();
-                if cur_len + w + 1 > CHUNK && cur_len > 0 {
-                    flush(&mut cur, &mut cur_len, &mut out);
+            // A long paragraph is cut at spaces, and a word longer than a piece
+            // (base64, a long link) by characters.
+            for mut word in para.split(' ') {
+                loop {
+                    let (part, rest) = match word.char_indices().nth(CHUNK) {
+                        Some((at, _)) => word.split_at(at),
+                        None => (word, ""),
+                    };
+                    let w = part.chars().count();
+                    if cur_len + w + 1 > CHUNK && cur_len > 0 {
+                        flush(&mut cur, &mut cur_len, &mut out);
+                    }
+                    cur.push_str(part);
+                    cur.push(' ');
+                    cur_len += w + 1;
+                    if rest.is_empty() {
+                        break;
+                    }
+                    word = rest;
                 }
-                cur.push_str(word);
-                cur.push(' ');
-                cur_len += w + 1;
             }
         } else {
             cur.push_str(&para);
@@ -300,13 +360,26 @@ pub fn chunks(text: &str) -> Vec<String> {
     out
 }
 
-/// Supported files under the folders: (path, modified unix seconds, size).
-fn walk(folders: &[PathBuf]) -> Vec<(PathBuf, i64, u64)> {
-    fn go(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, i64, u64)>) {
+/// What a walk over the folders found.
+struct Walk {
+    /// Supported files: (path, modified unix seconds, size).
+    files: Vec<(PathBuf, i64, u64)>,
+    /// Folders that did not open: a network drive away, a stick out.
+    unread: Vec<PathBuf>,
+}
+
+/// Whether the path lies in one of the folders.
+fn under(path: &Path, folders: &[PathBuf]) -> bool {
+    folders.iter().any(|f| path.starts_with(f))
+}
+
+fn walk(folders: &[PathBuf]) -> Walk {
+    fn go(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, i64, u64)>, unread: &mut Vec<PathBuf>) {
         if out.len() >= MAX_FILES {
             return;
         }
         let Ok(rd) = std::fs::read_dir(dir) else {
+            unread.push(dir.to_path_buf());
             return;
         };
         let mut dirs = Vec::new();
@@ -341,17 +414,20 @@ fn walk(folders: &[PathBuf]) -> Vec<(PathBuf, i64, u64)> {
             }
         }
         for d in dirs {
-            go(&d, depth - 1, out);
+            go(&d, depth - 1, out, unread);
         }
     }
-    let mut out = Vec::new();
+    let (mut files, mut unread) = (Vec::new(), Vec::new());
     for f in folders {
-        go(f, MAX_DEPTH, &mut out);
+        go(f, MAX_DEPTH, &mut files, &mut unread);
     }
-    out.sort();
-    out.dedup_by(|a, b| a.0 == b.0);
-    out
+    files.sort();
+    files.dedup_by(|a, b| a.0 == b.0);
+    Walk { files, unread }
 }
+
+/// Folders chosen right now.
+type Folders<'a> = dyn Fn() -> Vec<PathBuf> + Send + Sync + 'a;
 
 /// Where the index stands, for the settings page.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -383,7 +459,14 @@ pub struct DocIndex {
     embedder: Option<Arc<dyn Embedder>>,
     state: Arc<Mutex<IndexStatus>>,
     running: Arc<AtomicBool>,
+    /// Files that did not fit: such a file is not read again while there is
+    /// still no room for it.
+    too_big: Arc<Mutex<HashMap<String, TooBig>>>,
+    max_chunks: usize,
 }
+
+/// A file that did not fit: its (modified, size) and how many pieces it needs.
+type TooBig = ((i64, i64), usize);
 
 /// Lower case word stems: the first five letters, so «договора» finds «договор».
 fn stems(text: &str) -> Vec<String> {
@@ -405,6 +488,8 @@ impl DocIndex {
             embedder,
             state: Default::default(),
             running: Default::default(),
+            too_big: Default::default(),
+            max_chunks: MAX_CHUNKS,
         }
     }
 
@@ -437,9 +522,66 @@ impl DocIndex {
     }
 
     pub fn clear(&self) -> Result<(), String> {
+        self.too_big.lock().clear();
         self.db
             .with(|c| c.execute_batch("DELETE FROM doc_chunks; DELETE FROM doc_files;"))
             .map_err(db_err)
+    }
+
+    fn count_chunks(&self, path: Option<&str>) -> Result<usize, String> {
+        self.db
+            .with(|c| match path {
+                Some(p) => c.query_row(
+                    "SELECT COUNT(*) FROM doc_chunks WHERE path = ?1",
+                    [p],
+                    |r| r.get::<_, i64>(0),
+                ),
+                None => c.query_row("SELECT COUNT(*) FROM doc_chunks", [], |r| r.get(0)),
+            })
+            .map(|n| n as usize)
+            .map_err(db_err)
+    }
+
+    /// Drops files and their pieces, in one transaction.
+    fn forget<S: AsRef<str>>(&self, paths: &[S]) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        self.db
+            .with(|c| {
+                let tx = c.unchecked_transaction()?;
+                for p in paths {
+                    tx.execute("DELETE FROM doc_chunks WHERE path = ?1", [p.as_ref()])?;
+                    tx.execute("DELETE FROM doc_files WHERE path = ?1", [p.as_ref()])?;
+                }
+                tx.commit()
+            })
+            .map_err(db_err)
+    }
+
+    /// Follows the folders chosen right now: when they changed since `seen`,
+    /// what lies outside them leaves the index at once. Returns whether anything left.
+    fn follow(&self, current: &Folders<'_>, seen: &mut Vec<PathBuf>) -> Result<bool, String> {
+        let now = current();
+        if now == *seen {
+            return Ok(false);
+        }
+        *seen = now;
+        let paths: Vec<String> = self
+            .db
+            .with(|c| {
+                let mut st =
+                    c.prepare("SELECT path FROM doc_files UNION SELECT path FROM doc_chunks")?;
+                let rows = st.query_map([], |r| r.get(0))?;
+                rows.collect::<rusqlite::Result<_>>()
+            })
+            .map_err(db_err)?;
+        let outside: Vec<&String> = paths
+            .iter()
+            .filter(|p| !under(Path::new(p), seen))
+            .collect();
+        self.forget(&outside)?;
+        Ok(!outside.is_empty())
     }
 
     /// Reads new and changed files, drops gone ones, makes missing vectors.
@@ -449,10 +591,22 @@ impl DocIndex {
         folders: &[PathBuf],
         cancel: &CancellationToken,
     ) -> Result<String, String> {
+        self.run_with(|| folders.to_vec(), cancel).await
+    }
+
+    /// Like `run`, but `current` gives the folders chosen right now. It is asked
+    /// again before each file and each batch of vectors: a folder removed from
+    /// the settings mid-pass is not read further, its pieces leave the index,
+    /// and none of them goes to the embedding model.
+    pub async fn run_with(
+        &self,
+        current: impl Fn() -> Vec<PathBuf> + Send + Sync,
+        cancel: &CancellationToken,
+    ) -> Result<String, String> {
         if self.running.swap(true, Ordering::Relaxed) {
             return Err("индекс уже обновляется".into());
         }
-        let result = self.pass(folders, cancel).await;
+        let result = self.pass(&current, cancel).await;
         self.running.store(false, Ordering::Relaxed);
         let mut s = self.state.lock();
         s.progress = None;
@@ -463,13 +617,15 @@ impl DocIndex {
 
     async fn pass(
         &self,
-        folders: &[PathBuf],
+        current: &Folders<'_>,
         cancel: &CancellationToken,
     ) -> Result<String, String> {
-        let roots = folders.to_vec();
-        let found = tokio::task::spawn_blocking(move || walk(&roots))
+        let mut seen = current();
+        let roots = seen.clone();
+        let walked = tokio::task::spawn_blocking(move || walk(&roots))
             .await
             .map_err(|e| e.to_string())?;
+        let found = &walked.files;
         let known: HashMap<String, (i64, i64)> = self
             .db
             .with(|c| {
@@ -478,88 +634,112 @@ impl DocIndex {
                 rows.collect()
             })
             .map_err(db_err)?;
-        let here: std::collections::HashSet<String> = found
+        let here: HashSet<String> = found
             .iter()
             .map(|f| f.0.to_string_lossy().into_owned())
             .collect();
-        let gone: Vec<&String> = known.keys().filter(|p| !here.contains(*p)).collect();
-        self.db
-            .with(|c| {
-                for p in &gone {
-                    c.execute("DELETE FROM doc_chunks WHERE path = ?1", [p])?;
-                    c.execute("DELETE FROM doc_files WHERE path = ?1", [p])?;
-                }
-                Ok(())
-            })
-            .map_err(db_err)?;
-        let todo: Vec<&(PathBuf, i64, u64)> = found
+        // A folder that did not open is not a folder emptied: what the index
+        // has from it stays until it opens again or leaves the settings.
+        let gone: Vec<&String> = known
+            .keys()
+            .filter(|p| !here.contains(*p) && !under(Path::new(p), &walked.unread))
+            .collect();
+        self.forget(&gone)?;
+        self.too_big.lock().retain(|p, _| here.contains(p));
+        let mut todo: Vec<&(PathBuf, i64, u64)> = found
             .iter()
             .filter(|(p, m, s)| known.get(p.to_string_lossy().as_ref()) != Some(&(*m, *s as i64)))
             .collect();
-        let mut chunk_count: usize = self
-            .db
-            .with(|c| {
-                c.query_row("SELECT COUNT(*) FROM doc_chunks", [], |r| {
-                    r.get::<_, i64>(0)
-                })
-            })
-            .map_err(db_err)? as usize;
+        // Changed files first: they already hold room, new ones take what is left.
+        todo.sort_by_cached_key(|(p, _, _)| !known.contains_key(p.to_string_lossy().as_ref()));
+        let mut chunk_count = self.count_chunks(None)?;
         let (mut read, mut failed_files, mut full) = (0, 0, false);
         for (i, (path, modified, size)) in todo.iter().enumerate() {
             if cancel.is_cancelled() {
                 break;
             }
             self.state.lock().progress = Some((i, todo.len()));
+            if self.follow(current, &mut seen)? {
+                chunk_count = self.count_chunks(None)?;
+            }
+            if !under(path, &seen) {
+                continue;
+            }
+            let key = path.to_string_lossy().into_owned();
+            let stamp = (*modified, *size as i64);
+            let old = self.count_chunks(Some(key.as_str()))?;
+            let need = self
+                .too_big
+                .lock()
+                .get(&key)
+                .filter(|t| t.0 == stamp)
+                .map(|t| t.1);
+            if need.is_some_and(|n| chunk_count.saturating_sub(old) + n > self.max_chunks) {
+                full = true;
+                continue;
+            }
             let p = path.clone();
             let pages = tokio::task::spawn_blocking(move || extract(&p))
                 .await
                 .map_err(|e| e.to_string())?;
-            let key = path.to_string_lossy().into_owned();
             let pieces: Vec<(u32, String)> = match pages {
                 Ok(pages) => pages
                     .into_iter()
                     .flat_map(|(page, text)| chunks(&text).into_iter().map(move |t| (page, t)))
                     .collect(),
                 Err(e) => {
+                    // The file stays as it was and is read again next pass:
+                    // the reason may go away (a recognition language, a lock).
                     log::info!("document not read: {e}");
                     failed_files += 1;
-                    Vec::new()
+                    continue;
                 }
             };
-            let old: usize = self
-                .db
-                .with(|c| {
-                    c.query_row(
-                        "SELECT COUNT(*) FROM doc_chunks WHERE path = ?1",
-                        [&key],
-                        |r| r.get::<_, i64>(0),
-                    )
-                })
-                .map_err(db_err)? as usize;
-            if chunk_count - old + pieces.len() > MAX_CHUNKS {
-                full = true;
-                break;
+            // The folder may have left the settings while the file was read.
+            if self.follow(current, &mut seen)? {
+                chunk_count = self.count_chunks(None)?;
             }
-            chunk_count = chunk_count - old + pieces.len();
+            if !under(path, &seen) {
+                continue;
+            }
+            if chunk_count.saturating_sub(old) + pieces.len() > self.max_chunks {
+                full = true;
+                self.too_big
+                    .lock()
+                    .insert(key.clone(), (stamp, pieces.len()));
+                if old > 0 {
+                    // The old text of a changed file must not answer as its text now.
+                    self.forget(&[&key])?;
+                    chunk_count = chunk_count.saturating_sub(old);
+                }
+                continue;
+            }
+            self.too_big.lock().remove(&key);
+            // One transaction: one write to disk instead of one per piece, and
+            // a file is either all in the index or as it was.
             self.db
                 .with(|c| {
-                    c.execute("DELETE FROM doc_chunks WHERE path = ?1", [&key])?;
-                    for (page, text) in &pieces {
-                        c.execute(
+                    let tx = c.unchecked_transaction()?;
+                    tx.execute("DELETE FROM doc_chunks WHERE path = ?1", [&key])?;
+                    {
+                        let mut st = tx.prepare(
                             "INSERT INTO doc_chunks (path, page, text) VALUES (?1, ?2, ?3)",
-                            params![key, page, text],
                         )?;
+                        for (page, text) in &pieces {
+                            st.execute(params![key, page, text])?;
+                        }
                     }
-                    c.execute(
+                    tx.execute(
                         "INSERT OR REPLACE INTO doc_files (path, modified, size) VALUES (?1, ?2, ?3)",
-                        params![key, modified, *size as i64],
+                        params![key, stamp.0, stamp.1],
                     )?;
-                    Ok(())
+                    tx.commit()
                 })
                 .map_err(db_err)?;
+            chunk_count = chunk_count.saturating_sub(old) + pieces.len();
             read += 1;
         }
-        let embedded = self.embed_missing(cancel).await?;
+        let (embedded, refused) = self.embed_missing(current, &mut seen, cancel).await?;
         let mut report = format!(
             "Файлов в папках: {}, прочитано заново: {read}, убрано: {}.",
             found.len(),
@@ -571,73 +751,140 @@ impl DocIndex {
         if embedded > 0 {
             report.push_str(&format!(" Векторов построено: {embedded}."));
         }
+        if refused > 0 {
+            report.push_str(&format!(" Модель не приняла кусков: {refused}."));
+        }
         if full {
             report.push_str(&format!(
-                " Индекс полон ({MAX_CHUNKS} кусков): остальные файлы не вошли."
+                " Индекс полон ({} кусков): остальные файлы не вошли.",
+                self.max_chunks
             ));
         }
         Ok(report)
     }
 
-    /// Vectors for pieces that have none of the current model.
-    async fn embed_missing(&self, cancel: &CancellationToken) -> Result<usize, String> {
+    /// Vectors for pieces that have none of the current model: how many were
+    /// made, and how many pieces the model refused (they are tried next pass).
+    async fn embed_missing(
+        &self,
+        current: &Folders<'_>,
+        seen: &mut Vec<PathBuf>,
+        cancel: &CancellationToken,
+    ) -> Result<(usize, usize), String> {
         let Some((e, model)) = self.model() else {
-            return Ok(0);
+            return Ok((0, 0));
         };
         let mut done = 0;
+        // Refused pieces do not hold back the rest of this pass.
+        let mut refused: HashSet<i64> = HashSet::new();
         loop {
             if cancel.is_cancelled() {
                 break;
             }
-            let batch: Vec<(i64, String)> = self
+            // A folder removed mid-pass leaves before anything more is sent.
+            self.follow(current, seen)?;
+            let rows: Vec<(i64, String)> = self
                 .db
                 .with(|c| {
                     let mut st = c.prepare(
-                        "SELECT id, text FROM doc_chunks WHERE model IS NULL OR model != ?1 LIMIT ?2",
+                        "SELECT id, text FROM doc_chunks WHERE model IS NULL OR model != ?1 ORDER BY id LIMIT ?2",
                     )?;
-                    let rows = st.query_map(params![model, EMBED_BATCH as i64], |r| {
-                        Ok((r.get(0)?, r.get(1)?))
-                    })?;
+                    let rows = st.query_map(
+                        params![model, (EMBED_BATCH + refused.len()) as i64],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )?;
                     rows.collect()
                 })
                 .map_err(db_err)?;
+            let batch: Vec<(i64, String)> = rows
+                .into_iter()
+                .filter(|(id, _)| !refused.contains(id))
+                .take(EMBED_BATCH)
+                .collect();
             if batch.is_empty() {
                 break;
             }
-            let texts: Vec<String> = batch.iter().map(|b| b.1.clone()).collect();
-            let vectors = e.embed(&texts).await?;
-            if vectors.len() != batch.len() {
-                return Err("ответ модели эмбеддингов не той длины".into());
-            }
+            let texts: Vec<String> = batch
+                .iter()
+                .map(|b| b.1.chars().take(EMBED_CHARS).collect())
+                .collect();
+            let vectors: Vec<Option<Vec<f32>>> = match e.embed(&texts).await {
+                Ok(v) if v.len() == texts.len() => v.into_iter().map(Some).collect(),
+                Ok(_) => return Err("ответ модели эмбеддингов не той длины".into()),
+                Err(err) => {
+                    // A model that answers nothing stops the pass; one that
+                    // refuses some piece gets the pieces one by one.
+                    if e.embed(&[PROBE.to_string()]).await.is_err() {
+                        return Err(err);
+                    }
+                    let mut one_by_one = Vec::with_capacity(texts.len());
+                    for t in &texts {
+                        if cancel.is_cancelled() {
+                            break;
+                        }
+                        one_by_one.push(match e.embed(std::slice::from_ref(t)).await {
+                            Ok(mut v) if v.len() == 1 => v.pop(),
+                            _ => None,
+                        });
+                    }
+                    one_by_one
+                }
+            };
             self.db
                 .with(|c| {
-                    for ((id, _), v) in batch.iter().zip(&vectors) {
-                        c.execute(
+                    let tx = c.unchecked_transaction()?;
+                    {
+                        let mut st = tx.prepare(
                             "UPDATE doc_chunks SET model = ?2, embedding = ?3 WHERE id = ?1",
-                            params![id, model, encode_vector(v)],
                         )?;
+                        for ((id, _), v) in batch.iter().zip(&vectors) {
+                            if let Some(v) = v {
+                                st.execute(params![id, model, encode_vector(v)])?;
+                            }
+                        }
                     }
-                    Ok(())
+                    tx.commit()
                 })
                 .map_err(db_err)?;
-            done += batch.len();
+            for ((id, _), v) in batch.iter().zip(&vectors) {
+                match v {
+                    Some(_) => done += 1,
+                    None => {
+                        refused.insert(*id);
+                    }
+                }
+            }
         }
-        Ok(done)
+        Ok((done, refused.len()))
     }
 
     /// The pieces closest to a question: by meaning with vectors, else by words.
+    /// Pieces still without a vector (the first pass goes on, the model refused
+    /// them, the model changed) are found by their words alongside.
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<DocHit>, String> {
         if let Some((e, model)) = self.model() {
-            let rows: Vec<(String, u32, String, Vec<u8>)> = self
+            type Rows = (
+                Vec<(String, u32, String, Vec<u8>)>,
+                Vec<(String, u32, String)>,
+            );
+            let (rows, rest): Rows = self
                 .db
                 .with(|c| {
                     let mut st = c.prepare(
                         "SELECT path, page, text, embedding FROM doc_chunks WHERE model = ?1",
                     )?;
-                    let rows = st.query_map([&model], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-                    })?;
-                    rows.collect()
+                    let rows = st
+                        .query_map([&model], |r| {
+                            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                        })?
+                        .collect::<rusqlite::Result<_>>()?;
+                    let mut st = c.prepare(
+                        "SELECT path, page, text FROM doc_chunks WHERE model IS NULL OR model != ?1",
+                    )?;
+                    let rest = st
+                        .query_map([&model], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                        .collect::<rusqlite::Result<_>>()?;
+                    Ok((rows, rest))
                 })
                 .map_err(db_err)?;
             if !rows.is_empty() {
@@ -665,7 +912,9 @@ impl DocIndex {
                             .collect();
                         hits.sort_by(|a, b| b.score.total_cmp(&a.score));
                         hits.truncate(limit);
-                        return Ok(hits);
+                        // Scores of the two kinds do not compare: they take turns.
+                        let by_words = word_hits(query, rest, limit);
+                        return Ok(interleave(hits, by_words, limit));
                     }
                     Ok(_) => log::warn!("embedding answer has the wrong size"),
                     Err(err) => log::warn!("document search by meaning failed, using words: {err}"),
@@ -676,8 +925,7 @@ impl DocIndex {
     }
 
     fn search_words(&self, query: &str, limit: usize) -> Result<Vec<DocHit>, String> {
-        let words = stems(query);
-        if words.is_empty() {
+        if stems(query).is_empty() {
             return Ok(Vec::new());
         }
         let rows: Vec<(String, u32, String)> = self
@@ -688,31 +936,57 @@ impl DocIndex {
                 rows.collect()
             })
             .map_err(db_err)?;
-        let need = words.len().div_ceil(2);
-        let mut hits: Vec<DocHit> = rows
-            .into_iter()
-            .filter_map(|(path, page, text)| {
-                let lower = text.to_lowercase();
-                let present = words.iter().filter(|w| lower.contains(w.as_str())).count();
-                if present < need {
-                    return None;
-                }
-                let total: usize = words
-                    .iter()
-                    .map(|w| lower.matches(w.as_str()).count().min(5))
-                    .sum();
-                Some(DocHit {
-                    path,
-                    page,
-                    text,
-                    score: present as f32 + total as f32 * 0.1,
-                })
-            })
-            .collect();
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-        hits.truncate(limit);
-        Ok(hits)
+        Ok(word_hits(query, rows, limit))
     }
+}
+
+/// Pieces that hold at least half the words of the question, best first.
+fn word_hits(query: &str, rows: Vec<(String, u32, String)>, limit: usize) -> Vec<DocHit> {
+    let words = stems(query);
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let need = words.len().div_ceil(2);
+    let mut hits: Vec<DocHit> = rows
+        .into_iter()
+        .filter_map(|(path, page, text)| {
+            let lower = text.to_lowercase();
+            let present = words.iter().filter(|w| lower.contains(w.as_str())).count();
+            if present < need {
+                return None;
+            }
+            let total: usize = words
+                .iter()
+                .map(|w| lower.matches(w.as_str()).count().min(5))
+                .sum();
+            Some(DocHit {
+                path,
+                page,
+                text,
+                score: present as f32 + total as f32 * 0.1,
+            })
+        })
+        .collect();
+    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    hits.truncate(limit);
+    hits
+}
+
+/// Two lists in turns, the first one leading, up to `limit`.
+fn interleave(first: Vec<DocHit>, second: Vec<DocHit>, limit: usize) -> Vec<DocHit> {
+    let mut out = Vec::with_capacity(limit);
+    let (mut a, mut b) = (first.into_iter(), second.into_iter());
+    while out.len() < limit {
+        let (x, y) = (a.next(), b.next());
+        if x.is_none() && y.is_none() {
+            break;
+        }
+        out.extend(x);
+        if out.len() < limit {
+            out.extend(y);
+        }
+    }
+    out
 }
 
 pub struct DocsSearchTool(pub DocIndex);
@@ -922,6 +1196,21 @@ mod tests {
         assert!(none.contains("не выбраны"), "{none}");
     }
 
+    /// Two axes of meaning: fines and soup.
+    fn axes(texts: &[String]) -> Vec<Vec<f32>> {
+        texts
+            .iter()
+            .map(|t| {
+                let t = t.to_lowercase();
+                let has = |w: &[&str]| w.iter().any(|x| t.contains(x)) as u8 as f32;
+                vec![
+                    has(&["штраф", "неустойк", "пени"]),
+                    has(&["борщ", "суп", "еда"]),
+                ]
+            })
+            .collect()
+    }
+
     struct Axes;
 
     #[async_trait]
@@ -930,18 +1219,379 @@ mod tests {
             Some("axes-1".into())
         }
         async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
-            Ok(texts
-                .iter()
-                .map(|t| {
-                    let t = t.to_lowercase();
-                    let has = |w: &[&str]| w.iter().any(|x| t.contains(x)) as u8 as f32;
-                    vec![
-                        has(&["штраф", "неустойк", "пени"]),
-                        has(&["борщ", "суп", "еда"]),
-                    ]
-                })
-                .collect())
+            Ok(axes(texts))
         }
+    }
+
+    /// Like a real provider: refuses a batch with an overlong piece or with
+    /// «ОТКАЗ» in it, answers nothing while `dead`, and keeps what it was sent.
+    #[derive(Default)]
+    struct Picky {
+        sent: Mutex<Vec<String>>,
+        dead: AtomicBool,
+    }
+
+    #[async_trait]
+    impl Embedder for Picky {
+        fn model(&self) -> Option<String> {
+            Some("axes-1".into())
+        }
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            if self.dead.load(Ordering::Relaxed) {
+                return Err("сеть недоступна".into());
+            }
+            self.sent.lock().extend(texts.iter().cloned());
+            if texts
+                .iter()
+                .any(|t| t.chars().count() > 3000 || t.contains("ОТКАЗ"))
+            {
+                return Err("400: input refused".into());
+            }
+            Ok(axes(texts))
+        }
+    }
+
+    fn modified_secs(p: &Path) -> i64 {
+        std::fs::metadata(p)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// One paragraph per word, each a piece of its own.
+    fn paras(words: &[&str]) -> String {
+        words
+            .iter()
+            .map(|w| format!("{w} ").repeat(120))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_word_longer_than_a_piece_is_cut() {
+        let blob = "QUJD".repeat(10_000);
+        let parts = chunks(&format!("Вложение в base64: {blob} конец"));
+        assert!(parts.len() >= 40, "{}", parts.len());
+        assert!(
+            parts.iter().all(|p| p.chars().count() <= CHUNK),
+            "{:?}",
+            parts.iter().map(|p| p.chars().count()).max()
+        );
+        let kept: usize = parts.iter().map(|p| p.chars().count()).sum();
+        assert!(kept >= blob.len(), "{kept}");
+    }
+
+    #[test]
+    fn text_in_windows_1251_is_read() {
+        let ansi = [
+            0xC4, 0xEE, 0xE3, 0xEE, 0xE2, 0xEE, 0xF0, b' ', 0xB9, b'5', b' ', 0xAB, 0xB8, 0xA8,
+            0xBB, b';', 0xF8, 0xF2, 0xF0, 0xE0, 0xF4, b' ', b'1', b'%',
+        ];
+        assert_eq!(plain_text(&ansi).unwrap(), "Договор №5 «ёЁ»;штраф 1%");
+        let mut damaged = "Штраф по договору".as_bytes().to_vec();
+        damaged.push(0xD0);
+        assert!(plain_text(&damaged)
+            .unwrap()
+            .starts_with("Штраф по договору"));
+        assert_eq!(plain_text(b"plain ascii").unwrap(), "plain ascii");
+        assert!(plain_text(b"bin\0ary").is_none());
+
+        let d = tempfile::tempdir().unwrap();
+        let csv = d.path().join("выгрузка.csv");
+        std::fs::write(&csv, ansi).unwrap();
+        let pages = extract(&csv).unwrap();
+        assert!(pages[0].1.contains("Договор"), "{pages:?}");
+    }
+
+    #[tokio::test]
+    async fn a_folder_that_does_not_open_keeps_its_documents() {
+        let d = tempfile::tempdir().unwrap();
+        let docs = d.path().join("docs");
+        std::fs::create_dir(&docs).unwrap();
+        std::fs::write(
+            docs.join("договор.txt"),
+            "Штраф за просрочку оплаты составляет 1% в день от суммы договора.",
+        )
+        .unwrap();
+        let index = DocIndex::new(Arc::new(Db::open_in_memory().unwrap()), None);
+        let cancel = CancellationToken::new();
+        let folders = std::slice::from_ref(&docs);
+        index.run(folders, &cancel).await.unwrap();
+        assert_eq!(index.status().files, 1);
+        // A network drive away or a stick out: the folder does not open.
+        std::fs::rename(&docs, d.path().join("away")).unwrap();
+        let report = index.run(folders, &cancel).await.unwrap();
+        assert!(report.contains("убрано: 0"), "{report}");
+        assert_eq!(index.search("штраф договор", 3).await.unwrap().len(), 1);
+        // A folder removed from the settings does leave.
+        let report = index.run(&[], &cancel).await.unwrap();
+        assert!(report.contains("убрано: 1"), "{report}");
+        assert_eq!(index.status().files, 0);
+    }
+
+    #[tokio::test]
+    async fn a_file_that_fails_to_read_keeps_its_text_and_is_read_again() {
+        let d = tempfile::tempdir().unwrap();
+        let doc = d.path().join("рецепт.docx");
+        std::fs::write(
+            &doc,
+            zip_with(
+                "word/document.xml",
+                "<w:p><w:t>Борщ: свёкла, капуста, картошка и много любви к готовке.</w:t></w:p>"
+                    .as_bytes(),
+            ),
+        )
+        .unwrap();
+        let index = DocIndex::new(Arc::new(Db::open_in_memory().unwrap()), None);
+        let cancel = CancellationToken::new();
+        let folders = vec![d.path().to_path_buf()];
+        index.run(&folders, &cancel).await.unwrap();
+        // Caught half-saved: not a ZIP for now.
+        std::fs::write(&doc, b"PK half-saved").unwrap();
+        let report = index.run(&folders, &cancel).await.unwrap();
+        assert!(report.contains("Не прочитались: 1"), "{report}");
+        assert_eq!(index.search("борщ капуста", 3).await.unwrap().len(), 1);
+        let again = index.run(&folders, &cancel).await.unwrap();
+        assert!(again.contains("Не прочитались: 1"), "{again}");
+        // A new file that does not open is not taken as read.
+        std::fs::write(d.path().join("новый.docx"), b"not a zip").unwrap();
+        index.run(&folders, &cancel).await.unwrap();
+        assert_eq!(index.status().files, 1);
+    }
+
+    #[tokio::test]
+    async fn a_full_index_still_rereads_changed_files() {
+        let d = tempfile::tempdir().unwrap();
+        let file = |name: &str| d.path().join(name);
+        std::fs::write(file("a.txt"), paras(&["альфа"])).unwrap();
+        std::fs::write(file("b.txt"), paras(&["браво", "бетон", "башня"])).unwrap();
+        std::fs::write(file("c.txt"), paras(&["чарли"])).unwrap();
+        let mut index = DocIndex::new(Arc::new(Db::open_in_memory().unwrap()), None);
+        index.max_chunks = 3;
+        let cancel = CancellationToken::new();
+        let folders = vec![d.path().to_path_buf()];
+        let found = |q: &'static str| {
+            let index = index.clone();
+            async move { !index.search(q, 3).await.unwrap().is_empty() }
+        };
+
+        // b.txt does not fit; c.txt after it still goes in.
+        let report = index.run(&folders, &cancel).await.unwrap();
+        assert!(report.contains("Индекс полон (3 кусков)"), "{report}");
+        assert!(found("чарли").await && found("альфа").await && !found("браво").await);
+
+        // While there is no room, b.txt is not read again: the same date and
+        // size hide a shorter text that would fit.
+        let stamp = std::fs::metadata(file("b.txt")).unwrap();
+        let mut small = paras(&["дельта"]).into_bytes();
+        small.resize(stamp.len() as usize, b'\n');
+        std::fs::write(file("b.txt"), &small).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(file("b.txt"))
+            .unwrap()
+            .set_modified(stamp.modified().unwrap())
+            .unwrap();
+        index.run(&folders, &cancel).await.unwrap();
+        assert!(!found("дельта").await);
+
+        // A changed file goes before a new one: its new text takes the room.
+        std::fs::write(file("b2.txt"), paras(&["эхо"])).unwrap();
+        std::fs::write(file("c.txt"), paras(&["чайник", "чашка"])).unwrap();
+        index.run(&folders, &cancel).await.unwrap();
+        assert!(found("чашка").await && !found("эхо").await);
+
+        // A changed file that no longer fits does not answer with its old text.
+        std::fs::write(file("a.txt"), paras(&["омега", "оазис", "осина"])).unwrap();
+        index.run(&folders, &cancel).await.unwrap();
+        assert!(!found("альфа").await && !found("омега").await);
+    }
+
+    #[tokio::test]
+    async fn a_file_goes_into_the_index_whole_or_not_at_all() {
+        let d = tempfile::tempdir().unwrap();
+        let log = d.path().join("журнал.txt");
+        std::fs::write(
+            &log,
+            "Первая запись журнала о поставке товара на склад номер один.",
+        )
+        .unwrap();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let index = DocIndex::new(db.clone(), None);
+        let cancel = CancellationToken::new();
+        let folders = vec![d.path().to_path_buf()];
+        index.run(&folders, &cancel).await.unwrap();
+        // The second piece of the changed file fails to be written.
+        db.with(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER fail BEFORE INSERT ON doc_chunks WHEN NEW.text LIKE '%СБОЙ%'
+                 BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+        })
+        .unwrap();
+        std::fs::write(
+            &log,
+            format!(
+                "{}\n{}",
+                "Вторая запись журнала. ".repeat(30),
+                "СБОЙ записи. ".repeat(60)
+            ),
+        )
+        .unwrap();
+        assert!(index.run(&folders, &cancel).await.is_err());
+        let texts: Vec<String> = db
+            .with(|c| {
+                let mut st = c.prepare("SELECT text FROM doc_chunks")?;
+                let rows = st.query_map([], |r| r.get(0))?;
+                rows.collect()
+            })
+            .unwrap();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(texts[0].starts_with("Первая"), "{texts:?}");
+    }
+
+    #[tokio::test]
+    async fn a_refused_or_overlong_piece_does_not_hold_back_the_vectors() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("a.txt"),
+            "Неустойка за каждый день задержки равна одному проценту.",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("b.txt"),
+            "ОТКАЗ: этот кусок модель не принимает ни в каком виде вообще.",
+        )
+        .unwrap();
+        // A piece read by an older version: one word of 40 000 characters.
+        let old = d.path().join("выгрузка.json");
+        std::fs::write(&old, "{}").unwrap();
+        let key = old.to_string_lossy().into_owned();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        db.with(|c| {
+            c.execute(
+                "INSERT INTO doc_files (path, modified, size) VALUES (?1, ?2, 2)",
+                params![key, modified_secs(&old)],
+            )?;
+            c.execute(
+                "INSERT INTO doc_chunks (path, page, text) VALUES (?1, 0, ?2)",
+                params![key, "QUJD".repeat(10_000)],
+            )
+        })
+        .unwrap();
+        let model = Arc::new(Picky::default());
+        let index = DocIndex::new(db, Some(model.clone()));
+        let cancel = CancellationToken::new();
+        let folders = vec![d.path().to_path_buf()];
+        let report = index.run(&folders, &cancel).await.unwrap();
+        assert!(report.contains("Векторов построено: 2"), "{report}");
+        assert!(report.contains("Модель не приняла кусков: 1"), "{report}");
+        assert_eq!(index.status().embedded, 2);
+        let longest = model.sent.lock().iter().map(|t| t.chars().count()).max();
+        assert_eq!(longest, Some(EMBED_CHARS));
+
+        // No answer at all is not a refusal: the pass fails and marks nothing.
+        model.dead.store(true, Ordering::Relaxed);
+        let err = index.run(&folders, &cancel).await.unwrap_err();
+        assert!(err.contains("сеть"), "{err}");
+        assert_eq!(index.status().error.as_deref(), Some(err.as_str()));
+        // The refused piece is tried again on the next pass.
+        model.dead.store(false, Ordering::Relaxed);
+        let report = index.run(&folders, &cancel).await.unwrap();
+        assert!(report.contains("Модель не приняла кусков: 1"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn pieces_without_vectors_are_found_by_words() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("a.txt"),
+            "Неустойка за каждый день задержки равна одному проценту.",
+        )
+        .unwrap();
+        std::fs::write(
+            d.path().join("b.txt"),
+            "Борщ варят из свёклы и капусты, подают со сметаной.",
+        )
+        .unwrap();
+        let index = DocIndex::new(
+            Arc::new(Db::open_in_memory().unwrap()),
+            Some(Arc::new(Picky::default())),
+        );
+        let cancel = CancellationToken::new();
+        let folders = vec![d.path().to_path_buf()];
+        index.run(&folders, &cancel).await.unwrap();
+        // The new contract gets no vector: the model refuses it.
+        std::fs::write(
+            d.path().join("c.txt"),
+            "ОТКАЗ модели. Договор поставки: штрафы за просрочку по договору 5%.",
+        )
+        .unwrap();
+        let _ = index.run(&folders, &cancel).await;
+        let hits = index.search("штрафы по договору", 3).await.unwrap();
+        assert!(hits[0].path.ends_with("a.txt"), "{hits:?}");
+        assert!(hits.iter().any(|h| h.path.ends_with("c.txt")), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn a_folder_removed_mid_pass_is_not_read_and_not_sent() {
+        let d = tempfile::tempdir().unwrap();
+        let keep = d.path().join("keep");
+        let private = d.path().join("private");
+        std::fs::create_dir(&keep).unwrap();
+        std::fs::create_dir(&private).unwrap();
+        std::fs::write(
+            keep.join("a.txt"),
+            "Неустойка за каждый день задержки равна одному проценту.",
+        )
+        .unwrap();
+        std::fs::write(
+            private.join("b.txt"),
+            "Личное: номер паспорта и адрес, которые не должны уйти наружу.",
+        )
+        .unwrap();
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let cancel = CancellationToken::new();
+        // Read once without a model: these pieces wait for their vectors.
+        DocIndex::new(db.clone(), None)
+            .run(&[keep.clone(), private.clone()], &cancel)
+            .await
+            .unwrap();
+        std::fs::write(
+            private.join("c.txt"),
+            "Ещё одна личная запись, которую никто не должен читать без спроса.",
+        )
+        .unwrap();
+        std::fs::write(
+            keep.join("d.txt"),
+            "Борщ варят из свёклы и капусты, подают со сметаной.",
+        )
+        .unwrap();
+        let model = Arc::new(Picky::default());
+        let index = DocIndex::new(db, Some(model.clone()));
+        // The private folder leaves the settings right after the pass begins.
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let current = || {
+            if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                vec![keep.clone(), private.clone()]
+            } else {
+                vec![keep.clone()]
+            }
+        };
+        let report = index.run_with(current, &cancel).await.unwrap();
+        assert!(report.contains("прочитано заново: 1"), "{report}");
+        let sent = model.sent.lock().join("\n");
+        assert!(
+            sent.contains("Неустойка") && sent.contains("Борщ"),
+            "{sent}"
+        );
+        assert!(!sent.to_lowercase().contains("личн"), "{sent}");
+        assert_eq!(index.status().files, 2);
+        let hits = index.search("личная запись паспорт", 5).await.unwrap();
+        assert!(hits.iter().all(|h| h.path.contains("keep")), "{hits:?}");
     }
 
     #[tokio::test]

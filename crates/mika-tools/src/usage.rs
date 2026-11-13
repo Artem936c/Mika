@@ -202,6 +202,13 @@ impl Tool for ScreenTimeTool {
         _a: Approval,
         _c: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
+        // Turned off, it is not used either: what was counted before stays on
+        // this computer until it is wiped or grows old.
+        if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(ToolOutput::new(
+                "Учёт времени выключен: включить можно в настройках, раздел «Инструменты».",
+            ));
+        }
         let today = chrono::Local::now().date_naive();
         let name = arg_str_opt(&args, "period").unwrap_or("");
         let (from, to, label) = period(name, today).unwrap_or((today, today, "сегодня"));
@@ -209,13 +216,7 @@ impl Tool for ScreenTimeTool {
             .store
             .report(from, to)
             .map_err(|e| failed(format!("учёт времени недоступен: {e}")))?;
-        let mut text = report_text(&rows, label);
-        if !self.enabled.load(std::sync::atomic::Ordering::Relaxed) {
-            text.push_str(
-                "\nУчёт времени выключен: включить можно в настройках, раздел «Инструменты».",
-            );
-        }
-        Ok(ToolOutput::new(text))
+        Ok(ToolOutput::new(report_text(&rows, label)))
     }
 }
 
@@ -290,5 +291,25 @@ mod tests {
         let out = run(&tool, json!({"period": "today"})).await.unwrap().text;
         assert!(out.contains("Учёт времени выключен"), "{out}");
         assert!(tool.assess(&json!({"period": "год"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn counted_time_is_not_told_while_counting_is_off() {
+        let store = UsageStore(Arc::new(Db::open_in_memory().unwrap()));
+        let today = chrono::Local::now().date_naive();
+        store
+            .add(today, &HashMap::from([("telegram.exe".to_string(), 3600)]))
+            .unwrap();
+        let tool = ScreenTimeTool {
+            store,
+            enabled: Default::default(),
+        };
+        let out = run(&tool, json!({"period": "month"})).await.unwrap().text;
+        assert!(!out.contains("Telegram"), "{out}");
+        assert!(out.contains("Учёт времени выключен"), "{out}");
+        tool.enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let out = run(&tool, json!({"period": "month"})).await.unwrap().text;
+        assert!(out.contains("Telegram — 1 ч 00 мин"), "{out}");
     }
 }

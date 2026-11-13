@@ -163,8 +163,17 @@ pub struct RhythmSettings {
     docs: mika_tools::docs::IndexStatus,
 }
 
+/// Asked every few seconds while the page is open. Off the main thread: the
+/// index of documents may hold the base, and the Credential Manager is read.
 #[tauri::command]
-pub fn get_rhythm_settings(ctx: CtxState<'_>) -> RhythmSettings {
+pub async fn get_rhythm_settings(ctx: CtxState<'_>) -> Result<RhythmSettings, String> {
+    let ctx = ctx.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || rhythm_settings(&ctx))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn rhythm_settings(ctx: &Ctx) -> RhythmSettings {
     let c = ctx.config.lock().clone();
     let shared = &ctx.tool_env().shared;
     let (calendar_events, read, calendar_error) = shared.calendar.status();
@@ -175,13 +184,14 @@ pub fn get_rhythm_settings(ctx: CtxState<'_>) -> RhythmSettings {
         focus_left_s: shared.focus.left(chrono::Local::now().timestamp()),
         calendar_enabled: c.calendar.enabled,
         remind_min: c.calendar.remind_min,
-        has_calendar_url: has_secret(&ctx, mika_core::config::CALENDAR_SECRET_KEY),
+        has_calendar_url: has_secret(ctx, mika_core::config::CALENDAR_SECRET_KEY),
         calendar_events,
         calendar_read_at: read
             .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
             .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string()),
         calendar_error,
-        docs_folders: c.docs.folders,
+        // A repeat saved by an older version would break the list on the page.
+        docs_folders: crate::rhythm::unique_folders(c.docs.folders),
         docs: shared.docs.status(),
     }
 }
@@ -249,12 +259,7 @@ pub fn start_focus(ctx: CtxState<'_>, minutes: u64) {
 #[tauri::command]
 pub fn stop_focus(ctx: CtxState<'_>) {
     if let Some(held) = ctx.tool_env().shared.focus.stop() {
-        if !held.is_empty() {
-            ctx.session
-                .agent
-                .append_note(&format!("Пока шёл фокус, пришло:\n{}", held.join("\n")));
-        }
-        ctx.remark(&mika_tools::focus::summary(&held), "focus", true);
+        ctx.focus_over(&held);
     }
 }
 
@@ -283,23 +288,32 @@ pub fn save_calendar(
     Ok(())
 }
 
-/// Folders of documents; each must exist. The index follows at once.
+/// Folders of documents, each once; a new one must exist. The index follows
+/// at once. Off the main thread: asking a network drive that is away can
+/// take a minute.
 #[tauri::command]
-pub fn set_docs_folders(ctx: CtxState<'_>, folders: Vec<String>) -> Result<(), String> {
-    let folders: Vec<String> = folders
-        .into_iter()
-        .map(|f| f.trim().to_string())
-        .filter(|f| !f.is_empty())
-        .collect();
-    for (raw, path) in folders
-        .iter()
-        .zip(crate::rhythm::folder_paths(&folders, ctx.user_profile()))
+pub async fn set_docs_folders(ctx: CtxState<'_>, folders: Vec<String>) -> Result<(), String> {
+    let ctx = ctx.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || save_docs_folders(&ctx, folders))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn save_docs_folders(ctx: &Ctx, folders: Vec<String>) -> Result<(), String> {
+    let folders = crate::rhythm::unique_folders(folders);
+    let seen = ctx.config.lock().docs.folders.clone();
+    // Not under the lock: a network folder may answer in a minute.
+    if let Some(raw) =
+        crate::rhythm::missing_folder(&folders, &seen, ctx.user_profile(), |p| p.is_dir())
     {
-        if !path.is_dir() {
-            return Err(crate::strings::tr("error.docs_folder").replace("{path}", raw));
-        }
+        return Err(crate::strings::tr("error.docs_folder").replace("{path}", &raw));
     }
-    ctx.config.lock().docs.folders = folders;
+    {
+        // Another change may have been saved while the new folders were
+        // checked: only this one is applied to it.
+        let mut c = ctx.config.lock();
+        c.docs.folders = crate::rhythm::merge_folders(&seen, &folders, &c.docs.folders);
+    }
     ctx.save_config()?;
     ctx.docs_wake.notify_one();
     Ok(())
@@ -352,6 +366,7 @@ pub fn set_island_settings(
         let mut c = ctx.config.lock();
         c.island.city = city.trim().chars().take(60).collect();
         c.island.hide_in_games = hide_in_games;
+        *ctx.home_city.write() = c.island.city.clone();
     }
     *IDLE_WEATHER.lock() = None;
     ctx.save_config()

@@ -85,6 +85,8 @@ pub struct UiEnv {
     /// some programs (Telegram puts 😊 in the middle of the word).
     pub clipboard: Option<Arc<dyn crate::sys::Clipboard>>,
     pub sent: Sent,
+    /// Clipboard history: it keeps quiet while she uses the clipboard.
+    pub clips: crate::cliphist::ClipHistory,
 }
 
 impl UiEnv {
@@ -788,19 +790,16 @@ fn has_astral(text: &str) -> bool {
 
 impl UiEnv {
     /// Types the text where the caret is. Text with emoji goes through the
-    /// clipboard, which is put back afterwards.
+    /// clipboard, which is put back afterwards, after an error too.
     pub(crate) async fn type_text(&self, text: &str) -> Result<(), ToolError> {
         let Some(clip) = self.clipboard.clone().filter(|_| has_astral(text)) else {
             return self.input.text(text).map_err(failed);
         };
-        let saved = clip.get().ok();
+        let _loan = crate::cliphist::ClipLoan::start(clip.clone(), &self.clips);
         clip.set(text).map_err(failed)?;
         self.input.chord(&[VK_CONTROL, 0x56]).map_err(failed)?;
         // The program reads the clipboard on its own time.
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        if let Some(old) = saved {
-            let _ = clip.set(&old);
-        }
         Ok(())
     }
 }
@@ -1152,6 +1151,7 @@ mod tests {
             seen: Default::default(),
             clipboard: Some(e.clipboard.clone()),
             sent: Default::default(),
+            clips: e.shared.clips.clone(),
         };
         (ui, f)
     }
@@ -1324,6 +1324,27 @@ mod tests {
             .unwrap();
         }
         assert!(f.chords.lock().iter().all(|c| c == &vec![VK_RETURN]));
+    }
+
+    #[tokio::test]
+    async fn emoji_typed_through_the_clipboard_are_not_the_users_copies() {
+        let (e, f) = ui_env();
+        *f.clip_watch.lock() = Some(e.clips.clone());
+        *f.clipboard.lock() = "мой пароль".into();
+        *f.clip_private.lock() = true;
+        e.type_text("Привет 🙂 скоро буду").await.unwrap();
+        assert!(e.clips.is_empty(), "{:?}", e.clips.find("", 5));
+        assert_eq!(*f.clipboard.lock(), "мой пароль");
+        assert!(*f.clip_private.lock(), "the password manager's marks stay");
+
+        // A failed paste puts the clipboard back too.
+        *f.chord_error.lock() = Some(vec![VK_CONTROL, 0x56]);
+        *f.clipboard.lock() = "мой текст".into();
+        *f.clip_private.lock() = false;
+        e.clips.pause_for(0);
+        assert!(e.type_text("Ещё 🙂").await.is_err());
+        assert_eq!(*f.clipboard.lock(), "мой текст");
+        assert!(e.clips.is_empty(), "{:?}", e.clips.find("", 5));
     }
 
     #[tokio::test]

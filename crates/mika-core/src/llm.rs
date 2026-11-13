@@ -146,8 +146,97 @@ pub trait LlmProvider: Send + Sync {
     async fn stream(&self, req: LlmRequest) -> Result<LlmStream, LlmError>;
 }
 
+/// Reasoning that some models write into the reply text, as (open, close) markers:
+/// Gemma's thought channel and the `<think>` tags of Qwen and DeepSeek.
+/// Blocks that never reach the user: thoughts, and Gemma's own tool-call and
+/// tool-result tokens when it writes them into the text instead of the
+/// tool channel (`<|tool_call>[]`).
+const THOUGHT_MARKERS: &[(&str, &str)] = &[
+    ("<|channel>", "<channel|>"),
+    ("<think>", "</think>"),
+    ("<|tool_call>", "<tool_call|>"),
+    ("<|tool_response>", "<tool_response|>"),
+];
+
+/// Cuts reasoning blocks out of streamed text. A marker may arrive split across
+/// chunks, so a tail that could start one is held back.
+#[derive(Debug, Default)]
+pub struct ThoughtFilter {
+    held: String,
+    /// Index into `THOUGHT_MARKERS` of the open block.
+    inside: Option<usize>,
+}
+
+impl ThoughtFilter {
+    /// Length in bytes of the longest tail of `s` that is a proper prefix of one of `marks`.
+    fn partial_tail(s: &str, marks: &[&str]) -> usize {
+        marks
+            .iter()
+            .flat_map(|m| {
+                (1..m.len())
+                    .filter(|k| m.is_char_boundary(*k))
+                    .map(move |k| &m[..k])
+            })
+            .filter(|p| s.ends_with(p))
+            .map(str::len)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn push(&mut self, chunk: &str) -> String {
+        self.held.push_str(chunk);
+        let mut out = String::new();
+        loop {
+            match self.inside {
+                None => {
+                    let found = THOUGHT_MARKERS
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, (open, _))| self.held.find(open).map(|at| (at, i)))
+                        .min();
+                    if let Some((at, i)) = found {
+                        out.push_str(&self.held[..at]);
+                        self.held.drain(..at + THOUGHT_MARKERS[i].0.len());
+                        self.inside = Some(i);
+                        continue;
+                    }
+                    let opens: Vec<&str> = THOUGHT_MARKERS.iter().map(|(o, _)| *o).collect();
+                    let keep = Self::partial_tail(&self.held, &opens);
+                    let cut = self.held.len() - keep;
+                    out.push_str(&self.held[..cut]);
+                    self.held.drain(..cut);
+                    return out;
+                }
+                Some(i) => {
+                    let close = THOUGHT_MARKERS[i].1;
+                    if let Some(at) = self.held.find(close) {
+                        self.held.drain(..at + close.len());
+                        self.inside = None;
+                        continue;
+                    }
+                    let keep = Self::partial_tail(&self.held, &[close]);
+                    let cut = self.held.len() - keep;
+                    self.held.drain(..cut);
+                    return out;
+                }
+            }
+        }
+    }
+
+    /// Text still held when the stream ends; an unclosed block is dropped.
+    pub fn finish(&mut self) -> String {
+        let held = std::mem::take(&mut self.held);
+        if self.inside.take().is_some() {
+            String::new()
+        } else {
+            held
+        }
+    }
+}
+
 /// One short answer without tools: the whole text the model streams back,
-/// trimmed. `None` on an error, an empty answer or after `timeout`.
+/// reasoning blocks cut out, trimmed. `None` on an error, an empty answer or
+/// after `timeout`.
 pub async fn complete(
     provider: &dyn LlmProvider,
     system: &str,
@@ -162,13 +251,16 @@ pub async fn complete(
     let collect = async {
         let mut stream = provider.stream(req).await.ok()?;
         let mut text = String::new();
+        // A retelling is read aloud: the model's reasoning must not be.
+        let mut thoughts = ThoughtFilter::default();
         while let Some(chunk) = stream.next().await {
             match chunk {
-                Ok(LlmChunk::Text(t)) => text.push_str(&t),
+                Ok(LlmChunk::Text(t)) => text.push_str(&thoughts.push(&t)),
                 Ok(LlmChunk::ToolCall(_)) => {}
                 Err(_) => return None,
             }
         }
+        text.push_str(&thoughts.finish());
         let text = text.trim().to_string();
         (!text.is_empty()).then_some(text)
     };
@@ -197,5 +289,95 @@ mod tests {
         let back: Vec<ChatMessage> = serde_json::from_str(&json).unwrap();
         assert_eq!(back, msgs);
         assert!(!json.contains("tool_call_id\":null"));
+    }
+
+    fn thoughts(chunks: &[&str]) -> String {
+        let mut f = ThoughtFilter::default();
+        let mut out: String = chunks.iter().map(|c| f.push(c)).collect();
+        out.push_str(&f.finish());
+        out
+    }
+
+    #[test]
+    fn thought_blocks_are_cut_even_when_split() {
+        assert_eq!(
+            thoughts(&["<|channel>thought\nсчитаю…<channel|>Ответ: 51"]),
+            "Ответ: 51"
+        );
+        assert_eq!(
+            thoughts(&["Сейчас <|chan", "nel>thought думаю<chan", "nel|> готово"]),
+            "Сейчас  готово"
+        );
+        assert_eq!(thoughts(&["<think>план</think>Привет"]), "Привет");
+        assert_eq!(thoughts(&["<|channel>thought и обрыв"]), "");
+        assert_eq!(
+            thoughts(&["<|tool_call>[]"]),
+            "",
+            "an unclosed block is dropped"
+        );
+        assert_eq!(
+            thoughts(&["a < b и <think"]),
+            "a < b и <think",
+            "a lone prefix comes back at the end"
+        );
+        assert_eq!(thoughts(&["обычный текст"]), "обычный текст");
+    }
+
+    /// Streams the given text chunks once.
+    struct Chunks(Vec<&'static str>);
+
+    #[async_trait]
+    impl LlmProvider for Chunks {
+        fn name(&self) -> &str {
+            "chunks"
+        }
+        async fn stream(&self, _req: LlmRequest) -> Result<LlmStream, LlmError> {
+            use futures::StreamExt;
+            let chunks: Vec<Result<LlmChunk, LlmError>> = self
+                .0
+                .iter()
+                .map(|t| Ok(LlmChunk::Text(t.to_string())))
+                .collect();
+            Ok(futures::stream::iter(chunks).boxed())
+        }
+    }
+
+    async fn retell(chunks: Vec<&'static str>) -> Option<String> {
+        complete(
+            &Chunks(chunks),
+            "system",
+            "user",
+            std::time::Duration::from_secs(5),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn complete_cuts_out_reasoning() {
+        assert_eq!(
+            retell(vec![
+                "<think>Okay, the user wants",
+                " a short retelling…</th",
+                "ink> Нашла три варианта.",
+            ])
+            .await
+            .as_deref(),
+            Some("Нашла три варианта.")
+        );
+        assert_eq!(
+            retell(vec!["<|channel>thought\nretell it<channel|>Готово."])
+                .await
+                .as_deref(),
+            Some("Готово.")
+        );
+        assert_eq!(
+            retell(vec!["<think>only thinking, no answer"]).await,
+            None,
+            "nothing but reasoning is no answer"
+        );
+        assert_eq!(
+            retell(vec!["  Просто ", "ответ "]).await.as_deref(),
+            Some("Просто ответ")
+        );
     }
 }

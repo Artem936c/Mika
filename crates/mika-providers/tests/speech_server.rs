@@ -9,53 +9,77 @@ use mika_providers::live::Live;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
-/// Serves one request. Returns the base URL and the raw request bytes.
-async fn serve(
-    status: &str,
-    content_type: &str,
-    body: Vec<u8>,
-) -> (String, oneshot::Receiver<Vec<u8>>) {
+/// One answer of the fake server: status, content type, body.
+type Reply = (&'static str, &'static str, Vec<u8>);
+
+/// Serves the requests one by one with these answers. Returns the base URL
+/// and the raw bytes of each request.
+async fn serve_many(replies: Vec<Reply>) -> (String, mpsc::UnboundedReceiver<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let (tx, rx) = oneshot::channel();
-    let head = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    );
+    let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let (mut sock, _) = listener.accept().await.unwrap();
-        let mut buf = Vec::new();
-        let mut tmp = [0u8; 8192];
-        loop {
-            let n = sock.read(&mut tmp).await.unwrap();
-            buf.extend_from_slice(&tmp[..n]);
-            let text = String::from_utf8_lossy(&buf).to_string();
-            if let Some(end) = text.find("\r\n\r\n") {
-                let len = text[..end]
-                    .lines()
-                    .find_map(|l| {
-                        l.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .map(|v| v.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap_or(0);
-                // The head is ASCII, so its byte length equals its length in `text`.
-                if buf.len() >= end + 4 + len {
+        for (status, content_type, body) in replies {
+            let head = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 8192];
+            loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                buf.extend_from_slice(&tmp[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    // The head is ASCII, so its byte length equals its length in `text`.
+                    if buf.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+                if n == 0 {
                     break;
                 }
             }
-            if n == 0 {
-                break;
-            }
+            let _ = tx.send(buf);
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(&body).await.unwrap();
+            sock.shutdown().await.ok();
         }
-        let _ = tx.send(buf);
-        sock.write_all(head.as_bytes()).await.unwrap();
-        sock.write_all(&body).await.unwrap();
-        sock.shutdown().await.ok();
     });
     (format!("http://{addr}/v1"), rx)
+}
+
+/// Serves one request. Returns the base URL and the raw request bytes.
+async fn serve(
+    status: &'static str,
+    content_type: &'static str,
+    body: Vec<u8>,
+) -> (String, oneshot::Receiver<Vec<u8>>) {
+    let (base, mut requests) = serve_many(vec![(status, content_type, body)]).await;
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        if let Some(r) = requests.recv().await {
+            let _ = tx.send(r);
+        }
+    });
+    (base, rx)
+}
+
+/// The JSON body of a raw HTTP request.
+fn json_body(req: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(req);
+    serde_json::from_str(&text[text.find("\r\n\r\n").unwrap() + 4..]).unwrap()
 }
 
 fn live(base: &str, edit: impl FnOnce(&mut Config)) -> Live {
@@ -138,6 +162,36 @@ async fn the_voice_in_words_goes_as_instructions() {
         "Молодой тёплый голос. Сейчас радостно."
     );
     assert_eq!(json["voice"], "coral");
+}
+
+#[tokio::test]
+async fn a_refusal_of_instructions_is_remembered() {
+    let wav = b"RIFF\x24\0\0\0WAVEfmt sound".to_vec();
+    let refused = br#"{"error":{"message":"unknown field instructions","code":400}}"#.to_vec();
+    let (base, mut requests) = serve_many(vec![
+        ("400 Bad Request", "application/json", refused),
+        ("200 OK", "audio/wav", wav.clone()),
+        ("200 OK", "audio/wav", wav.clone()),
+    ])
+    .await;
+    let l = live(&base, |c| {
+        c.voice.tts_model = "strict/tts".into();
+        c.voice.tts_cache = false;
+    });
+    let tone = "Сейчас радостно, с улыбкой в голосе.";
+    assert_eq!(l.synthesize_with("Раз", tone).await.unwrap(), wav);
+    assert_eq!(
+        json_body(&requests.recv().await.unwrap())["instructions"],
+        tone
+    );
+    assert!(json_body(&requests.recv().await.unwrap())
+        .get("instructions")
+        .is_none());
+    // The next phrase goes without them at once: no refused request first.
+    assert_eq!(l.synthesize_with("Два", tone).await.unwrap(), wav);
+    let next = json_body(&requests.recv().await.unwrap());
+    assert_eq!(next["input"], "Два");
+    assert!(next.get("instructions").is_none(), "{next}");
 }
 
 #[tokio::test]

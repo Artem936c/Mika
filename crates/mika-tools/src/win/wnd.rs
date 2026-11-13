@@ -1,12 +1,13 @@
 use windows::core::{BOOL, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromRect, MonitorFromWindow, HDC, HMONITOR,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetForegroundWindow, GetWindow, GetWindowRect, GetWindowTextLengthW,
@@ -55,10 +56,24 @@ unsafe extern "system" fn collect(h: HWND, lparam: LPARAM) -> BOOL {
     BOOL(1)
 }
 
-fn process_name(h: HWND) -> String {
+/// Top-level windows, from front to back.
+pub(super) fn top_level() -> Vec<HWND> {
+    let mut handles: Vec<HWND> = Vec::new();
+    // SAFETY: the callback only pushes into `handles`, which outlives the call.
+    let _ = unsafe { EnumWindows(Some(collect), LPARAM(&mut handles as *mut _ as isize)) };
+    handles
+}
+
+/// The process of a window; 0 for a closed one.
+pub(super) fn process_id(h: HWND) -> u32 {
     let mut pid = 0u32;
-    // SAFETY: h comes from EnumWindows; pid is a valid out pointer.
+    // SAFETY: plain query on a window handle; pid is a valid out pointer.
     unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+    pid
+}
+
+fn process_name(h: HWND) -> String {
+    let pid = process_id(h);
     if pid == 0 {
         return String::new();
     }
@@ -87,10 +102,7 @@ fn process_name(h: HWND) -> String {
 
 impl Windows for WinWindows {
     fn list(&self) -> Vec<WindowInfo> {
-        let mut handles: Vec<HWND> = Vec::new();
-        // SAFETY: the callback only pushes into `handles`, which outlives the call.
-        let _ = unsafe { EnumWindows(Some(collect), LPARAM(&mut handles as *mut _ as isize)) };
-        handles
+        top_level()
             .into_iter()
             .filter_map(|h| {
                 // SAFETY: plain queries on a window handle from EnumWindows.
@@ -222,13 +234,35 @@ impl Windows for WinWindows {
             let _ = ShowWindow(h, SW_RESTORE);
             let mut r = RECT::default();
             GetWindowRect(h, &mut r).map_err(|_| "окно закрыто или недоступно".to_string())?;
-            let (x, y, w, hgt) = moved(
-                (r.left, r.top, r.right - r.left, r.bottom - r.top),
-                rect_tuple(from),
-                rect_tuple(*target),
-            );
+            let to = rect_tuple(*target);
+            let placed = moved(rect_tuple(r), rect_tuple(from), to);
+            let (x, y, w, hgt) = placed;
             SetWindowPos(h, None, x, y, w, hgt, SWP_NOZORDER | SWP_NOACTIVATE)
                 .map_err(|e| format!("не удалось перенести окно: {}", e.message()))?;
+            // On a monitor with another scale the window resizes itself
+            // (WM_DPICHANGED), maybe after SetWindowPos returns: fit it again.
+            let to_monitor = MonitorFromRect(target, MONITOR_DEFAULTTONEAREST);
+            let rescales = match (monitor_dpi(monitor), monitor_dpi(to_monitor)) {
+                (Some(a), Some(b)) => a != b,
+                _ => true,
+            };
+            if rescales {
+                for _ in 0..6 {
+                    let mut now = RECT::default();
+                    if GetWindowRect(h, &mut now).is_err() {
+                        break;
+                    }
+                    if let Some((x, y, w, hgt)) = refit(rect_tuple(now), to) {
+                        SetWindowPos(h, None, x, y, w, hgt, SWP_NOZORDER | SWP_NOACTIVATE)
+                            .map_err(|e| format!("не удалось перенести окно: {}", e.message()))?;
+                        break;
+                    }
+                    if rect_tuple(now) != placed {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
         }
         Ok(())
     }
@@ -236,6 +270,27 @@ impl Windows for WinWindows {
 
 fn rect_tuple(r: RECT) -> (i32, i32, i32, i32) {
     (r.left, r.top, r.right - r.left, r.bottom - r.top)
+}
+
+/// Effective scale of a monitor in DPI; `None` when Windows does not say.
+fn monitor_dpi(m: HMONITOR) -> Option<u32> {
+    let (mut x, mut y) = (0u32, 0u32);
+    // SAFETY: plain query; the out pointers live through the call.
+    unsafe { GetDpiForMonitor(m, MDT_EFFECTIVE_DPI, &mut x, &mut y) }.ok()?;
+    Some(x)
+}
+
+/// A new box when the window no longer fits the work area `to`: shrunk and
+/// pulled in, its offset kept. `None` when it fits.
+pub fn refit(
+    window: (i32, i32, i32, i32),
+    to: (i32, i32, i32, i32),
+) -> Option<(i32, i32, i32, i32)> {
+    let fits = window.0 >= to.0
+        && window.1 >= to.1
+        && window.0 + window.2 <= to.0 + to.2
+        && window.1 + window.3 <= to.1 + to.3;
+    (!fits).then(|| moved(window, to, to))
 }
 
 /// The window's box on another monitor: the same offset from the corner of
@@ -306,6 +361,21 @@ mod tests {
         assert_eq!(
             moved((1800, 10, 400, 300), left, right),
             (3720, 10, 400, 300)
+        );
+    }
+
+    #[test]
+    fn a_window_grown_by_the_new_scale_is_fitted_again() {
+        let right = (1920, 0, 2560, 1400);
+        // 1800×1000 placed at 100 % grows to 2700×1500 at 150 %.
+        assert_eq!(
+            refit((2020, 50, 2700, 1500), right),
+            Some((1920, 0, 2560, 1400))
+        );
+        assert_eq!(refit((2020, 50, 1200, 700), right), None);
+        assert_eq!(
+            refit((4000, 900, 600, 600), right),
+            Some((3880, 800, 600, 600))
         );
     }
 }

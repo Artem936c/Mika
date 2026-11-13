@@ -2,7 +2,7 @@
 //! Texts that look like passwords or keys, texts marked by password managers
 //! and copies from blind-zone windows are never kept.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::sys::{Clipboard, SavedClip};
 use crate::util::{arg_u64, schema, truncate};
 
 /// Texts kept.
@@ -48,6 +49,43 @@ const KEY_PREFIXES: &[&str] = &[
     "eyj",
 ];
 
+/// A link or a path by its plain signs: a scheme, a drive, a share, a leading
+/// slash, a site name first or a file name with an extension last. A slash
+/// alone proves nothing: passwords and base64 keys have them too.
+fn path_like(t: &str) -> bool {
+    let lower = t.to_lowercase();
+    if lower.contains("://") || lower.starts_with("www.") || lower.starts_with("mailto:") {
+        return true;
+    }
+    let b = t.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/') {
+        return true;
+    }
+    if ["\\\\", "/", "./", "../", ".\\", "..\\", "~/", "~\\"]
+        .iter()
+        .any(|p| t.starts_with(p))
+    {
+        return true;
+    }
+    let parts: Vec<&str> = t.split(['/', '\\']).collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    // `site.ru/…`
+    let site = first.rsplit_once('.').is_some_and(|(name, zone)| {
+        !name.is_empty() && zone.len() >= 2 && zone.chars().all(|c| c.is_ascii_alphabetic())
+    });
+    // `…/name.ext`
+    let file = last.rsplit_once('.').is_some_and(|(name, ext)| {
+        !name.is_empty()
+            && (1..=5).contains(&ext.len())
+            && ext.chars().all(|c| c.is_ascii_alphanumeric())
+            && ext.chars().any(|c| c.is_ascii_alphabetic())
+    });
+    site || file
+}
+
 /// Whether a copied text looks like a password, a key or a one-time code.
 pub fn looks_secret(text: &str) -> bool {
     let t = text.trim();
@@ -72,9 +110,8 @@ pub fn looks_secret(text: &str) -> bool {
     let marks = t
         .chars()
         .any(|c| !c.is_alphanumeric() && !matches!(c, '.' | '/' | ':' | '-' | '_'));
-    // A link, a path or a file name is not a password.
-    let path_like = lower.starts_with("http") || t.contains('\\') || t.contains('/');
-    if path_like {
+    // A link or a path is not a password.
+    if path_like(t) {
         return false;
     }
     let classes = [lowers, uppers, digits, marks]
@@ -90,6 +127,68 @@ pub struct ClipHistory {
     /// Unix milliseconds until which she uses the clipboard herself: her own
     /// copies and the text she puts back are not kept.
     quiet_until: Arc<AtomicI64>,
+    /// Her uses of the clipboard going on now.
+    holds: Arc<AtomicUsize>,
+}
+
+/// The history keeps quiet this long after she gives the clipboard back: the
+/// app looks at the clipboard once a second, and what she put back is not a
+/// new copy of the user.
+const QUIET_AFTER_MS: i64 = 3000;
+
+/// While it lives, and `QUIET_AFTER_MS` after, changes of the clipboard are hers.
+pub struct ClipHold(ClipHistory);
+
+impl Drop for ClipHold {
+    fn drop(&mut self) {
+        // The pause first: no moment without either.
+        self.0.pause_for(QUIET_AFTER_MS);
+        self.0.holds.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The user's clipboard lent to her. What it held is saved when the loan
+/// starts and put back when the loan ends, after an error or «Стоп» too, with
+/// pictures, files and the marks of password managers. Meanwhile the history
+/// keeps none of the changes.
+pub struct ClipLoan {
+    clipboard: Arc<dyn Clipboard>,
+    saved: Option<SavedClip>,
+    // Dropped after the clipboard is put back.
+    _hold: ClipHold,
+}
+
+impl ClipLoan {
+    pub fn start(clipboard: Arc<dyn Clipboard>, history: &ClipHistory) -> Self {
+        let hold = history.hold();
+        let saved = match clipboard.save() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                log::warn!("clipboard not saved before using it: {e}");
+                None
+            }
+        };
+        Self {
+            clipboard,
+            saved,
+            _hold: hold,
+        }
+    }
+
+    /// Whether the old clipboard will come back.
+    pub fn saved(&self) -> bool {
+        self.saved.is_some()
+    }
+}
+
+impl Drop for ClipLoan {
+    fn drop(&mut self) {
+        if let Some(saved) = self.saved.take() {
+            if let Err(e) = self.clipboard.restore(&saved) {
+                log::warn!("clipboard not put back: {e}");
+            }
+        }
+    }
 }
 
 fn now_ms() -> i64 {
@@ -155,8 +254,14 @@ impl ClipHistory {
         self.quiet_until.store(now_ms() + ms, Ordering::Relaxed);
     }
 
+    /// She uses the clipboard herself until the hold is dropped, and a little after.
+    pub fn hold(&self) -> ClipHold {
+        self.holds.fetch_add(1, Ordering::SeqCst);
+        ClipHold(self.clone())
+    }
+
     pub fn paused(&self) -> bool {
-        self.quiet_until.load(Ordering::Relaxed) > now_ms()
+        self.holds.load(Ordering::SeqCst) > 0 || self.quiet_until.load(Ordering::Relaxed) > now_ms()
     }
 }
 
@@ -262,13 +367,21 @@ mod tests {
             "ghp_1234567890abcdefghij",
             "482915",
             "aB3dE6gH9jK2mN5pQ8rS1tU4",
+            // A slash or a backslash inside does not make it a path.
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "Qw3rty/2024!",
+            r"Pa\ss9word",
         ] {
             assert!(looks_secret(secret), "{secret}");
         }
         for plain in [
             "Привет, как дела?",
             "https://example.com/Path?a=1&B=2",
+            "github.com/Mika-AI/Repo2",
             r"C:\Users\Me\Документы\Отчёт-2026.docx",
+            r"\\Server\Share\Plan2026",
+            "/usr/Local/Bin2",
+            "src/Main2.rs",
             "договор",
             "12,5",
             "Иванов",
@@ -300,6 +413,35 @@ mod tests {
         }
         assert_eq!(h.len(), KEEP);
         assert_eq!(h.find("", 1)[0].text, format!("текст {}", KEEP + 4));
+    }
+
+    #[test]
+    fn a_loan_puts_the_marked_clipboard_back_and_keeps_the_history_quiet() {
+        let (e, f) = crate::testing::env();
+        let history = ClipHistory::default();
+        *f.clip_watch.lock() = Some(history.clone());
+        *f.clipboard.lock() = "unrated-bloating-shrimp".into();
+        *f.clip_private.lock() = true;
+        {
+            let loan = ClipLoan::start(e.clipboard.clone(), &history);
+            assert!(loan.saved());
+            assert!(history.paused());
+            e.clipboard.set("её текст 🙂").unwrap();
+            assert!(!*f.clip_private.lock());
+        }
+        assert_eq!(*f.clipboard.lock(), "unrated-bloating-shrimp");
+        assert!(*f.clip_private.lock(), "the marks come back");
+        assert!(history.paused(), "quiet a little after");
+        assert!(history.is_empty());
+
+        // Paused while any hold lives.
+        let outer = history.hold();
+        drop(history.hold());
+        history.pause_for(0);
+        assert!(history.paused());
+        drop(outer);
+        history.pause_for(0);
+        assert!(!history.paused());
     }
 
     #[tokio::test]

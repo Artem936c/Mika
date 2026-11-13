@@ -128,6 +128,7 @@ mod live {
             seen: Default::default(),
             clipboard: Some(Arc::new(super::clipboard::WinClipboard)),
             sent: Default::default(),
+            clips: Default::default(),
         };
         let tool = crate::messenger::MessengerSendTool(crate::screen::ScreenEnv {
             ui,

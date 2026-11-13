@@ -270,8 +270,8 @@ impl ScreenClickTool {
     }
 
     /// Point of `target` on the picture by the vision model. Picture pixels.
-    /// A point is used only after the model, shown a crosshair on it, does not
-    /// say it is wrong: first by the grid, then by pixels named outright.
+    /// A point is used only after the model, shown a crosshair on it, says yes:
+    /// first by the grid, then by pixels named outright.
     async fn by_vision(
         &self,
         png: &[u8],
@@ -294,7 +294,7 @@ impl ScreenClickTool {
         }
         if seen {
             return Err(failed(format!(
-                "не уверена, где «{target}»: модель со зрением дважды указала место, но при проверке там другое. \
+                "не уверена, где «{target}»: модель со зрением дважды указала место, но при проверке не подтвердила его. \
 Ничего не нажала. Не повторяй это нажатие: спроси пользователя или сделай по-другому (клавиши, ui_read, messenger_send с file)."
             )));
         }
@@ -321,7 +321,7 @@ impl ScreenClickTool {
     }
 
     /// Whether the model, shown a crosshair on the point, agrees it is the target.
-    /// An unclear answer counts as yes.
+    /// Only a plain «да» counts: an unclear or empty answer is a no.
     async fn point_holds(
         &self,
         pic: &crate::grid::Picture,
@@ -346,7 +346,7 @@ impl ScreenClickTool {
             "На снимке красное перекрестие. Его центр стоит на «{target}»? Ответь одним словом: да или нет."
         );
         let answer = self.ask(&png, &question, cancel).await?;
-        Ok(crate::grid::yes(&answer) != Some(false))
+        Ok(crate::grid::yes(&answer) == Some(true))
     }
 
     /// The point by the grid: a cell, then a cell inside it.
@@ -581,6 +581,7 @@ mod tests {
                 seen: Default::default(),
                 clipboard: None,
                 sent: Default::default(),
+                clips: Default::default(),
             },
             screen: e.screen.clone(),
             enabled: e.shared.screen_enabled.clone(),
@@ -675,6 +676,52 @@ mod tests {
         assert_eq!(crate::grid::two_numbers("(12; 7)"), Some((12, 7)));
         assert_eq!(crate::grid::yes("Нет."), Some(false));
         assert_eq!(crate::grid::yes("может"), None);
+    }
+
+    #[tokio::test]
+    async fn only_a_plain_yes_on_the_crosshair_lets_the_click_through() {
+        let (env, vision, f) = screen_env("C:\\Users\\me");
+        let pic = crate::grid::Picture {
+            rgb: vec![230; 400 * 300 * 3],
+            width: 400,
+            height: 300,
+        };
+        *f.picture.lock() = Some((crate::grid::encode(&pic).unwrap(), 400, 300));
+        let tool = ScreenClickTool { env, vision };
+        // A marked-up, partial or empty no is a no: nothing is clicked.
+        for (grid_no, named, named_no) in [
+            ("**Нет**", "x=200, y=150", "Не то, это поле ввода"),
+            ("«Нет»", "200 150", "Неверно"),
+            ("Nope", "200 150", ""),
+        ] {
+            *f.vision_seq.lock() = vec![
+                "5".into(),
+                "1".into(),
+                grid_no.into(),
+                named.into(),
+                named_no.into(),
+            ];
+            let err = run(&tool, json!({"target": "скрепка", "window": "игра"}))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("Ничего не нажала"), "{err}");
+            assert!(f.clicks.lock().is_empty(), "{grid_no} / {named_no}");
+        }
+        // Pixels with fractions keep y; a yes in bold still counts.
+        *f.vision_seq.lock() = vec![
+            "5".into(),
+            "1".into(),
+            "нет".into(),
+            "x=200.5, y=150.0".into(),
+            "**Да**".into(),
+        ];
+        run(&tool, json!({"target": "скрепка", "window": "игра"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            f.clicks.lock().clone(),
+            vec![(210, 170, crate::sys::MouseButton::Left, false)]
+        );
     }
 
     #[tokio::test]

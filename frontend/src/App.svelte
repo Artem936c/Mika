@@ -15,6 +15,7 @@
   import { reduceTask, type TaskView } from './lib/task';
   import {
     ISLAND_SHAPES,
+    noticeOf,
     opensChat,
     rectForShape,
     reduceState,
@@ -49,7 +50,7 @@
     track: { title: string; artist: string } | null;
   }
 
-  /** A fired reminder stays in the island this long, like a spoken reply. */
+  /** A fired reminder or her own line stays in the island this long, like a spoken reply. */
   const NOTICE_MS = 9000;
 
   let current = $state<AssistantState>('idle');
@@ -65,7 +66,7 @@
   let innerWidth = $state(1000);
   let avatarInIsland = $state(true);
   let idle = $state<IdleInfo>({ weather: null, reminder: null, track: null });
-  /** Text of a reminder that has just fired. */
+  /** Text of a reminder that has just fired, or of her own line. */
   let notice = $state('');
   let noticeTimer: ReturnType<typeof setTimeout> | undefined;
   let emotion = $state<Emotion>('neutral');
@@ -173,15 +174,13 @@
       tool = '';
       if (e.name?.startsWith('reminder_')) loadIdle();
     }
-    if (e?.type === 'reminder_fired' && typeof e.text === 'string') {
-      const task = (payload as { kind?: string }).kind === 'task';
-      if (!task) {
-        notice = e.text;
-        clearTimeout(noticeTimer);
-        noticeTimer = setTimeout(() => (notice = ''), NOTICE_MS);
-      }
-      loadIdle();
+    const noticed = noticeOf(payload);
+    if (noticed !== null) {
+      notice = noticed;
+      clearTimeout(noticeTimer);
+      noticeTimer = setTimeout(() => (notice = ''), NOTICE_MS);
     }
+    if (e?.type === 'reminder_fired') loadIdle();
     if (e?.type === 'user_text') notice = '';
   }
 

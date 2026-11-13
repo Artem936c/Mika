@@ -519,6 +519,9 @@
     border-radius: 16px;
     font-size: 14px;
     line-height: 1.4;
+    /* The end of focus lists what came, one line each. */
+    white-space: pre-wrap;
+    word-break: break-word;
     background: rgba(111, 227, 255, 0.08);
     border: 1px solid rgba(111, 227, 255, 0.3);
     user-select: text;

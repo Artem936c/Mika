@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mika_core::policy::blind::is_blind_title;
+use mika_tools::cliphist::ClipLoan;
 use mika_tools::sys::WindowInfo;
 use tauri::{AppHandle, Emitter};
 
@@ -75,7 +76,7 @@ const VK_V: u16 = 0x56;
 const VK_CONTROL: u16 = 0x11;
 
 /// Copies the selection of the window in front and gives the clipboard back
-/// its old text. Blocking.
+/// what it held. Blocking.
 pub fn grab(ctx: &Ctx) -> Result<Selection, String> {
     let env = ctx.tool_env();
     let own = mika_tools::own_process();
@@ -88,9 +89,8 @@ pub fn grab(ctx: &Ctx) -> Result<Selection, String> {
         return Err(crate::strings::tr("selection.blind"));
     }
     wait_keys_up(Duration::from_millis(1500));
-    // Her mark and the text she puts back are not the user's copies.
-    env.shared.clips.pause_for(3000);
-    let old = env.clipboard.get().ok();
+    // Her mark and what she puts back are not the user's copies.
+    let loan = ClipLoan::start(env.clipboard.clone(), &env.shared.clips);
     // A mark tells a real copy from an empty selection.
     let mark = format!("\u{2063}mika-{}", std::process::id());
     env.clipboard.set(&mark)?;
@@ -107,14 +107,11 @@ pub fn grab(ctx: &Ctx) -> Result<Selection, String> {
             _ => {}
         }
     }
-    match old {
-        Some(old) => {
-            let _ = env.clipboard.set(&old);
-        }
-        None => {
-            let _ = env.clipboard.set("");
-        }
+    if !loan.saved() {
+        // Nothing to put back: at least her mark does not stay.
+        let _ = env.clipboard.set("");
     }
+    drop(loan);
     let text = text.trim().to_string();
     if text.is_empty() {
         return Err(crate::strings::tr("selection.empty"));
@@ -124,7 +121,7 @@ pub fn grab(ctx: &Ctx) -> Result<Selection, String> {
 }
 
 /// Puts `text` in place of the selection: back to the window, paste, and the
-/// clipboard gets its old text again. Blocking.
+/// clipboard gets back what it held, after an error too. Blocking.
 pub fn paste(ctx: &Ctx, sel: &Selection, text: &str) -> Result<(), String> {
     let env = ctx.tool_env();
     let alive = env
@@ -138,15 +135,11 @@ pub fn paste(ctx: &Ctx, sel: &Selection, text: &str) -> Result<(), String> {
     }
     env.windows.focus(alive.id)?;
     std::thread::sleep(Duration::from_millis(250));
-    env.shared.clips.pause_for(3000);
-    let old = env.clipboard.get().ok();
+    let _loan = ClipLoan::start(env.clipboard.clone(), &env.shared.clips);
     env.clipboard.set(text)?;
     env.input.chord(&[VK_CONTROL, VK_V])?;
     // The program reads the clipboard after the key: give it time.
     std::thread::sleep(Duration::from_millis(400));
-    if let Some(old) = old {
-        let _ = env.clipboard.set(&old);
-    }
     Ok(())
 }
 

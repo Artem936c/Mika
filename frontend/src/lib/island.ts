@@ -82,6 +82,26 @@ export function unionRect(a: Rect, b: Rect): Rect {
   };
 }
 
+/**
+ * Text that unfolds the island and the avatar bubble for a moment: a fired
+ * reminder, and her own line about a break, the end of focus or a meeting soon.
+ * They must be seen with replies not spoken. A scheduled task shows up as its
+ * own message; greetings and the late-night line (`life`) stay in the chat.
+ * Of a line with a list (what came during focus) only the head is shown: the
+ * list itself is in the chat.
+ */
+export function noticeOf(event: unknown): string | null {
+  if (typeof event !== 'object' || event === null) return null;
+  const e = event as { type?: unknown; text?: unknown; kind?: unknown };
+  if (typeof e.text !== 'string' || !e.text.trim()) return null;
+  if (e.type === 'reminder_fired' && e.kind !== 'task') return e.text;
+  if (e.type === 'remark' && e.kind !== 'life') {
+    const head = e.text.trim().split('\n')[0].trim();
+    return head.replace(/:$/, '.');
+  }
+  return null;
+}
+
 /** Elements inside the island that handle their own clicks. */
 const CONTROLS = 'button, a, input, textarea, select, label, [role="button"]';
 

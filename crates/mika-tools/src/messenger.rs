@@ -20,6 +20,7 @@ use mika_core::tools::{arg_str, spec, Assessment, RiskLevel, Tool, ToolError, To
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::cliphist::ClipLoan;
 use crate::screen::ScreenEnv;
 use crate::sys::WindowInfo;
 use crate::util::{arg_bool, failed};
@@ -193,7 +194,8 @@ impl MessengerSendTool {
 
     /// Types the text and sends it. With a file, the file goes first through
     /// the clipboard, as if pasted from Explorer: Telegram opens its sending
-    /// box, the text becomes the caption, Enter sends both.
+    /// box, the text becomes the caption, Enter sends both. The user's
+    /// clipboard comes back whole, after an error or «Стоп» too.
     pub(crate) async fn send_here(
         &self,
         w: &WindowInfo,
@@ -214,13 +216,13 @@ impl MessengerSendTool {
         }
         ui.windows.focus(w.id).map_err(failed)?;
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let mut old = None;
+        let mut loan = None;
         if let Some(f) = file {
             let clipboard = ui
                 .clipboard
                 .clone()
                 .ok_or_else(|| failed("буфер обмена недоступен"))?;
-            old = clipboard.get().ok();
+            loan = Some(ClipLoan::start(clipboard.clone(), &ui.clips));
             clipboard
                 .set_files(std::slice::from_ref(f))
                 .map_err(failed)?;
@@ -231,22 +233,23 @@ impl MessengerSendTool {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         self.keys(&[VK_RETURN], 600).await?;
-        if let (Some(old), Some(clipboard)) = (old, ui.clipboard.as_ref()) {
-            let _ = clipboard.set(&old);
-        }
+        drop(loan);
         *ui.sent.lock() = Some((w.id, key, std::time::Instant::now()));
         Ok(())
     }
 
     /// The text and the file to send. A small model often writes the path of
     /// a picture into the text («[Прикрепляю картинку: C:\\…\\кот.jpg]»)
-    /// instead of `file`: such a path to an existing file becomes the file.
+    /// instead of `file`, or into both: such a path never goes into the chat,
+    /// and a path to an existing file becomes the file.
     fn parts(&self, args: &Value) -> Result<(String, Option<PathBuf>), ToolError> {
         let text = text_arg(args);
+        let found = attachment_in(&text);
         if let Some(file) = self.file_arg(args)? {
-            return Ok((text, Some(file)));
+            let caption = found.map(|(rest, _)| rest).unwrap_or(text);
+            return Ok((caption, Some(file)));
         }
-        match attachment_in(&text) {
+        match found {
             Some((rest, path)) if path.is_file() => Ok((rest, Some(path))),
             _ => Ok((text, None)),
         }
@@ -419,6 +422,7 @@ mod tests {
             seen: Default::default(),
             clipboard: Some(e.clipboard.clone()),
             sent: Default::default(),
+            clips: e.shared.clips.clone(),
         };
         let screen = ScreenEnv {
             ui,
@@ -568,6 +572,71 @@ mod tests {
             .assess(&json!({"contact": "А", "file": "C:\\нет\\такого.jpg"}))
             .is_err());
         assert!(t.assess(&json!({"contact": "А"})).is_err());
+    }
+
+    #[tokio::test]
+    async fn the_marked_clipboard_comes_back_and_her_pastes_stay_out_of_history() {
+        let (t, f) = tool();
+        let history = t.0.ui.clips.clone();
+        *f.clip_watch.lock() = Some(history.clone());
+        let d = tempfile::tempdir().unwrap();
+        let cat = d.path().join("кот.jpg");
+        std::fs::write(&cat, b"jpg").unwrap();
+        // A password copied in a password manager: marked, out of history.
+        *f.clipboard.lock() = "unrated-bloating-shrimp".into();
+        *f.clip_private.lock() = true;
+        let args = json!({"contact": "Аня", "file": cat.to_string_lossy(), "text": "Котик 🙂", "chat_open": true});
+        run(&t, args).await.unwrap();
+        assert_eq!(*f.clipboard.lock(), "unrated-bloating-shrimp");
+        assert!(*f.clip_private.lock(), "the marks come back");
+        assert!(history.is_empty(), "{:?}", history.find("", 5));
+        assert!(history.paused(), "the history keeps quiet a little after");
+    }
+
+    #[tokio::test]
+    async fn the_clipboard_comes_back_after_an_error_or_a_stop() {
+        let (t, f) = tool();
+        let w = t.telegram().unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let cat = d.path().join("кот.jpg");
+        std::fs::write(&cat, b"jpg").unwrap();
+        *f.clipboard.lock() = "старый текст".into();
+        *f.chord_error.lock() = Some(vec![VK_RETURN]);
+        assert!(t.send_here(&w, "", Some(&cat)).await.is_err());
+        assert_eq!(*f.clipboard.lock(), "старый текст");
+
+        // «Стоп» while Telegram opens its sending box: the future is dropped.
+        *f.chord_error.lock() = None;
+        f.clip_files.lock().clear();
+        let stopped = tokio::time::timeout(
+            Duration::from_millis(900),
+            t.send_here(&w, "Котик", Some(&cat)),
+        )
+        .await;
+        assert!(stopped.is_err(), "stopped before the end");
+        assert_eq!(
+            *f.clip_files.lock(),
+            vec![cat],
+            "the file was in the clipboard"
+        );
+        assert_eq!(*f.clipboard.lock(), "старый текст");
+    }
+
+    #[tokio::test]
+    async fn a_path_in_the_text_never_goes_as_the_caption_of_the_file() {
+        let (t, f) = tool();
+        let d = tempfile::tempdir().unwrap();
+        let cat = d.path().join("кот.jpg");
+        std::fs::write(&cat, b"jpg").unwrap();
+        let file = cat.to_string_lossy().to_string();
+        let announce = format!("[Прикрепляю картинку: {file}]");
+        let args = json!({"contact": "Аня", "file": file, "text": announce, "chat_open": true});
+        assert_eq!(t.assess(&args).unwrap().target, "файл кот.jpg");
+        run(&t, args).await.unwrap();
+        assert!(f.typed.lock().is_empty(), "{:?}", f.typed.lock());
+
+        let args = json!({"contact": "Аня", "file": file, "text": format!("Котик {file}"), "chat_open": true});
+        assert_eq!(t.parts(&args).unwrap().0, "Котик");
     }
 
     #[test]

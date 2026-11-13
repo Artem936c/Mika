@@ -7,7 +7,10 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use mika_core::gate::Approval;
 use mika_core::llm::ToolSpec;
-use mika_core::tools::{arg_str, spec, Assessment, RiskLevel, Tool, ToolError, ToolOutput};
+use mika_core::tools::{
+    arg_str, arg_str_opt, spec, Assessment, RiskLevel, Tool, ToolError, ToolOutput,
+};
+use parking_lot::RwLock;
 use regex::Regex;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -235,6 +238,27 @@ impl Tool for WebSearchTool {
 pub struct WeatherTool {
     pub http: Arc<dyn Http>,
     pub enabled: Arc<AtomicBool>,
+    /// The user's city from the settings: used when the request names no city.
+    pub home: Arc<RwLock<String>>,
+}
+
+impl WeatherTool {
+    /// The city the user named, else the city from the settings.
+    fn city(&self, args: &Value) -> Result<String, ToolError> {
+        let named = arg_str_opt(args, "city").unwrap_or("").trim();
+        let city = if named.is_empty() {
+            self.home.read().trim().to_string()
+        } else {
+            named.to_string()
+        };
+        if city.is_empty() {
+            return Err(ToolError::BadArguments(
+                "город не назван, и в настройках Мики он не задан: спроси у пользователя город"
+                    .into(),
+            ));
+        }
+        Ok(city)
+    }
 }
 
 /// Temperature now, in whole degrees, and the sky in words: for the idle island.
@@ -301,13 +325,20 @@ impl Tool for WeatherTool {
     fn spec(&self) -> ToolSpec {
         spec(
             "get_weather",
-            "Погода сейчас и на три дня для города.",
-            schema(&[("city", "string", "Город, например «Москва»")], &["city"]),
+            "Погода сейчас и на три дня. Без города берётся город пользователя из настроек.",
+            schema(
+                &[(
+                    "city",
+                    "string",
+                    "Город, только если пользователь его назвал. Не придумывай город сама.",
+                )],
+                &[],
+            ),
         )
     }
 
     fn assess(&self, args: &Value) -> Result<Assessment, ToolError> {
-        let city = arg_str(args, "city")?;
+        let city = self.city(args)?;
         Ok(Assessment::new(
             RiskLevel::Low,
             "Узнать погоду",
@@ -323,7 +354,8 @@ impl Tool for WeatherTool {
         _c: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         ensure_enabled(&self.enabled)?;
-        let city = arg_str(&args, "city")?.trim();
+        let city = self.city(&args)?;
+        let city = city.as_str();
         let geo: Value = serde_json::from_str(
             &self
                 .http
@@ -415,6 +447,7 @@ mod tests {
         let w = WeatherTool {
             http: e.http.clone(),
             enabled: e.shared.web_enabled.clone(),
+            home: e.shared.home_city.clone(),
         };
         let err = run(&w, json!({"city": "Москва"})).await.unwrap_err();
         assert_eq!(err.to_string(), WEB_DISABLED);
@@ -458,6 +491,7 @@ mod tests {
             &WeatherTool {
                 http: e.http,
                 enabled: e.shared.web_enabled,
+                home: e.shared.home_city,
             },
             json!({"city": "москва"}),
         )
@@ -484,6 +518,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn weather_without_a_city_uses_the_city_from_settings() {
+        let (e, f) = env();
+        f.http.lock().insert(
+            "https://geocoding-api.open-meteo.com".into(),
+            json!({"results": [{"name": "Пермь", "country": "Россия", "latitude": 58.0, "longitude": 56.25}]}).to_string(),
+        );
+        f.http.lock().insert(
+            "https://api.open-meteo.com".into(),
+            json!({"current": {"temperature_2m": 1.0, "weather_code": 3}}).to_string(),
+        );
+        *e.shared.home_city.write() = " Пермь ".into();
+        let w = WeatherTool {
+            http: e.http,
+            enabled: e.shared.web_enabled,
+            home: e.shared.home_city,
+        };
+        assert_eq!(w.assess(&json!({})).unwrap().target, "Пермь");
+        let out = run(&w, json!({"city": "  "})).await.unwrap();
+        assert!(out.text.starts_with("Пермь, Россия."), "{}", out.text);
+        // A city the user named wins over the one from settings.
+        assert_eq!(
+            w.assess(&json!({"city": "Казань"})).unwrap().target,
+            "Казань"
+        );
+        // The model must not be nudged to a city by an example in the schema.
+        let spec = w.spec();
+        assert!(!spec.parameters.to_string().contains("Москва"));
+        assert_eq!(spec.parameters["required"], json!([]));
+        let calls = f.http_calls.lock();
+        assert!(
+            calls[0].contains("name=%D0%9F%D0%B5%D1%80%D0%BC%D1%8C&"),
+            "{}",
+            calls[0]
+        );
+    }
+
+    #[test]
+    fn weather_without_any_city_asks_for_one() {
+        let (e, _) = env();
+        let w = WeatherTool {
+            http: e.http,
+            enabled: e.shared.web_enabled,
+            home: e.shared.home_city,
+        };
+        let err = w.assess(&json!({})).unwrap_err();
+        assert!(
+            err.to_string().contains("спроси у пользователя город"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn weather_unknown_city_is_clear_error() {
         let (e, f) = env();
         f.http
@@ -493,6 +579,7 @@ mod tests {
             &WeatherTool {
                 http: e.http,
                 enabled: e.shared.web_enabled,
+                home: e.shared.home_city,
             },
             json!({"city": "Нигдеград"}),
         )

@@ -57,6 +57,21 @@ pub fn voice_instructions(style: &str, tone: Option<&str>) -> String {
         .join(" ")
 }
 
+/// The face her voice takes. A sleepy face held longer than the mood of a
+/// reply lasts comes from a long silence, and whatever makes her speak has
+/// just ended it: the emotion driver only has not caught up yet.
+pub fn voice_mood(
+    face: mika_core::emotion::Emotion,
+    held: std::time::Duration,
+) -> mika_core::emotion::Emotion {
+    use mika_core::emotion::{Emotion, PULSE_HOLD};
+    if face == Emotion::Sleepy && held > PULSE_HOLD {
+        Emotion::Neutral
+    } else {
+        face
+    }
+}
+
 /// How one MCP server did at the last start: its tool count or the error.
 pub type McpReport = Vec<(String, Result<usize, String>)>;
 
@@ -77,6 +92,8 @@ pub struct Ctx {
     pub screen_enabled: Arc<AtomicBool>,
     /// Mirrors `tools.news_feed`.
     pub news_feed: Arc<RwLock<String>>,
+    /// Mirrors `island.city`.
+    pub home_city: Arc<RwLock<String>>,
     env: ToolEnv,
     mcp_tools: Mutex<Vec<Arc<dyn Tool>>>,
     pub mcp_report: Mutex<McpReport>,
@@ -114,6 +131,8 @@ pub struct Ctx {
     pub selection: Mutex<Option<crate::selection::Selection>>,
     /// Her face now; set in `setup`. Her voice follows it.
     pub emotion: std::sync::OnceLock<mika_core::emotion::EmotionHandle>,
+    /// The last face shown and since when.
+    face_since: Arc<Mutex<(mika_core::emotion::Emotion, std::time::Instant)>>,
     /// Read the calendar link again now.
     pub calendar_wake: Arc<tokio::sync::Notify>,
     /// Look over the documents now.
@@ -171,6 +190,7 @@ impl Ctx {
         let web_enabled = Arc::new(AtomicBool::new(config.tools.web_enabled));
         let screen_enabled = Arc::new(AtomicBool::new(config.privacy.screen_enabled));
         let news_feed = Arc::new(RwLock::new(config.tools.news_feed.clone()));
+        let home_city = Arc::new(RwLock::new(config.island.city.clone()));
         let disabled = config.tools.disabled_groups.clone();
         let voice: Arc<dyn Voice> = Arc::new(mika_audio::win::WindowsVoice::new());
         voice.configure(&config.voice.voice, config.voice.rate);
@@ -209,6 +229,7 @@ impl Ctx {
                 web_enabled: web_enabled.clone(),
                 screen_enabled: screen_enabled.clone(),
                 news_feed: news_feed.clone(),
+                home_city: home_city.clone(),
                 memory: memory.clone(),
                 vision: Arc::new(live.clone()),
                 images: Arc::new(live),
@@ -263,6 +284,9 @@ impl Ctx {
             })
         }));
         speaker.set_brief(config.lock().voice.brief_long);
+        // A retelling still being made is speech for the rest of the app: the
+        // microphone waits for it, and «Стоп» or the microphone drops it.
+        let voice = speaker.wrap(voice);
         let hinted = Arc::downgrade(&agent);
         agent.add_prompt_extra(Arc::new(move || {
             hinted
@@ -288,6 +312,7 @@ impl Ctx {
             web_enabled,
             screen_enabled,
             news_feed,
+            home_city,
             env,
             mcp_tools: Mutex::new(Vec::new()),
             mcp_report: Mutex::new(Vec::new()),
@@ -314,6 +339,10 @@ impl Ctx {
             duck_turn: std::sync::atomic::AtomicU64::new(0),
             selection: Mutex::new(None),
             emotion: std::sync::OnceLock::new(),
+            face_since: Arc::new(Mutex::new((
+                mika_core::emotion::Emotion::Neutral,
+                std::time::Instant::now(),
+            ))),
             calendar_wake: Default::default(),
             docs_wake: Default::default(),
         })
@@ -354,7 +383,8 @@ impl Ctx {
         ));
         self.apply_voice_engine();
         self.restart_wake();
-        // Her current reply, to recognise her own name in the speakers.
+        // Her current reply, to recognise her own name in the speakers, and
+        // how long her face has stayed the same, for the tone of her voice.
         let mut said = self.bus.subscribe();
         let echo = Arc::downgrade(self);
         tauri::async_runtime::spawn(async move {
@@ -381,6 +411,9 @@ impl Ctx {
                                 .rev()
                                 .collect();
                         }
+                    }
+                    mika_core::Event::EmotionChanged { emotion } => {
+                        *ctx.face_since.lock() = (emotion, std::time::Instant::now());
                     }
                     _ => {}
                 }
@@ -481,11 +514,22 @@ impl Ctx {
     pub fn apply_voice_engine(&self) {
         let v = self.config.lock().voice.clone();
         let emotion = self.emotion.get().cloned().filter(|_| v.tone_by_mood);
+        let since = self.face_since.clone();
         // The face of the moment the sentence is asked for, when tone follows mood.
         let mood = move || {
             emotion
                 .as_ref()
-                .map_or(mika_core::emotion::Emotion::Neutral, |e| e.get())
+                .map_or(mika_core::emotion::Emotion::Neutral, |e| {
+                    let face = e.get();
+                    let (seen, at) = *since.lock();
+                    // Not seen yet: the face has only just changed.
+                    let held = if seen == face {
+                        at.elapsed()
+                    } else {
+                        std::time::Duration::ZERO
+                    };
+                    voice_mood(face, held)
+                })
         };
         if v.tts == TtsEngine::Provider && !v.tts_model.trim().is_empty() {
             let live = self.live.clone();
@@ -652,7 +696,7 @@ impl Ctx {
             *slot = Some(control.clone());
             control
         };
-        // Her own speech must not reach the microphone.
+        // Her own speech must not reach the microphone, nor a retelling still being made.
         self.voice.stop();
         let before = self.state.get();
         let rest = if before == AssistantState::AwaitingConfirm {
@@ -909,6 +953,27 @@ mod tests {
         assert_eq!(super::speech_locale("en"), "en-US");
         assert_eq!(super::speech_locale("de"), "de-DE");
         assert_eq!(super::speech_locale("en-GB"), "en-GB");
+    }
+
+    #[test]
+    fn a_long_sleepy_face_does_not_make_her_voice_sleepy() {
+        use super::voice_mood;
+        use mika_core::emotion::Emotion;
+        use std::time::Duration;
+        // After half an hour of silence a greeting is not said sleepily.
+        assert_eq!(
+            voice_mood(Emotion::Sleepy, Duration::from_secs(1800)),
+            Emotion::Neutral
+        );
+        // A reply tagged sleepy is.
+        assert_eq!(
+            voice_mood(Emotion::Sleepy, Duration::from_secs(1)),
+            Emotion::Sleepy
+        );
+        assert_eq!(
+            voice_mood(Emotion::Joy, Duration::from_secs(1800)),
+            Emotion::Joy
+        );
     }
 
     #[test]

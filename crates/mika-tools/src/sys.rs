@@ -238,6 +238,15 @@ pub trait Radios: Send + Sync {
     fn set(&self, kind: RadioKind, on: bool) -> Result<(), String>;
 }
 
+/// What the clipboard held before she used it, to be put back afterwards.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedClip {
+    /// Clipboard formats with their bytes, in the order the clipboard listed
+    /// them: text, pictures, files and the marks password managers put on
+    /// their copies.
+    pub formats: Vec<(u32, Vec<u8>)>,
+}
+
 pub trait Clipboard: Send + Sync {
     fn get(&self) -> Result<String, String>;
     fn set(&self, text: &str) -> Result<(), String>;
@@ -245,6 +254,11 @@ pub trait Clipboard: Send + Sync {
     fn set_files(&self, _paths: &[PathBuf]) -> Result<(), String> {
         Err("копирование файлов в буфер здесь недоступно".into())
     }
+    /// What the clipboard holds now, not only text: marks of password
+    /// managers too, so that what is put back stays out of clipboard history.
+    fn save(&self) -> Result<SavedClip, String>;
+    /// Puts back what `save` returned, in place of anything there now.
+    fn restore(&self, saved: &SavedClip) -> Result<(), String>;
 }
 
 /// One clickable or editable element of a web page, numbered for the model.
@@ -383,6 +397,8 @@ pub struct Shared {
     pub screen_enabled: Arc<AtomicBool>,
     /// `tools.news_feed` from the config.
     pub news_feed: Arc<RwLock<String>>,
+    /// `island.city` from the config: the user's city for the weather.
+    pub home_city: Arc<RwLock<String>>,
     pub memory: Memory,
     pub vision: Arc<dyn Vision>,
     pub images: Arc<dyn ImageGen>,

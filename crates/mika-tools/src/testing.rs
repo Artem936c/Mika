@@ -28,6 +28,13 @@ pub struct Fakes {
     pub focused: Mutex<Vec<u64>>,
     pub closed: Mutex<Vec<u64>>,
     pub clipboard: Mutex<String>,
+    /// The clipboard text carries the marks of a password manager.
+    pub clip_private: Mutex<bool>,
+    /// Gets every text the clipboard takes, as the app's watch does, unless
+    /// the text is marked.
+    pub clip_watch: Mutex<Option<crate::cliphist::ClipHistory>>,
+    /// A key chord that fails.
+    pub chord_error: Mutex<Option<Vec<u16>>>,
     /// A real picture for every capture: PNG, width, height.
     pub picture: Mutex<Option<(Vec<u8>, u32, u32)>>,
     /// Windows moved to a monitor.
@@ -228,6 +235,9 @@ impl Ui for Fake {
 
 impl Input for Fake {
     fn chord(&self, keys: &[u16]) -> Result<(), String> {
+        if self.0.chord_error.lock().as_deref() == Some(keys) {
+            return Err("клавиши не нажались".into());
+        }
         self.0.chords.lock().push(keys.to_vec());
         Ok(())
     }
@@ -334,16 +344,53 @@ impl Radios for Fake {
     }
 }
 
+/// Text in the fake's saved clipboard.
+const SAVED_TEXT: u32 = 13;
+/// A password manager's mark in the fake's saved clipboard.
+const SAVED_MARK: u32 = 0xC100;
+
+impl Fake {
+    /// The clipboard takes `text`: like every real write, it drops the marks.
+    fn clip_write(&self, text: &str, private: bool) {
+        *self.0.clipboard.lock() = text.into();
+        *self.0.clip_private.lock() = private;
+        if let Some(history) = self.0.clip_watch.lock().as_ref() {
+            if !private && !text.is_empty() {
+                history.push(text, "fake.exe", 0);
+            }
+        }
+    }
+}
+
 impl Clipboard for Fake {
     fn get(&self) -> Result<String, String> {
         Ok(self.0.clipboard.lock().clone())
     }
     fn set(&self, text: &str) -> Result<(), String> {
-        *self.0.clipboard.lock() = text.into();
+        self.clip_write(text, false);
         Ok(())
     }
     fn set_files(&self, paths: &[PathBuf]) -> Result<(), String> {
         *self.0.clip_files.lock() = paths.to_vec();
+        self.clip_write("", false);
+        Ok(())
+    }
+    fn save(&self) -> Result<SavedClip, String> {
+        let mut formats = vec![(SAVED_TEXT, self.0.clipboard.lock().as_bytes().to_vec())];
+        if *self.0.clip_private.lock() {
+            formats.push((SAVED_MARK, Vec::new()));
+        }
+        Ok(SavedClip { formats })
+    }
+    fn restore(&self, saved: &SavedClip) -> Result<(), String> {
+        let text = saved
+            .formats
+            .iter()
+            .find(|(f, _)| *f == SAVED_TEXT)
+            .map(|(_, b)| String::from_utf8_lossy(b).into_owned())
+            .unwrap_or_default();
+        let private = saved.formats.iter().any(|(f, _)| *f == SAVED_MARK);
+        self.clip_write(&text, private);
         Ok(())
     }
 }
@@ -455,6 +502,7 @@ pub fn env_with(db: Arc<Db>, user_profile: &str) -> (ToolEnv, Arc<Fakes>) {
             news_feed: Arc::new(parking_lot::RwLock::new(
                 "https://feed.example/rss".to_string(),
             )),
+            home_city: Default::default(),
             memory: Memory::new(db.clone(), None),
             vision: fake(),
             images: fake(),

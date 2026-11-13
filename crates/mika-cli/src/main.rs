@@ -85,6 +85,7 @@ async fn run() {
             web_enabled: Arc::new(AtomicBool::new(config.tools.web_enabled)),
             screen_enabled: Arc::new(AtomicBool::new(config.privacy.screen_enabled)),
             news_feed: Arc::new(RwLock::new(config.tools.news_feed.clone())),
+            home_city: Arc::new(RwLock::new(config.island.city.clone())),
             memory: memory.clone(),
             vision: Arc::new(live.clone()),
             images: Arc::new(live),

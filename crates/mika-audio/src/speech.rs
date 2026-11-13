@@ -7,9 +7,12 @@ use std::sync::{Arc, OnceLock};
 
 use mika_core::events::{Event, EventBus};
 use mika_core::schedule::ReminderKind;
+use mika_core::state::AssistantState;
+use parking_lot::Mutex;
 use regex::Regex;
 use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::Notify;
 
 /// A sentence shorter than this waits for the next one: "т. е." is not a sentence.
 const MIN_SENTENCE: usize = 12;
@@ -166,6 +169,22 @@ pub struct SpeakerSwitch {
     /// Long replies are retold briefly instead of read out.
     brief: Arc<AtomicBool>,
     summarize: Option<Summarize>,
+    /// A lock, so a stop never slips between the check and the queueing of a
+    /// retelling.
+    retellings: Arc<Mutex<Retellings>>,
+    /// Wakes the retellings being made when they are dropped: they stop
+    /// waiting for the model at once.
+    dropped: Arc<Notify>,
+}
+
+/// Retellings being made and which of them still count.
+#[derive(Default)]
+struct Retellings {
+    /// Grows on every stop and new message: a retelling asked for before it
+    /// is dropped.
+    generation: u64,
+    /// Retellings of this generation not yet said.
+    pending: usize,
 }
 
 impl SpeakerSwitch {
@@ -205,8 +224,152 @@ impl SpeakerSwitch {
         self.brief.load(Ordering::Relaxed)
     }
 
-    fn heard(&self) -> bool {
+    /// Whether anyone would hear her now: false while the system sound is off.
+    pub fn heard(&self) -> bool {
         self.audible.as_ref().is_none_or(|a| a())
+    }
+
+    /// Drops the retellings still being made: «Стоп», a new message, the
+    /// microphone opening.
+    /// They stop counting as speech at once, not when the model answers.
+    pub fn cancel(&self) {
+        {
+            let mut r = self.retellings.lock();
+            r.generation += 1;
+            r.pending = 0;
+        }
+        self.dropped.notify_waiters();
+    }
+
+    /// True while a retelling is being made: she has not finished speaking.
+    pub fn retelling(&self) -> bool {
+        self.retellings.lock().pending > 0
+    }
+
+    /// `voice` as the rest of the app should use it: a retelling still being
+    /// made counts as speech, so nobody listens or turns other programs up
+    /// over it, and `stop` drops it too.
+    pub fn wrap(&self, voice: Arc<dyn Voice>) -> Arc<dyn Voice> {
+        Arc::new(Retold {
+            inner: voice,
+            switch: self.clone(),
+        })
+    }
+
+    /// Says a short retelling of a long reply once it is made, unless she was
+    /// stopped meanwhile. Until then she counts as speaking.
+    fn retell(&self, voice: Arc<dyn Voice>, reply: String) {
+        // Nobody would hear it: the model is not asked either.
+        if !self.heard() {
+            return;
+        }
+        let pending = Pending::start(&self.retellings);
+        let switch = self.clone();
+        tokio::spawn(async move {
+            let dropped = switch.dropped.clone();
+            let dropped = dropped.notified();
+            tokio::pin!(dropped);
+            // A stop before `notified` was made does not wake it.
+            if !pending.current() {
+                return;
+            }
+            let summary = async {
+                match switch.summarize.clone() {
+                    Some(s) => s(reply.clone()).await,
+                    None => None,
+                }
+            };
+            let short = tokio::select! {
+                short = summary => short,
+                () = &mut dropped => return,
+            };
+            let text = short
+                .map(|s| clean_for_speech(&s))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| fallback_brief(&reply));
+            let wanted = switch.get() && switch.heard();
+            let r = switch.retellings.lock();
+            if wanted && r.generation == pending.generation {
+                voice.speak(&text);
+            }
+            drop(r);
+            // Let go only after the retelling is queued: the voice is busy by then.
+            drop(pending);
+        });
+    }
+}
+
+/// Counts one retelling until it is said or dropped.
+struct Pending {
+    retellings: Arc<Mutex<Retellings>>,
+    generation: u64,
+}
+
+impl Pending {
+    fn start(retellings: &Arc<Mutex<Retellings>>) -> Self {
+        let mut r = retellings.lock();
+        r.pending += 1;
+        Self {
+            retellings: retellings.clone(),
+            generation: r.generation,
+        }
+    }
+
+    /// Whether no stop came since it was asked for.
+    fn current(&self) -> bool {
+        self.retellings.lock().generation == self.generation
+    }
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let mut r = self.retellings.lock();
+        // A stop has already let go of the retellings of older generations.
+        if r.generation == self.generation {
+            r.pending = r.pending.saturating_sub(1);
+        }
+    }
+}
+
+/// The voice made by [`SpeakerSwitch::wrap`].
+struct Retold {
+    inner: Arc<dyn Voice>,
+    switch: SpeakerSwitch,
+}
+
+impl Voice for Retold {
+    fn speak(&self, text: &str) {
+        self.inner.speak(text);
+    }
+
+    fn stop(&self) {
+        // The retelling first: once dropped, it cannot reach the voice after the stop.
+        self.switch.cancel();
+        self.inner.stop();
+    }
+
+    fn voices(&self) -> Vec<VoiceInfo> {
+        self.inner.voices()
+    }
+
+    fn configure(&self, voice: &str, rate: f32) {
+        self.inner.configure(voice, rate);
+    }
+
+    fn set_remote(&self, remote: Option<RemoteSynth>) {
+        self.inner.set_remote(remote);
+    }
+
+    fn set_observer(&self, observer: Option<FirstSound>) {
+        self.inner.set_observer(observer);
+    }
+
+    fn busy(&self) -> bool {
+        self.switch.retelling() || self.inner.busy()
+    }
+
+    fn set_tone(&self, tone: Option<ToneSource>) {
+        self.inner.set_tone(tone);
     }
 }
 
@@ -241,6 +404,8 @@ struct Turn {
     long: bool,
     /// A multi-step task runs: steps are not spoken, only the end.
     task: bool,
+    /// How the task of this turn ended, `Some(ok)`, once it has.
+    task_end: Option<bool>,
 }
 
 /// Reads replies, questions about actions and reminders aloud until the bus closes.
@@ -253,31 +418,27 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
     let mut turn = Turn::default();
     // True once a piece of the current reply has arrived as a delta.
     let mut streamed = false;
-    // Grows with every new message: a retelling of an older reply is dropped.
-    let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // A question about an action is open: what the user says answers it, and
+    // the reply goes on with its task.
+    let mut confirming = false;
     let say = |text: &str| {
         let clean = clean_for_speech(text);
         if !clean.is_empty() && switch.heard() {
             voice.speak(&clean);
         }
     };
-    let retell = |reply: String| {
-        let gen = generation.load(Ordering::Relaxed);
-        let (voice, switch, generation) = (voice.clone(), switch.clone(), generation.clone());
-        let summarize = switch.summarize.clone();
-        tokio::spawn(async move {
-            let short = match summarize {
-                Some(s) => s(reply.clone()).await,
-                None => None,
-            };
-            let text = short
-                .map(|s| clean_for_speech(&s))
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| fallback_brief(&reply));
-            if generation.load(Ordering::Relaxed) == gen && switch.get() && switch.heard() {
-                voice.speak(&text);
-            }
-        });
+    // A whole reply goes to the voice sentence by sentence: in one piece it
+    // would start late and be cut off.
+    let say_all = |text: &str| {
+        let mut s = SentenceSplitter::default();
+        for sentence in s.push(text).into_iter().chain(s.finish()) {
+            say(&sentence);
+        }
+    };
+    // Silence now, a retelling still being made included.
+    let stop = || {
+        switch.cancel();
+        voice.stop();
     };
     loop {
         let event = match events.recv().await {
@@ -285,24 +446,45 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
             Err(RecvError::Lagged(_)) => continue,
             Err(RecvError::Closed) => break,
         };
+        match &event {
+            Event::ConfirmRequested { .. } => confirming = true,
+            Event::ConfirmResolved { .. }
+            | Event::StateChanged {
+                to: AssistantState::Idle,
+                ..
+            } => confirming = false,
+            _ => {}
+        }
         let brief = switch.brief();
         match event {
+            // An answer to the question: her voice stops, the turn goes on.
+            Event::UserText { .. } if confirming => stop(),
             // A new message interrupts whatever she was saying.
             Event::UserText { .. } => {
-                voice.stop();
-                generation.fetch_add(1, Ordering::Relaxed);
+                stop();
                 turn = Turn::default();
                 streamed = false;
             }
+            // Not the error of the turn: the agent ends the task before it
+            // reports one. The microphone or the selection failed meanwhile.
+            Event::Error { .. } if turn.task && turn.task_end.is_none() => {}
             Event::Error { message } => {
-                voice.stop();
-                generation.fetch_add(1, Ordering::Relaxed);
-                let broke_off = turn.task;
+                stop();
+                let broke_off = turn.task_end == Some(false);
                 turn = Turn::default();
                 streamed = false;
                 if broke_off && switch.get() {
                     say(&format!("Задача оборвалась. {message}"));
                 }
+            }
+            // A task stopped by the user ends without a reply or an error:
+            // a later error is not about it.
+            Event::StateChanged {
+                to: AssistantState::Idle,
+                ..
+            } if turn.task_end.is_some() => {
+                turn = Turn::default();
+                streamed = false;
             }
             Event::TaskUpdated { task } => {
                 if !task.finished && !turn.task {
@@ -312,6 +494,7 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
                 }
                 // Stays set to the end of the turn: the final reply comes whole.
                 turn.task = true;
+                turn.task_end = task.finished.then_some(task.ok);
             }
             _ if !switch.get() => {}
             Event::AssistantDelta { .. } if turn.task => streamed = true,
@@ -333,22 +516,24 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
                     turn.held.extend(sentences);
                 }
             }
+            // How to answer the question: the turn goes on.
+            Event::AssistantText { text } if confirming => say(&text),
             Event::AssistantText { text } => {
                 let whole = !streamed || turn.task;
                 if !brief {
                     if whole {
-                        say(&text);
+                        say_all(&text);
                     } else if let Some(rest) = turn.splitter.finish() {
                         say(&rest);
                     }
                 } else if whole {
                     if text.chars().count() > LONG_REPLY {
-                        retell(text);
+                        switch.retell(voice.clone(), text);
                     } else {
                         say(&text);
                     }
                 } else if turn.long {
-                    retell(text);
+                    switch.retell(voice.clone(), text);
                 } else {
                     for sentence in turn.held.drain(..) {
                         say(&sentence);
@@ -393,8 +578,8 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mika_core::confirm::{Answer, DecidedBy};
     use mika_core::tools::{Assessment, RiskLevel};
-    use parking_lot::Mutex;
     use std::time::Duration;
 
     #[derive(Default)]
@@ -628,14 +813,261 @@ mod tests {
     }
 
     fn task(finished: bool) -> Event {
+        task_with(finished, finished)
+    }
+
+    fn task_with(finished: bool, ok: bool) -> Event {
         Event::TaskUpdated {
             task: mika_core::task::Task {
                 title: "Задача".into(),
                 steps: Vec::new(),
                 finished,
-                ok: finished,
+                ok,
             },
         }
+    }
+
+    fn idle() -> Event {
+        Event::StateChanged {
+            from: AssistantState::Thinking,
+            to: AssistantState::Idle,
+        }
+    }
+
+    fn error(message: &str) -> Event {
+        Event::Error {
+            message: message.into(),
+        }
+    }
+
+    fn confirm_requested() -> Event {
+        Event::ConfirmRequested {
+            id: 7,
+            tool: "messenger_send".into(),
+            assessment: Assessment::new(RiskLevel::High, "Написать Ане", "x", "y"),
+            allow_always: false,
+            timeout_s: 60,
+        }
+    }
+
+    fn confirm_resolved() -> Event {
+        Event::ConfirmResolved {
+            id: 7,
+            answer: Answer::Once,
+            by: DecidedBy::Chat,
+        }
+    }
+
+    /// Long-reply retelling that waits until the test lets it go.
+    fn gated_switch() -> (SpeakerSwitch, tokio::sync::oneshot::Sender<()>) {
+        let (go, wait) = tokio::sync::oneshot::channel::<()>();
+        let wait = Arc::new(Mutex::new(Some(wait)));
+        let s = SpeakerSwitch::new(true).with_summarizer(Arc::new(move |_reply: String| {
+            let wait = wait.lock().take();
+            Box::pin(async move {
+                if let Some(w) = wait {
+                    let _ = w.await;
+                }
+                Some("Коротко о главном.".into())
+            })
+        }));
+        s.set_brief(true);
+        (s, go)
+    }
+
+    /// What happened to a long reply whose retelling the model makes slowly.
+    struct SlowRetelling {
+        voice: Arc<FakeVoice>,
+        /// She counted as speaking while the model was retelling.
+        busy_meanwhile: bool,
+        /// The retelling still waited for the model when it answered.
+        model_waited: bool,
+    }
+
+    async fn long_reply_with_a_slow_retelling(stop_meanwhile: bool) -> SlowRetelling {
+        let bus = EventBus::new(64);
+        let inner = Arc::new(FakeVoice::default());
+        let (switch, go) = gated_switch();
+        let voice = switch.wrap(inner.clone());
+        let job = tokio::spawn(run_speaker(bus.clone(), voice.clone(), switch));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        bus.publish(Event::AssistantText {
+            text: "Это очень длинный ответ про погоду на неделю. ".repeat(10),
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // The model is still retelling: she has not finished speaking.
+        let busy_meanwhile = voice.busy();
+        assert!(inner.said.lock().is_empty());
+        if stop_meanwhile {
+            // «Стоп», the stop word or the microphone opening.
+            voice.stop();
+            // Silent at once, not when the model answers.
+            assert!(!voice.busy());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let model_waited = go.send(()).is_ok();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        job.abort();
+        assert!(!voice.busy());
+        SlowRetelling {
+            voice: inner,
+            busy_meanwhile,
+            model_waited,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retelling_being_made_counts_as_speech() {
+        let r = long_reply_with_a_slow_retelling(false).await;
+        assert!(r.busy_meanwhile);
+        assert!(r.model_waited);
+        assert_eq!(*r.voice.said.lock(), ["Коротко о главном."]);
+    }
+
+    #[tokio::test]
+    async fn a_stop_drops_a_retelling_being_made() {
+        let r = long_reply_with_a_slow_retelling(true).await;
+        assert!(r.busy_meanwhile);
+        // The model is not waited for after the stop.
+        assert!(!r.model_waited);
+        assert!(r.voice.said.lock().is_empty());
+        assert_eq!(*r.voice.stops.lock(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_stop_between_two_retellings_lets_go_of_the_old_one_only() {
+        let switch = gated_switch().0;
+        let inner = Arc::new(FakeVoice::default());
+        let voice = switch.wrap(inner.clone());
+        switch.retell(inner.clone(), "Первый длинный ответ.".into());
+        assert!(voice.busy());
+        voice.stop();
+        assert!(!voice.busy());
+        // The next reply is retold and counts as speech until it is said.
+        switch.retell(inner.clone(), "Второй длинный ответ.".into());
+        assert!(voice.busy());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!voice.busy());
+        assert_eq!(*inner.said.lock(), ["Коротко о главном."]);
+    }
+
+    #[tokio::test]
+    async fn an_answer_to_a_question_keeps_the_task_silent() {
+        // A step after the answer is not said.
+        let v = run_with(
+            vec![
+                task(false),
+                confirm_requested(),
+                Event::UserText {
+                    text: "эээ".into()
+                },
+                Event::AssistantText {
+                    text: "Скажи «да» или «нет».".into(),
+                },
+                Event::UserText {
+                    text: "да".into()
+                },
+                confirm_resolved(),
+                delta("Отправила. Теперь открою браузер. "),
+                Event::ToolStarted {
+                    id: "2".into(),
+                    name: "open_app".into(),
+                    summary: "Открыть".into(),
+                },
+                task(true),
+                Event::AssistantText {
+                    text: "Всё сделала.".into(),
+                },
+            ],
+            brief_switch(),
+        )
+        .await;
+        assert_eq!(
+            *v.said.lock(),
+            [
+                "Нужно подтверждение. Написать Ане.",
+                "Скажи «да» или «нет».",
+                "Всё сделала."
+            ]
+        );
+
+        // Without retelling the end right after the answer is said once.
+        let end = "Сообщение Ане отправлено.";
+        let v = run_with(
+            vec![
+                task(false),
+                confirm_requested(),
+                Event::UserText {
+                    text: "да".into()
+                },
+                confirm_resolved(),
+                delta(&format!("{end} ")),
+                task(true),
+                Event::AssistantText { text: end.into() },
+            ],
+            SpeakerSwitch::new(true),
+        )
+        .await;
+        assert_eq!(*v.said.lock(), ["Нужно подтверждение. Написать Ане.", end]);
+    }
+
+    #[tokio::test]
+    async fn an_error_from_elsewhere_is_not_a_broken_task() {
+        // The microphone fails while the task runs: the task goes on silently.
+        let v = run_with(
+            vec![
+                task(false),
+                error("не услышала речь"),
+                delta("Шаг два готов. "),
+                Event::ToolStarted {
+                    id: "1".into(),
+                    name: "open_app".into(),
+                    summary: "Открыть".into(),
+                },
+                task(true),
+                Event::AssistantText {
+                    text: "Всё сделала.".into(),
+                },
+            ],
+            brief_switch(),
+        )
+        .await;
+        assert_eq!(*v.said.lock(), ["Всё сделала."]);
+
+        // A task stopped by the user; later the microphone hears nothing.
+        let v = run_with(
+            vec![
+                task(false),
+                task_with(true, false),
+                idle(),
+                error("не услышала речь"),
+            ],
+            brief_switch(),
+        )
+        .await;
+        assert!(v.said.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_retelling_the_end_of_a_task_is_said_by_sentences() {
+        let end = "Нашла три файла с отчётами. Самый новый — за октябрь. Остальные старше года.";
+        let v = run_with(
+            vec![
+                task(false),
+                task(true),
+                Event::AssistantText { text: end.into() },
+            ],
+            SpeakerSwitch::new(true),
+        )
+        .await;
+        assert_eq!(
+            *v.said.lock(),
+            [
+                "Нашла три файла с отчётами.",
+                "Самый новый — за октябрь.",
+                "Остальные старше года."
+            ]
+        );
     }
 
     #[tokio::test]
@@ -685,14 +1117,13 @@ mod tests {
         .await;
         assert_eq!(*v.said.lock(), vec!["Всё сделала."]);
 
-        // A task that broke off says why.
+        // A task that broke off says why. The agent ends the task first.
         let v = run_with(
             vec![
                 task(false),
                 delta("Шаг один. "),
-                Event::Error {
-                    message: "слишком много шагов подряд".into(),
-                },
+                task_with(true, false),
+                error("слишком много шагов подряд"),
             ],
             brief_switch(),
         )
