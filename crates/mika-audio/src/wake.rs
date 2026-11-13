@@ -61,14 +61,53 @@ pub fn has_name(heard: &str, name: &str) -> bool {
     !name.is_empty() && heard.windows(name.len()).any(|w| w == name.as_slice())
 }
 
-/// The phrase that wakes her, if the recognizer heard the name. Partial text
-/// counts: the whole vocabulary keeps it clean, and waiting for the pause
-/// after the name would make her slow.
+/// Words that stop her speech. They act only while she speaks.
+pub const STOP_WORDS: &[&str] = &[
+    "стоп",
+    "хватит",
+    "замолчи",
+    "помолчи",
+    "тихо",
+    "достаточно",
+    "остановись",
+];
+
+/// What a heard phrase asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeardKind {
+    /// The name: listen to the user.
+    Name,
+    /// A stop word without the name: stop talking.
+    Stop,
+}
+
+/// The stop word in the phrase, as a whole word.
+pub fn stop_word(heard: &str) -> Option<&'static str> {
+    heard
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .find_map(|w| STOP_WORDS.iter().find(|s| **s == w).copied())
+}
+
+/// The name wins over a stop word: «Мика, стоп» is a call.
+pub fn heard_kind(heard: &str, name: &str) -> Option<HeardKind> {
+    if has_name(heard, name) {
+        Some(HeardKind::Name)
+    } else if stop_word(heard).is_some() {
+        Some(HeardKind::Stop)
+    } else {
+        None
+    }
+}
+
+/// The phrase that wakes or stops her, if the recognizer heard the name or a
+/// stop word. Partial text counts: the whole vocabulary keeps it clean, and
+/// waiting for the pause after the name would make her slow.
 pub fn woke(heard: &Heard, name: &str) -> Option<String> {
     let text = match heard {
         Heard::Partial(t) | Heard::Final { text: t, .. } => t,
     };
-    has_name(text, name).then(|| text.clone())
+    heard_kind(text, name).map(|_| text.clone())
 }
 
 /// Stops listening when dropped.
@@ -461,5 +500,15 @@ mod tests {
         assert!(is_echo("Мика", "Меня зовут МИКА, чем помочь?"));
         assert!(!is_echo("Мика", "Сегодня минус десять."));
         assert!(!is_echo("", "что угодно"));
+    }
+
+    #[test]
+    fn a_stop_word_stops_and_the_name_calls() {
+        assert_eq!(heard_kind("мика стоп", "мика"), Some(HeardKind::Name));
+        assert_eq!(heard_kind("ну хватит", "мика"), Some(HeardKind::Stop));
+        assert_eq!(heard_kind("Замолчи", "мика"), Some(HeardKind::Stop));
+        assert_eq!(heard_kind("стопка книг", "мика"), None);
+        assert_eq!(heard_kind("включи музыку", "мика"), None);
+        assert_eq!(stop_word("а теперь тихо"), Some("тихо"));
     }
 }

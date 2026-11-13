@@ -10,10 +10,14 @@
     news_feed: string;
     groups: { id: string; enabled: boolean }[];
     tool_count: number;
+    notifications: { enabled: boolean; only_messengers: boolean; read_aloud: boolean };
+    briefing_enabled: boolean;
+    briefing_time: string;
   }
 
   let s = $state<ToolSettings | null>(null);
   let feed = $state('');
+  let briefingTime = $state('08:00');
   let note = $state('');
   let error = $state('');
 
@@ -23,6 +27,7 @@
     try {
       s = await invoke<ToolSettings>('get_tool_settings');
       feed = s.news_feed;
+      briefingTime = s.briefing_time;
     } catch (e) {
       error = String(e);
     }
@@ -43,6 +48,15 @@
     if (!error) note = t('island.saved');
   }
 
+  function setNotify(change: Partial<ToolSettings['notifications']>) {
+    if (!s) return;
+    run('set_notifications', { ...s.notifications, ...change });
+  }
+
+  function setBriefing(enabled: boolean) {
+    run('set_briefing', { enabled, time: briefingTime });
+  }
+
   const groupTitle = (id: string) => {
     const key = `group.${id}`;
     return isMessageKey(key) ? t(key) : id;
@@ -58,6 +72,39 @@
       sub={t('tools.screen_sub')}
       onchange={(v) => run('set_screen_enabled', { value: v })}
     />
+  </div>
+
+  <div class="lbl">{t('tools.notify')}</div>
+  <div class="stack">
+    <Switch
+      checked={s.notifications.enabled}
+      title={t('tools.notify_on')}
+      sub={t('tools.notify_on_sub')}
+      onchange={(v) => setNotify({ enabled: v })}
+    />
+    {#if s.notifications.enabled}
+      <Switch
+        checked={s.notifications.only_messengers}
+        title={t('tools.notify_messengers')}
+        sub={t('tools.notify_messengers_sub')}
+        onchange={(v) => setNotify({ only_messengers: v })}
+      />
+      <Switch
+        checked={s.notifications.read_aloud}
+        title={t('tools.notify_aloud')}
+        sub={t('tools.notify_aloud_sub')}
+        onchange={(v) => setNotify({ read_aloud: v })}
+      />
+    {/if}
+  </div>
+
+  <div class="lbl">{t('tools.briefing')}</div>
+  <div class="stack">
+    <Switch checked={s.briefing_enabled} title={t('tools.briefing_on')} sub={t('tools.briefing_sub')} onchange={setBriefing} />
+  </div>
+  <div class="line time">
+    <span>{t('tools.briefing_time')}</span>
+    <input class="fld" type="time" bind:value={briefingTime} onchange={() => s && setBriefing(s.briefing_enabled)} />
   </div>
 
   <div class="lbl">{t('tools.feed')}</div>
@@ -89,6 +136,14 @@
   .line {
     display: flex;
     gap: 8px;
+  }
+  .time {
+    align-items: center;
+    margin: 10px 2px 4px;
+    font-size: 13px;
+  }
+  .time .fld {
+    width: 120px;
   }
   .hint {
     margin: 0 2px 10px;

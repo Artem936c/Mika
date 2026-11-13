@@ -3,7 +3,9 @@
 mod app;
 mod bridge;
 mod catalog;
+mod everyday;
 mod platform;
+mod selection;
 mod settings;
 mod strings;
 mod tray;
@@ -182,6 +184,9 @@ fn main() {
             settings::clear_speech_cache,
             settings::install_vosk,
             settings::set_follow_up,
+            settings::set_duck_media,
+            settings::set_notifications,
+            settings::set_briefing,
             settings::remove_vosk,
             settings::save_speech_settings,
             settings::set_microphone_enabled,
@@ -194,6 +199,9 @@ fn main() {
             settings::save_update_settings,
             settings::check_update,
             settings::install_update,
+            selection::selection_action,
+            selection::selection_paste,
+            selection::selection_clear,
         ])
         .setup(move |app| {
             let island = app
@@ -222,6 +230,7 @@ fn main() {
             tray::install(app.handle(), &name)?;
             tray::register_shortcut(app.handle());
             tray::register_listen_shortcut(app.handle());
+            tray::register_selection_shortcut(app.handle());
             let _ = background.app.set(app.handle().clone());
             background.start_background();
             spawn_notifier(app.handle().clone(), bus.clone(), background.clone());
@@ -236,6 +245,12 @@ fn main() {
             );
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Programs quietened for her voice get their sound back.
+                app.state::<Arc<crate::app::Ctx>>().restore_media();
+            }
+        });
 }

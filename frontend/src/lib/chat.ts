@@ -208,6 +208,14 @@ export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
       if (text === null || e.kind === 'task') return items;
       return [...finishStreaming(items), { kind: 'reminder', text }];
     }
+    case 'notification': {
+      const app = str(e.app) ?? '';
+      const title = str(e.title) ?? '';
+      const body = str(e.text) ?? '';
+      if (!title && !body) return items;
+      const head = [app, title].filter(Boolean).join(' — ');
+      return [...finishStreaming(items), { kind: 'reminder', text: body ? `${head}: ${body}` : head }];
+    }
     default:
       return items;
   }
@@ -259,6 +267,12 @@ const TOOL_GROUPS: Record<string, MessageKey> = {
   rdp_open: 'tool.rdp',
   run_shell: 'tool.shell',
   volume: 'tool.volume',
+  app_volume: 'tool.volume',
+  system_health: 'tool.system',
+  chat_watch: 'tool.message',
+  screen_click: 'tool.screen',
+  search_text: 'tool.files',
+  disk_usage: 'tool.files',
   power: 'tool.power',
   clipboard: 'tool.clipboard',
   system_info: 'tool.system',
@@ -289,6 +303,7 @@ const TOOL_GROUPS: Record<string, MessageKey> = {
   history_search: 'tool.memory',
   media_control: 'tool.media',
   now_playing: 'tool.media',
+  messenger_send: 'tool.message',
   ui_read: 'tool.ui',
   ui_click: 'tool.ui',
   ui_type: 'tool.ui',

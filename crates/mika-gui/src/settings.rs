@@ -48,6 +48,9 @@ pub struct ToolSettings {
     news_feed: String,
     groups: Vec<ToolGroup>,
     tool_count: usize,
+    notifications: mika_core::config::NotificationsConfig,
+    briefing_enabled: bool,
+    briefing_time: String,
 }
 
 #[tauri::command]
@@ -57,6 +60,9 @@ pub fn get_tool_settings(ctx: CtxState<'_>) -> ToolSettings {
         web_enabled: c.tools.web_enabled,
         screen_enabled: c.privacy.screen_enabled,
         news_feed: c.tools.news_feed.clone(),
+        notifications: c.notifications.clone(),
+        briefing_enabled: c.briefing.enabled,
+        briefing_time: c.briefing.time.clone(),
         groups: mika_tools::GROUPS
             .iter()
             .map(|g| ToolGroup {
@@ -90,6 +96,51 @@ pub fn set_screen_enabled(app: AppHandle, ctx: CtxState<'_>, value: bool) -> Res
     ctx.set_screen_enabled(value)?;
     crate::bridge::settings_changed(&app);
     Ok(())
+}
+
+/// Notifications of other programs: on or off, which programs, aloud or not.
+#[tauri::command]
+pub fn set_notifications(
+    ctx: CtxState<'_>,
+    enabled: bool,
+    only_messengers: bool,
+    read_aloud: bool,
+) -> Result<(), String> {
+    {
+        let mut c = ctx.config.lock();
+        c.notifications.enabled = enabled;
+        c.notifications.only_messengers = only_messengers;
+        c.notifications.read_aloud = read_aloud;
+    }
+    if !enabled {
+        // Without notifications nobody would tell her a watched person wrote.
+        ctx.tool_env().shared.watches.stop_all();
+    }
+    ctx.save_config()
+}
+
+/// The morning summary: on or off and its time, `HH:MM`.
+#[tauri::command]
+pub fn set_briefing(ctx: CtxState<'_>, enabled: bool, time: String) -> Result<(), String> {
+    let time = time.trim().to_string();
+    if chrono::NaiveTime::parse_from_str(&time, "%H:%M").is_err() {
+        return Err(crate::strings::tr("error.briefing_time"));
+    }
+    {
+        let mut c = ctx.config.lock();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        // Turned on after its time today: the summary waits for tomorrow.
+        if enabled && !c.briefing.enabled {
+            let past = chrono::Local::now().time()
+                >= chrono::NaiveTime::parse_from_str(&time, "%H:%M").unwrap_or_default();
+            if past {
+                c.briefing.last_date = today;
+            }
+        }
+        c.briefing.enabled = enabled;
+        c.briefing.time = time;
+    }
+    ctx.save_config()
 }
 
 #[tauri::command]
@@ -651,6 +702,7 @@ pub struct VoiceSettings {
     vosk_downloading: bool,
     vosk_bytes: u64,
     follow_up: bool,
+    duck_media: bool,
 }
 
 /// Async: listing voices waits for Windows and must not block the UI thread.
@@ -709,7 +761,18 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
         vosk_downloading: crate::vosk::downloading(),
         vosk_bytes,
         follow_up: c.follow_up,
+        duck_media: c.duck_media,
     })
+}
+
+/// Other programs quieter while she listens and speaks, or not.
+#[tauri::command]
+pub fn set_duck_media(ctx: CtxState<'_>, value: bool) -> Result<(), String> {
+    ctx.config.lock().voice.duck_media = value;
+    if !value {
+        ctx.restore_media();
+    }
+    ctx.save_config()
 }
 
 /// Listen again after an answer to a spoken question, or not.

@@ -20,6 +20,62 @@ pub struct Config {
     pub telegram: TelegramConfig,
     pub embedding: EmbeddingConfig,
     pub updates: UpdatesConfig,
+    pub notifications: NotificationsConfig,
+    pub briefing: BriefingConfig,
+}
+
+/// Notifications of other programs. Off until the user turns them on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    pub enabled: bool,
+    /// Only messengers and mail; otherwise every program.
+    pub only_messengers: bool,
+    /// Say each one aloud when replies are spoken.
+    pub read_aloud: bool,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            only_messengers: true,
+            read_aloud: true,
+        }
+    }
+}
+
+/// The morning summary: weather, the day's plans, rates, news.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BriefingConfig {
+    pub enabled: bool,
+    /// Local time `HH:MM` after which the summary comes, once a day.
+    pub time: String,
+    /// Day of the last summary, `YYYY-MM-DD`.
+    pub last_date: String,
+}
+
+impl Default for BriefingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            time: "08:00".into(),
+            last_date: String::new(),
+        }
+    }
+}
+
+impl BriefingConfig {
+    /// Whether the summary is due at `now`: on, past the time, not yet today.
+    pub fn due(&self, now: chrono::NaiveDateTime) -> bool {
+        let Ok(at) = chrono::NaiveTime::parse_from_str(self.time.trim(), "%H:%M") else {
+            return false;
+        };
+        self.enabled
+            && now.time() >= at
+            && self.last_date != now.date().format("%Y-%m-%d").to_string()
+    }
 }
 
 /// Where to look for new versions. Nothing is checked while `manifest_url` is empty.
@@ -174,6 +230,8 @@ pub struct VoiceConfig {
     pub wake_enabled: bool,
     /// After an answer to a spoken question, listen again for a few seconds.
     pub follow_up: bool,
+    /// Other programs get quieter while she listens and speaks.
+    pub duck_media: bool,
 }
 
 impl Default for VoiceConfig {
@@ -192,6 +250,7 @@ impl Default for VoiceConfig {
             input_device: String::new(),
             wake_enabled: false,
             follow_up: true,
+            duck_media: true,
         }
     }
 }
@@ -602,5 +661,24 @@ mod tests {
         assert!(a.persona_prompt().contains("заботливая"));
         a.custom_prompt = "я".repeat(MAX_CUSTOM_PROMPT + 50);
         assert_eq!(a.persona_prompt().chars().count(), MAX_CUSTOM_PROMPT);
+    }
+
+    #[test]
+    fn briefing_comes_once_a_day_after_its_time() {
+        let at = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap();
+        let mut b = BriefingConfig {
+            enabled: true,
+            time: "08:30".into(),
+            last_date: "2026-11-12".into(),
+        };
+        assert!(!b.due(at("2026-11-13 08:00")));
+        assert!(b.due(at("2026-11-13 11:00")));
+        b.last_date = "2026-11-13".into();
+        assert!(!b.due(at("2026-11-13 11:00")));
+        b.last_date.clear();
+        b.time = "утро".into();
+        assert!(!b.due(at("2026-11-13 11:00")));
+        assert!(!NotificationsConfig::default().enabled);
+        assert!(!BriefingConfig::default().enabled);
     }
 }

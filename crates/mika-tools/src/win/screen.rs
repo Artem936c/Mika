@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::with_com;
-use crate::sys::{Screen, Shot};
+use crate::sys::{OcrWord, Screen, Shot};
 
 pub struct GdiScreen;
 
@@ -61,8 +61,13 @@ impl Drop for Gdi {
     }
 }
 
-/// Pixels as RGB, top row first.
-fn grab(window: Option<u64>, max_side: u32) -> Result<(Vec<u8>, u32, u32, f32), String> {
+/// Pixels as RGB, the picture size, the shrink factor and the screen position
+/// of the top left corner.
+#[allow(clippy::type_complexity)]
+fn grab(
+    window: Option<u64>,
+    max_side: u32,
+) -> Result<(Vec<u8>, u32, u32, f32, (i32, i32)), String> {
     // SAFETY: GDI calls on handles owned by `Gdi`; buffers outlive the calls that fill them.
     unsafe {
         let hwnd = window.map(|id| HWND(id as usize as *mut core::ffi::c_void));
@@ -181,7 +186,7 @@ fn grab(window: Option<u64>, max_side: u32) -> Result<(Vec<u8>, u32, u32, f32), 
         for [b, g, r, _] in bgra.as_chunks::<4>().0 {
             rgb.extend_from_slice(&[*r, *g, *b]);
         }
-        Ok((rgb, out_w as u32, out_h as u32, factor))
+        Ok((rgb, out_w as u32, out_h as u32, factor, origin))
     }
 }
 
@@ -213,6 +218,42 @@ fn ocr_engine() -> Result<OcrEngine, String> {
 }
 
 fn recognize(png: Vec<u8>) -> windows::core::Result<Result<String, String>> {
+    let result = match ocr_result(png)? {
+        Ok(r) => r,
+        Err(e) => return Ok(Err(e)),
+    };
+    let mut lines = Vec::new();
+    for line in result.Lines()? {
+        lines.push(line.Text()?.to_string());
+    }
+    Ok(Ok(lines.join("\n")))
+}
+
+fn recognize_words(png: Vec<u8>) -> windows::core::Result<Result<Vec<OcrWord>, String>> {
+    let result = match ocr_result(png)? {
+        Ok(r) => r,
+        Err(e) => return Ok(Err(e)),
+    };
+    let mut out = Vec::new();
+    for (i, line) in result.Lines()?.into_iter().enumerate() {
+        for word in line.Words()? {
+            let r = word.BoundingRect()?;
+            out.push(OcrWord {
+                text: word.Text()?.to_string(),
+                line: i as u32,
+                x: r.X,
+                y: r.Y,
+                w: r.Width,
+                h: r.Height,
+            });
+        }
+    }
+    Ok(Ok(out))
+}
+
+fn ocr_result(
+    png: Vec<u8>,
+) -> windows::core::Result<Result<windows::Media::Ocr::OcrResult, String>> {
     let stream = InMemoryRandomAccessStream::new()?;
     let writer = DataWriter::CreateDataWriter(&stream)?;
     writer.WriteBytes(&png)?;
@@ -232,22 +273,18 @@ fn recognize(png: Vec<u8>) -> windows::core::Result<Result<String, String>> {
             "снимок больше {limit} пикселей по стороне, распознавание его не берёт"
         )));
     }
-    let result = engine.RecognizeAsync(&bitmap)?.join()?;
-    let mut lines = Vec::new();
-    for line in result.Lines()? {
-        lines.push(line.Text()?.to_string());
-    }
-    Ok(Ok(lines.join("\n")))
+    Ok(Ok(engine.RecognizeAsync(&bitmap)?.join()?))
 }
 
 impl Screen for GdiScreen {
     fn capture(&self, window: Option<u64>, max_side: u32) -> Result<Shot, String> {
-        let (rgb, width, height, factor) = grab(window, max_side)?;
+        let (rgb, width, height, factor, origin) = grab(window, max_side)?;
         Ok(Shot {
             png: encode_png(&rgb, width, height)?,
             width,
             height,
             factor,
+            origin,
         })
     }
 
@@ -255,6 +292,14 @@ impl Screen for GdiScreen {
         let png = png.to_vec();
         with_com(COINIT_MULTITHREADED, move || {
             recognize(png)
+                .map_err(|e| format!("распознавание текста не сработало: {}", e.message()))?
+        })
+    }
+
+    fn ocr_words(&self, png: &[u8]) -> Result<Vec<OcrWord>, String> {
+        let png = png.to_vec();
+        with_com(COINIT_MULTITHREADED, move || {
+            recognize_words(png)
                 .map_err(|e| format!("распознавание текста не сработало: {}", e.message()))?
         })
     }
@@ -270,6 +315,37 @@ mod tests {
         assert_eq!(fit(3200, 1800, 1600), (1600, 900, 2.0));
         assert_eq!(fit(1000, 4000, 1600), (400, 1600, 2.5));
         assert_eq!(fit(5000, 5000, 0), (5000, 5000, 1.0));
+    }
+
+    #[test]
+    #[ignore = "looks at the screen and the mixer of this computer"]
+    fn live_words_with_boxes_and_the_mixer() {
+        use crate::sys::Volume;
+        // A picture from MIKA_OCR_PNG, or the screen.
+        let (png, width) = match std::env::var("MIKA_OCR_PNG") {
+            Ok(path) => {
+                let png = std::fs::read(path).unwrap();
+                let pic = crate::grid::decode(&png).unwrap();
+                (png, pic.width)
+            }
+            Err(_) => {
+                let shot = GdiScreen.capture(None, 0).unwrap();
+                (shot.png, shot.width)
+            }
+        };
+        let words = GdiScreen.ocr_words(&png).unwrap();
+        println!("picture width {width}, words {}", words.len());
+        for w in words.iter().take(8) {
+            println!("{:?}", w);
+        }
+        assert!(words
+            .iter()
+            .all(|w| w.x >= 0.0 && w.x + w.w <= width as f32 + 1.0));
+        let found = crate::grid::find_label(&words, "Сохранить как");
+        println!("label: {found:?}");
+        let apps = super::super::audio::CoreAudioVolume.apps();
+        println!("mixer: {apps:?}");
+        assert!(apps.is_ok());
     }
 
     #[test]

@@ -22,12 +22,18 @@ use crate::sys::*;
 pub struct Fakes {
     pub opened: Mutex<Vec<(String, Option<String>)>>,
     pub volume: Mutex<(u8, bool)>,
+    pub app_volumes: Mutex<Vec<AppVolume>>,
     pub power: Mutex<Vec<PowerAction>>,
     pub windows: Mutex<Vec<WindowInfo>>,
     pub focused: Mutex<Vec<u64>>,
     pub closed: Mutex<Vec<u64>>,
     pub clipboard: Mutex<String>,
     pub start_apps: Mutex<Vec<(String, String)>>,
+    pub ocr_text: Mutex<String>,
+    /// OCR answers in turn; when used up, `ocr_text`.
+    pub ocr_seq: Mutex<Vec<String>>,
+    /// What `Screen::ocr_words` finds.
+    pub ocr_words: Mutex<Vec<OcrWord>>,
     pub trashed: Mutex<Vec<PathBuf>>,
     pub hosts: Mutex<Vec<String>>,
     pub rdp_files: Mutex<Vec<PathBuf>>,
@@ -129,6 +135,23 @@ impl Volume for Fake {
         self.0.volume.lock().1 = mute;
         Ok(())
     }
+    fn apps(&self) -> Result<Vec<AppVolume>, String> {
+        Ok(self.0.app_volumes.lock().clone())
+    }
+    fn set_app(&self, pid: u32, level: Option<u8>, mute: Option<bool>) -> Result<(), String> {
+        let mut apps = self.0.app_volumes.lock();
+        let a = apps
+            .iter_mut()
+            .find(|a| a.pid == pid)
+            .ok_or("no such app")?;
+        if let Some(l) = level {
+            a.level = l;
+        }
+        if let Some(m) = mute {
+            a.muted = m;
+        }
+        Ok(())
+    }
 }
 
 impl Power for Fake {
@@ -214,10 +237,23 @@ impl Screen for Fake {
             width: (3200.0 / factor) as u32,
             height: (1800.0 / factor) as u32,
             factor,
+            origin: (10, 20),
         })
     }
+    fn ocr_words(&self, _png: &[u8]) -> Result<Vec<OcrWord>, String> {
+        Ok(self.0.ocr_words.lock().clone())
+    }
     fn ocr(&self, _png: &[u8]) -> Result<String, String> {
-        Ok("текст с экрана".into())
+        let mut seq = self.0.ocr_seq.lock();
+        if !seq.is_empty() {
+            return Ok(seq.remove(0));
+        }
+        let set = self.0.ocr_text.lock().clone();
+        Ok(if set.is_empty() {
+            "текст с экрана".into()
+        } else {
+            set
+        })
     }
 }
 
@@ -389,6 +425,7 @@ pub fn env_with(db: Arc<Db>, user_profile: &str) -> (ToolEnv, Arc<Fakes>) {
             images: fake(),
             bus: EventBus::new(64),
             tasks: mika_core::task::TaskBoard::new(EventBus::new(64)),
+            watches: Default::default(),
         },
         db,
     };

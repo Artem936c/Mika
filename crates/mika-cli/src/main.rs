@@ -89,6 +89,7 @@ async fn run() {
             images: Arc::new(live),
             bus: bus.clone(),
             tasks: task_board.clone(),
+            watches: Default::default(),
         },
     );
     let mut registry = ToolRegistry::new();

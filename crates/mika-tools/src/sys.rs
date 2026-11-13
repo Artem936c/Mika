@@ -23,11 +23,30 @@ pub trait Launcher: Send + Sync {
     }
 }
 
+/// Sound of one program in the Windows mixer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppVolume {
+    pub pid: u32,
+    /// Executable name, lower case: `chrome.exe`.
+    pub process: String,
+    /// 0..=100, relative to the system volume.
+    pub level: u8,
+    pub muted: bool,
+}
+
 pub trait Volume: Send + Sync {
     /// Level 0..=100 and mute flag.
     fn get(&self) -> Result<(u8, bool), String>;
     fn set(&self, level: u8) -> Result<(), String>;
     fn set_mute(&self, mute: bool) -> Result<(), String>;
+    /// Programs that have sound in the mixer now.
+    fn apps(&self) -> Result<Vec<AppVolume>, String> {
+        Err("громкость программ здесь недоступна".into())
+    }
+    /// Changes the level or the mute flag of every sound of the process.
+    fn set_app(&self, _pid: u32, _level: Option<u8>, _mute: Option<bool>) -> Result<(), String> {
+        Err("громкость программ здесь недоступна".into())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +160,20 @@ pub struct Shot {
     pub height: u32,
     /// Screen pixels per picture pixel: 1.0 unless the picture was shrunk.
     pub factor: f32,
+    /// Screen position of the top left corner, physical pixels.
+    pub origin: (i32, i32),
+}
+
+/// One word found on a picture, with its box in picture pixels.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OcrWord {
+    pub text: String,
+    /// Words of one line share it.
+    pub line: u32,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
 }
 
 pub trait Screen: Send + Sync {
@@ -149,6 +182,10 @@ pub trait Screen: Send + Sync {
     fn capture(&self, window: Option<u64>, max_side: u32) -> Result<Shot, String>;
     /// Text found on a PNG picture.
     fn ocr(&self, png: &[u8]) -> Result<String, String>;
+    /// Words found on a PNG picture with their boxes.
+    fn ocr_words(&self, _png: &[u8]) -> Result<Vec<OcrWord>, String> {
+        Err("распознавание слов с их местом здесь недоступно".into())
+    }
 }
 
 pub use mika_core::llm::{ImageGen, Vision};
@@ -288,6 +325,10 @@ pub struct ProcessInfo {
 pub trait SystemProbe: Send + Sync {
     fn facts(&self) -> SystemFacts;
     fn processes(&self) -> Vec<ProcessInfo>;
+    /// Charge in percent and whether it charges; `None` without a battery.
+    fn battery(&self) -> Option<(u8, bool)> {
+        None
+    }
 }
 
 /// Everything tools need from the outside world.
@@ -330,4 +371,6 @@ pub struct Shared {
     pub bus: EventBus,
     /// Plan of the running task; the agent reads the same board.
     pub tasks: mika_core::task::TaskBoard,
+    /// People whose messages she answers for the user; the notification reader uses it too.
+    pub watches: crate::watch::ChatWatches,
 }

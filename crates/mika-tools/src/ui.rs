@@ -26,7 +26,7 @@ use crate::util::{arg_bool, arg_u64, failed, truncate};
 pub const MAX_NODES: usize = 400;
 const MAX_TREE_CHARS: usize = 14_000;
 /// The highlight frame stays this long before the click.
-const TARGET_PAUSE_MS: u64 = 350;
+pub(crate) const TARGET_PAUSE_MS: u64 = 350;
 /// Time for the program to react before its window is read again.
 const SETTLE_MS: u64 = 400;
 /// Changed elements listed after an action.
@@ -136,7 +136,12 @@ impl UiEnv {
         Ok(w)
     }
 
-    fn act(&self, w: &WindowInfo, summary: impl Into<String>, target: String) -> Assessment {
+    pub(crate) fn act(
+        &self,
+        w: &WindowInfo,
+        summary: impl Into<String>,
+        target: String,
+    ) -> Assessment {
         Assessment::new(
             RiskLevel::Medium,
             summary,
@@ -165,7 +170,7 @@ impl UiEnv {
         }
     }
 
-    fn foreign_windows(&self) -> Vec<WindowInfo> {
+    pub(crate) fn foreign_windows(&self) -> Vec<WindowInfo> {
         self.windows
             .list()
             .into_iter()
@@ -175,7 +180,7 @@ impl UiEnv {
 
     /// What an action changed: a closed window, a new window (a dialog), or the
     /// elements that differ from the last reading. Saves a separate `ui_read`.
-    async fn outcome(&self, w: &WindowInfo, before: &[WindowInfo]) -> String {
+    pub(crate) async fn outcome(&self, w: &WindowInfo, before: &[WindowInfo]) -> String {
         tokio::time::sleep(std::time::Duration::from_millis(SETTLE_MS)).await;
         let now = self.foreign_windows();
         let mut out = Vec::new();
@@ -238,7 +243,7 @@ impl UiEnv {
         self.input.click(x, y, btn, double).map_err(failed)
     }
 
-    fn show_target(&self, r: Rect) {
+    pub(crate) fn show_target(&self, r: Rect) {
         self.bus.publish(Event::UiTarget {
             x: r.x,
             y: r.y,
@@ -269,7 +274,7 @@ const WINDOW_PROP: (&str, &str) = (
     "Часть заголовка окна или имя программы; без него — окно, в котором работает пользователь",
 );
 
-fn props(extra: &[(&str, Value)], required: &[&str]) -> Value {
+pub(crate) fn props(extra: &[(&str, Value)], required: &[&str]) -> Value {
     let mut p = serde_json::Map::new();
     p.insert(
         WINDOW_PROP.0.into(),
@@ -437,7 +442,7 @@ impl Tool for UiReadTool {
         }
         let process = w.process.to_lowercase();
         let note = if SELF_DRAWN.iter().any(|p| process.starts_with(p)) {
-            "\n(Эта программа не отдаёт текст сообщений: прочитать переписку можно screen_text с этим окном.)"
+            "\n(Эта программа не отдаёт текст сообщений: прочитать переписку можно screen_text с этим окном, а написать человеку в Telegram — messenger_send.)"
         } else {
             ""
         };
@@ -784,7 +789,7 @@ fn has_astral(text: &str) -> bool {
 impl UiEnv {
     /// Types the text where the caret is. Text with emoji goes through the
     /// clipboard, which is put back afterwards.
-    async fn type_text(&self, text: &str) -> Result<(), ToolError> {
+    pub(crate) async fn type_text(&self, text: &str) -> Result<(), ToolError> {
         let Some(clip) = self.clipboard.clone().filter(|_| has_astral(text)) else {
             return self.input.text(text).map_err(failed);
         };

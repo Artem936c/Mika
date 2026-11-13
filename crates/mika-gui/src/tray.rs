@@ -156,7 +156,13 @@ pub fn global_shortcut_plugin() -> tauri::plugin::TauriPlugin<tauri::Wry> {
             if event.state() != ShortcutState::Pressed {
                 return;
             }
-            if shortcut.key == Code::KeyK {
+            if shortcut.key == Code::KeyX {
+                let ctx = app
+                    .state::<std::sync::Arc<crate::app::Ctx>>()
+                    .inner()
+                    .clone();
+                crate::selection::on_shortcut(app, ctx);
+            } else if shortcut.key == Code::KeyK {
                 window::summon(app);
                 let ctx = app
                     .state::<std::sync::Arc<crate::app::Ctx>>()
@@ -188,6 +194,41 @@ pub fn register_shortcut(app: &AppHandle) {
                 return;
             }
             Err(e) => log::warn!("shortcut {label} is taken: {e}"),
+        }
+    }
+}
+
+/// Act on the text selected in another program. Tried in order.
+const SELECTION_SHORTCUTS: &[(&str, bool)] = &[("Ctrl+Alt+X", false), ("Ctrl+Shift+X", true)];
+static SELECTION_SHORTCUT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// The selection shortcut that was registered, or a note that none was free.
+pub fn selection_shortcut_label() -> String {
+    SELECTION_SHORTCUT
+        .get()
+        .copied()
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::strings::tr("tray.shortcut_none"))
+}
+
+pub fn register_selection_shortcut(app: &AppHandle) {
+    use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut};
+    for (label, shift) in SELECTION_SHORTCUTS {
+        let mods = if *shift {
+            Modifiers::CONTROL | Modifiers::SHIFT
+        } else {
+            Modifiers::CONTROL | Modifiers::ALT
+        };
+        match app
+            .global_shortcut()
+            .register(Shortcut::new(Some(mods), Code::KeyX))
+        {
+            Ok(()) => {
+                let _ = SELECTION_SHORTCUT.set(label);
+                log::info!("selection shortcut {label} registered");
+                return;
+            }
+            Err(e) => log::warn!("selection shortcut {label} is taken: {e}"),
         }
     }
 }

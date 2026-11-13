@@ -25,7 +25,7 @@ pub struct ListFolderTool {
     pub user_profile: String,
 }
 
-fn size_text(bytes: u64) -> String {
+pub(crate) fn size_text(bytes: u64) -> String {
     const K: f64 = 1024.0;
     let b = bytes as f64;
     if b < K {

@@ -10,6 +10,7 @@
     version: string;
     autostart: boolean;
     shortcut: string;
+    selection_shortcut: string;
     data_dir: string;
     logs_dir: string;
   }
@@ -138,6 +139,7 @@
 
   <div class="rows">
     <div class="row"><span>{t('general.shortcut')}</span><kbd>{g.shortcut}</kbd></div>
+    <div class="row"><span>{t('general.selection_shortcut')}</span><kbd>{g.selection_shortcut}</kbd></div>
     <div class="row">
       <span>{t('general.data')}</span>
       <button class="link" title={g.data_dir} onclick={() => invoke('open_folder', { which: 'data' })}>{t('general.open')}</button>

@@ -54,4 +54,16 @@ impl SystemProbe for SysinfoProbe {
             })
             .collect()
     }
+
+    fn battery(&self) -> Option<(u8, bool)> {
+        use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+        let mut s = SYSTEM_POWER_STATUS::default();
+        // SAFETY: fills a plain struct owned here.
+        unsafe { GetSystemPowerStatus(&mut s) }.ok()?;
+        // 128: no battery; 255: unknown.
+        if s.BatteryFlag & 128 != 0 || s.BatteryLifePercent > 100 {
+            return None;
+        }
+        Some((s.BatteryLifePercent, s.ACLineStatus == 1))
+    }
 }

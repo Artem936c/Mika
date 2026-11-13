@@ -11,6 +11,7 @@
   import { isEmotion, reduceEmotion, type Emotion } from './lib/avatar';
   import { fromHistory, reduceChat, type ChatItem } from './lib/chat';
   import { reducePending, type Pending } from './lib/confirm';
+  import { selectionFrom, type Selection } from './lib/selection';
   import { reduceTask, type TaskView } from './lib/task';
   import {
     ISLAND_SHAPES,
@@ -72,6 +73,7 @@
   let work = $state('');
   let tool = $state('');
   let pending = $state<Pending | null>(null);
+  let selection = $state<Selection | null>(null);
   let task = $state<TaskView | null>(null);
   let needsSetup = $state(false);
 
@@ -239,6 +241,11 @@
     listen('mika://event', (e) => onEvent(e.payload)).then((u) => (unlisten = u));
     listen<{ action?: string }>('mika://ui', (e) => {
       if (e.payload?.action === 'open_chat') openPanel();
+      const picked = selectionFrom(e.payload);
+      if (picked) {
+        selection = picked;
+        openPanel();
+      }
       if (e.payload?.action === 'settings_changed') loadUi();
     }).then((u) => (unlistenUi = u));
 
@@ -325,6 +332,13 @@
     onmic={setMic}
     onlisten={() => invoke('voice_listen')}
     onwindowed={setWindowed}
+    {selection}
+    onselection={(action) => invoke('selection_action', { action })}
+    onselectionpaste={() => invoke('selection_paste')}
+    onselectionclose={() => {
+      selection = null;
+      invoke('selection_clear');
+    }}
   />
 {/snippet}
 

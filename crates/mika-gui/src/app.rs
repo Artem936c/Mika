@@ -90,6 +90,12 @@ pub struct Ctx {
     speaking: Mutex<String>,
     /// A newer version found by the last check.
     pub update: Mutex<Option<crate::update::Manifest>>,
+    /// Other programs get quieter while she listens and speaks.
+    ducker: Arc<mika_tools::system::Ducker>,
+    /// Bumped on every change of the voice state: an older restore gives up.
+    duck_turn: std::sync::atomic::AtomicU64,
+    /// Text the user selected in another program and sent here by the shortcut.
+    pub selection: Mutex<Option<crate::selection::Selection>>,
 }
 
 /// How an attempt to hear a phrase ended.
@@ -184,9 +190,11 @@ impl Ctx {
                 images: Arc::new(live),
                 bus: bus.clone(),
                 tasks: task_board.clone(),
+                watches: Default::default(),
             },
         );
         let speaker = speaker.with_audible(audible(env.volume.clone()));
+        let env_volume = env.volume.clone();
         let mut registry = ToolRegistry::new();
         mika_tools::register_all(&mut registry, &env, &disabled);
 
@@ -252,6 +260,12 @@ impl Ctx {
             follow_up: AtomicBool::new(false),
             speaking: Mutex::new(String::new()),
             update: Mutex::new(None),
+            ducker: Arc::new(mika_tools::system::Ducker::new(
+                env_volume,
+                std::process::id(),
+            )),
+            duck_turn: std::sync::atomic::AtomicU64::new(0),
+            selection: Mutex::new(None),
         })
     }
 
@@ -342,6 +356,8 @@ impl Ctx {
         let this = self.clone();
         tauri::async_runtime::spawn(async move { this.reconnect_mcp().await });
         self.restart_telegram();
+        self.start_notifications();
+        self.start_briefing();
     }
 
     /// Rebuilds the tool set from the current settings and connected MCP servers.
@@ -498,6 +514,20 @@ impl Ctx {
             return;
         }
         let name = self.config.lock().assistant.wake_phrase.clone();
+        let speaking = self.state.get() == AssistantState::Speaking || self.voice.busy();
+        if mika_audio::wake::heard_kind(heard, &name) == Some(mika_audio::wake::HeardKind::Stop) {
+            let word = mika_audio::wake::stop_word(heard).unwrap_or_default();
+            if speaking && !mika_audio::wake::is_echo(word, &self.speaking.lock()) {
+                log::info!("stop word heard while speaking: {word}");
+                self.end_voice_dialog();
+                // A reply still being written would keep adding sentences.
+                if self.state.get() == AssistantState::Speaking {
+                    self.session.stop();
+                }
+                self.voice.stop();
+            }
+            return;
+        }
         if self.state.get() == AssistantState::Speaking
             && mika_audio::wake::is_echo(&name, &self.speaking.lock())
         {
@@ -670,6 +700,56 @@ impl Ctx {
         self.listen_once(true).await;
     }
 
+    /// Gives other programs their sound back now. Blocking.
+    pub fn restore_media(&self) {
+        self.ducker.restore();
+    }
+
+    /// Whether other programs should stay quiet: she listens, speaks, or thinks
+    /// in the middle of a talk by voice.
+    fn wants_quiet(&self) -> bool {
+        let state = self.state.get();
+        matches!(state, AssistantState::Listening | AssistantState::Speaking)
+            || self.voice.busy()
+            || (state == AssistantState::Thinking && self.follow_up.load(Ordering::Relaxed))
+    }
+
+    /// Lowers other programs when she starts listening or speaking and brings
+    /// them back a moment after she is done.
+    fn duck_for(self: &Arc<Self>, to: AssistantState) {
+        if !self.config.lock().voice.duck_media {
+            return;
+        }
+        let turn = self.duck_turn.fetch_add(1, Ordering::Relaxed) + 1;
+        if matches!(to, AssistantState::Listening | AssistantState::Speaking) {
+            if !self.ducker.ducked() {
+                let ducker = self.ducker.clone();
+                tauri::async_runtime::spawn_blocking(move || ducker.duck());
+            }
+            return;
+        }
+        if !self.ducker.ducked() {
+            return;
+        }
+        let me = Arc::downgrade(self);
+        tauri::async_runtime::spawn(async move {
+            let mut calm = 0;
+            // Back after 1.5 s of silence; a newer state change takes over.
+            while calm < 15 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let Some(ctx) = me.upgrade() else { return };
+                if ctx.duck_turn.load(Ordering::Relaxed) != turn {
+                    return;
+                }
+                calm = if ctx.wants_quiet() { 0 } else { calm + 1 };
+            }
+            if let Some(ctx) = me.upgrade() {
+                let ducker = ctx.ducker.clone();
+                tauri::async_runtime::spawn_blocking(move || ducker.restore());
+            }
+        });
+    }
+
     /// Starts listening after each answer to a spoken question.
     fn watch_voice_dialog(self: &Arc<Self>) {
         use mika_core::Event;
@@ -684,6 +764,9 @@ impl Ctx {
                     Err(RecvError::Closed) => break,
                 };
                 let Some(ctx) = me.upgrade() else { break };
+                if let Event::StateChanged { to, .. } = &event {
+                    ctx.duck_for(*to);
+                }
                 match event {
                     Event::Error { .. } => ctx.end_voice_dialog(),
                     Event::StateChanged { to, .. }
@@ -740,6 +823,15 @@ impl Ctx {
 
     pub fn user_profile(&self) -> &str {
         &self.env.user_profile
+    }
+
+    /// The system interfaces the tools use.
+    pub fn tool_env(&self) -> &ToolEnv {
+        &self.env
+    }
+
+    pub fn state(&self) -> AssistantState {
+        self.state.get()
     }
 }
 

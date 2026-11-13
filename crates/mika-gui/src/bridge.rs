@@ -450,6 +450,7 @@ pub struct GeneralSettings {
     version: &'static str,
     autostart: bool,
     shortcut: String,
+    selection_shortcut: String,
     data_dir: String,
     logs_dir: String,
 }
@@ -460,6 +461,7 @@ pub fn get_general_settings() -> GeneralSettings {
         version: env!("CARGO_PKG_VERSION"),
         autostart: crate::platform::autostart_enabled(),
         shortcut: crate::tray::shortcut_label(),
+        selection_shortcut: crate::tray::selection_shortcut_label(),
         data_dir: mika_core::paths::data_dir().display().to_string(),
         logs_dir: mika_core::paths::logs_dir().display().to_string(),
     }

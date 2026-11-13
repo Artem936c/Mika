@@ -144,6 +144,7 @@ export async function install(scenario: string) {
             version: '0.2.0-pre.1',
             autostart: false,
             shortcut: 'Ctrl+Alt+M',
+            selection_shortcut: 'Ctrl+Alt+X',
             data_dir: String.raw`C:\Users\me\AppData\Roaming\Mika`,
             logs_dir: String.raw`C:\Users\me\AppData\Local\Mika\logs`,
           };
@@ -156,6 +157,9 @@ export async function install(scenario: string) {
               (id) => ({ id, enabled: id !== 'rdp' }),
             ),
             tool_count: 58,
+            notifications: { enabled: true, only_messengers: true, read_aloud: true },
+            briefing_enabled: false,
+            briefing_time: '08:30',
           };
         case 'get_island_settings':
           return { city: 'Пермь', hide_in_games: true, monitor: '', monitors: [String.raw`\\.\DISPLAY1`, String.raw`\\.\DISPLAY2`] };
@@ -230,6 +234,7 @@ export async function install(scenario: string) {
             vosk_downloading: false,
             vosk_bytes: 141_000_000,
             follow_up: true,
+            duck_media: true,
           };
         case 'test_microphone':
           return 'какая сегодня погода';
@@ -300,6 +305,11 @@ export async function install(scenario: string) {
         break;
       case 'reminder':
         send({ type: 'reminder_fired', id: 1, text: 'Выключить чайник', kind: 'remind', late_s: 0 });
+        break;
+      case 'selection':
+        emit('mika://ui', { action: 'selection', text: 'Добрый день! Прошу прислать акт сверки за октябрь до пятницы.', app: 'outlook.exe' });
+        await wait(700);
+        send({ type: 'notification', app: 'Telegram', title: 'Аня Смирнова', text: 'Ты будешь на созвоне в шесть?' });
         break;
       case 'task': {
         click('.iw');

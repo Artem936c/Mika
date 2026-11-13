@@ -72,6 +72,9 @@ impl Renderer {
             Event::ReminderFired { text, late_s, .. } => {
                 format!("[reminder] {text} (late {late_s} s)")
             }
+            Event::Notification { app, title, text } => {
+                format!("[notification] {app} — {title}: {text}")
+            }
             Event::UiTarget { x, y, w, h } => format!("[target] {x},{y} {w}x{h}"),
             Event::Timing { stage, ms } => format!("[time] {stage} {ms} ms"),
             Event::TaskUpdated { task } => {

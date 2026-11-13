@@ -35,6 +35,7 @@
     vosk_downloading: boolean;
     vosk_bytes: number;
     follow_up: boolean;
+    duck_media: boolean;
   }
 
   let { name }: { name: string } = $props();
@@ -61,6 +62,16 @@
     try {
       await invoke('set_follow_up', { value: v });
       s.follow_up = v;
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  async function setDuck(v: boolean) {
+    if (!s) return;
+    try {
+      await invoke('set_duck_media', { value: v });
+      s.duck_media = v;
     } catch (e) {
       fail(e);
     }
@@ -334,6 +345,7 @@
   </label>
   {#if wakeNote}<p class="hint">{wakeNote}</p>{/if}
   <Switch checked={s.follow_up} title={t('voice.follow_up')} sub={t('voice.follow_up_sub')} onchange={setFollowUp} />
+  <Switch checked={s.duck_media} title={t('voice.duck')} sub={t('voice.duck_sub')} onchange={setDuck} />
   <div class="lbl top">{t('voice.vosk')}</div>
   {#if s.vosk_downloading}
     <p class="hint">{t('voice.vosk_loading', { share: voskShare })}</p>

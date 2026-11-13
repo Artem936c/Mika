@@ -5,6 +5,8 @@
   import ConfirmCard from './ConfirmCard.svelte';
   import Icon from './Icon.svelte';
   import ImageCard from './ImageCard.svelte';
+  import SelectionCard from './SelectionCard.svelte';
+  import type { Selection } from './selection';
   import TaskPanel from './TaskPanel.svelte';
   import type { TaskView } from './task';
   import WeatherCard from './WeatherCard.svelte';
@@ -40,6 +42,10 @@
     onnew,
     ontaskhide = () => {},
     onpoke,
+    selection = null,
+    onselection = () => {},
+    onselectionpaste = async () => {},
+    onselectionclose = () => {},
   }: {
     items: ChatItem[];
     status: AssistantState;
@@ -75,6 +81,11 @@
     ontaskhide?: () => void;
     /** A click on the avatar. */
     onpoke?: () => void;
+    /** Text selected in another program, sent by the shortcut. */
+    selection?: Selection | null;
+    onselection?: (action: string) => void;
+    onselectionpaste?: () => Promise<void>;
+    onselectionclose?: () => void;
   } = $props();
 
   let draft = $state('');
@@ -222,6 +233,9 @@
     {/if}
     {#if pending}
       <ConfirmCard {pending} {onanswer} compact />
+    {/if}
+    {#if selection}
+      <SelectionCard {selection} {busy} onaction={onselection} onpaste={onselectionpaste} onclose={onselectionclose} />
     {/if}
 
     <div class="comp">

@@ -49,7 +49,8 @@ pub struct FindFilesTool {
     pub user_profile: String,
 }
 
-const SKIP_DIRS: &[&str] = &["appdata", "node_modules", ".git", "$recycle.bin", "target"];
+pub(crate) const SKIP_DIRS: &[&str] =
+    &["appdata", "node_modules", ".git", "$recycle.bin", "target"];
 
 fn walk(dir: &Path, query: &str, depth: usize, out: &mut Vec<PathBuf>, limit: usize) {
     if out.len() >= limit {

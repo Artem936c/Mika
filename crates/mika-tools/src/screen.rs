@@ -15,7 +15,8 @@ use mika_core::tools::{
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::sys::{Screen, Shot, Vision, WindowInfo};
+use crate::sys::{MouseButton, Screen, Shot, Vision, WindowInfo};
+use crate::ui::props;
 use crate::ui::UiEnv;
 use crate::util::{failed, truncate};
 
@@ -212,6 +213,194 @@ impl Tool for ScreenTextTool {
     }
 }
 
+/// Grid of the first look for a vision model, and of the look inside its cell.
+const GRID: (u32, u32) = (8, 6);
+const FINE_GRID: (u32, u32) = (4, 4);
+
+/// Clicks a label or a described thing in a window by its picture: for
+/// programs UI Automation cannot read (Telegram, games, Electron apps).
+pub struct ScreenClickTool {
+    pub env: ScreenEnv,
+    pub vision: Arc<dyn Vision>,
+}
+
+impl ScreenClickTool {
+    /// Asks the vision model for a cell of a numbered grid over `pic`.
+    async fn ask_cell(
+        &self,
+        pic: &crate::grid::Picture,
+        (cols, rows): (u32, u32),
+        target: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<crate::grid::Area>, ToolError> {
+        let drawn = crate::grid::draw_grid(pic, cols, rows);
+        let png = crate::grid::encode(&drawn).ok_or_else(|| failed("снимок не собрался"))?;
+        let question = format!(
+            "На снимке сетка, у каждой клетки номер в левом верхнем углу (от 1 до {}). \
+В какой клетке находится середина «{target}»? Ответь только номером клетки. Если такого на снимке нет, ответь 0.",
+            cols * rows
+        );
+        let answer = tokio::select! {
+            _ = cancel.cancelled() => return Err(ToolError::Cancelled),
+            a = self.vision.ask(&png, &question) => a.map_err(failed)?,
+        };
+        Ok(crate::grid::first_number(&answer)
+            .and_then(|n| crate::grid::cell(pic.width, pic.height, cols, rows, n)))
+    }
+
+    /// Point of `target` on the picture by the vision model: a cell, then a
+    /// cell inside it. Picture pixels.
+    async fn by_vision(
+        &self,
+        png: &[u8],
+        target: &str,
+        cancel: &CancellationToken,
+    ) -> Result<Option<(f32, f32)>, ToolError> {
+        let pic = crate::grid::decode(png).ok_or_else(|| failed("снимок не читается"))?;
+        let Some(first) = self.ask_cell(&pic, GRID, target, cancel).await? else {
+            return Ok(None);
+        };
+        // The cell with half a cell around it: the thing may sit on a line.
+        let around = crate::grid::Area {
+            x: first.x - first.w / 2.0,
+            y: first.y - first.h / 2.0,
+            w: first.w * 2.0,
+            h: first.h * 2.0,
+        };
+        let (part, at) = crate::grid::crop(&pic, around);
+        let fine = self.ask_cell(&part, FINE_GRID, target, cancel).await?;
+        let (x, y) = match fine {
+            Some(c) => {
+                let (cx, cy) = c.center();
+                (at.x + cx, at.y + cy)
+            }
+            None => first.center(),
+        };
+        Ok(Some((x, y)))
+    }
+}
+
+#[async_trait]
+impl Tool for ScreenClickTool {
+    fn spec(&self) -> ToolSpec {
+        spec(
+            "screen_click",
+            "Нажать в окне на надпись или на то, что видно на картинке, когда ui_read не видит элементов (Telegram, игры, сайты в приложениях). \
+Сначала ищет надпись распознаванием текста на этом компьютере, если не нашла — спрашивает модель со зрением. В ответе — что изменилось.",
+            props(
+                &[
+                    ("target", json!({ "type": "string", "description": "Надпись на кнопке или описание: «Поиск», «значок шестерёнки»" })),
+                    ("window", window_prop()),
+                    ("n", json!({ "type": "integer", "description": "Какую из одинаковых надписей нажать, с 1 сверху" })),
+                    ("button", json!({ "type": "string", "enum": ["left", "right"] })),
+                    ("double", json!({ "type": "boolean", "description": "Двойной щелчок" })),
+                ],
+                &["target"],
+            ),
+        )
+    }
+
+    fn assess(&self, args: &Value) -> Result<Assessment, ToolError> {
+        let target = arg_str(args, "target")?.trim();
+        if target.is_empty() {
+            return Err(ToolError::BadArguments(
+                "нужно, на что нажать: target".into(),
+            ));
+        }
+        self.env.ensure_enabled()?;
+        let w = self.env.ui.target(args)?;
+        Ok(self.env.ui.act(
+            &w,
+            "Нажать в окне по картинке",
+            format!(
+                "«{}» в окне «{}»",
+                truncate(target, 60),
+                truncate(&w.title, 60)
+            ),
+        ))
+    }
+
+    async fn run(
+        &self,
+        args: Value,
+        _a: Approval,
+        cancel: CancellationToken,
+    ) -> Result<ToolOutput, ToolError> {
+        self.env.ensure_enabled()?;
+        let target = arg_str(&args, "target")?.trim().to_string();
+        let w = self.env.ui.target(&args)?;
+        let button = match arg_str_opt(&args, "button") {
+            Some("right") => MouseButton::Right,
+            _ => MouseButton::Left,
+        };
+        let double = args.get("double").and_then(Value::as_bool).unwrap_or(false);
+        let nth = args.get("n").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+        // A covered window cannot take a click where it is seen.
+        self.env.ui.windows.focus(w.id).map_err(failed)?;
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let view = View {
+            window: Some(w.clone()),
+        };
+        let shot = self.env.capture(&view, 0).await?;
+        let screen = self.env.screen.clone();
+        let png = shot.png.clone();
+        let words = tokio::task::spawn_blocking(move || screen.ocr_words(&png))
+            .await
+            .map_err(|e| failed(e.to_string()))?
+            .unwrap_or_default();
+        let found = crate::grid::find_label(&words, &target);
+        let (point, how) = if let Some(a) = found.get(nth - 1) {
+            let (x, y) = a.center();
+            ((x * shot.factor, y * shot.factor), "по надписи")
+        } else {
+            let small = self.env.capture(&view, VISION_MAX_SIDE).await?;
+            match self.by_vision(&small.png, &target, &cancel).await {
+                Ok(Some((x, y))) => (
+                    (x * small.factor, y * small.factor),
+                    "по картинке, примерно",
+                ),
+                Ok(None) => {
+                    return Err(failed(format!(
+                        "не нашла «{target}» в окне «{}»: ни надписи, ни похожего на картинке",
+                        truncate(&w.title, 60)
+                    )))
+                }
+                Err(e) => {
+                    return Err(failed(format!(
+                        "надписи «{target}» в окне нет, а модель со зрением не ответила: {e}"
+                    )))
+                }
+            }
+        };
+        let (x, y) = (
+            shot.origin.0 + point.0.round() as i32,
+            shot.origin.1 + point.1.round() as i32,
+        );
+        let before = self.env.ui.foreign_windows();
+        self.env.ui.show_target(crate::sys::Rect {
+            x: x - 12,
+            y: y - 12,
+            w: 24,
+            h: 24,
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(crate::ui::TARGET_PAUSE_MS)).await;
+        self.env
+            .ui
+            .input
+            .click(x, y, button, double)
+            .map_err(failed)?;
+        let more = if found.len() > 1 {
+            format!(" Таких надписей {}, нажала {}-ю сверху.", found.len(), nth)
+        } else {
+            String::new()
+        };
+        let report = self.env.ui.outcome(&w, &before).await;
+        Ok(ToolOutput::new(format!(
+            "Нажала «{target}» ({how}).{more}\n{report}"
+        )))
+    }
+}
+
 pub struct ScreenshotTool(pub ScreenEnv);
 
 impl ScreenshotTool {
@@ -348,6 +537,52 @@ mod tests {
              Снимок уменьшен: для ui_click координаты со снимка умножай на 2.00."
         );
         assert_eq!(*f.captures.lock(), vec![Some(7)]);
+    }
+
+    #[tokio::test]
+    async fn click_finds_the_label_by_text_and_clicks_its_screen_point() {
+        let (env, vision, f) = screen_env("C:\\Users\\me");
+        *f.ocr_words.lock() = vec![
+            crate::sys::OcrWord {
+                text: "Поиск".into(),
+                line: 0,
+                x: 100.0,
+                y: 40.0,
+                w: 60.0,
+                h: 20.0,
+            },
+            crate::sys::OcrWord {
+                text: "Поиск".into(),
+                line: 3,
+                x: 100.0,
+                y: 400.0,
+                w: 60.0,
+                h: 20.0,
+            },
+        ];
+        let tool = ScreenClickTool { env, vision };
+        let a = tool
+            .assess(&json!({"target": "Поиск", "window": "игра"}))
+            .unwrap();
+        assert_eq!((a.level, a.scope.as_str()), (RiskLevel::Medium, "game.exe"));
+        assert!(tool
+            .assess(&json!({"target": "Оплатить", "window": "оплата"}))
+            .is_err());
+        let out = run(&tool, json!({"target": "поиск", "window": "игра", "n": 2}))
+            .await
+            .unwrap()
+            .text;
+        assert!(
+            out.starts_with("Нажала «поиск» (по надписи). Таких надписей 2"),
+            "{out}"
+        );
+        // Picture origin (10, 20) plus the middle of the second word.
+        let clicks = f.clicks.lock().clone();
+        assert_eq!(
+            clicks,
+            vec![(140, 430, crate::sys::MouseButton::Left, false)]
+        );
+        assert_eq!(*f.focused.lock(), vec![7]);
     }
 
     #[tokio::test]

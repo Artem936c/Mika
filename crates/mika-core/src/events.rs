@@ -71,6 +71,12 @@ pub enum Event {
         /// Seconds past the due time: more than a few when the app was closed.
         late_s: u64,
     },
+    /// A Windows notification of another program, after the privacy filters.
+    Notification {
+        app: String,
+        title: String,
+        text: String,
+    },
     /// Screen rectangle of the element about to be clicked, physical pixels.
     UiTarget {
         x: i32,

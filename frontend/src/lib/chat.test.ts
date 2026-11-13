@@ -74,6 +74,12 @@ describe('new events and cards', () => {
     expect(reduceChat([], { type: 'reminder_fired', id: 2, text: 'сделай', kind: 'task', late_s: 0 })).toEqual([]);
   });
 
+  it('a notification of another program becomes a row', () => {
+    const items = reduceChat([], { type: 'notification', app: 'Telegram', title: 'Аня', text: 'привет' });
+    expect(items).toEqual([{ kind: 'reminder', text: 'Telegram — Аня: привет' }]);
+    expect(reduceChat([], { type: 'notification', app: 'X', title: '', text: '' })).toEqual([]);
+  });
+
   it('image card needs a path', () => {
     expect(cardData({ kind: 'image', path: 'C:\\p\\a.png' })).toEqual({ kind: 'image', path: 'C:\\p\\a.png' });
     expect(cardData({ kind: 'image' })).toBeUndefined();

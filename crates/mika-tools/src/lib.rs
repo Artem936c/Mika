@@ -11,18 +11,23 @@ pub mod image;
 pub mod info;
 pub mod media;
 pub mod memory;
+pub mod messenger;
 pub mod notes;
+pub mod notify;
 pub mod rdp;
 pub mod reminders;
 pub mod screen;
+pub mod search;
 pub mod shell;
 pub mod sys;
 pub mod system;
 pub mod todos;
 pub mod ui;
+pub mod watch;
 pub mod web;
 pub mod win;
 
+mod grid;
 mod util;
 
 #[cfg(test)]
@@ -75,13 +80,23 @@ const HINTS: &[(&str, &str)] = &[
     ("web_search", "найти свежие сведения в интернете"),
     ("get_time", "который час, какое число, какой день недели"),
     ("volume", "громкость, звук"),
+    (
+        "app_volume",
+        "сделать тише или громче одну программу: браузер, игру, Telegram",
+    ),
     ("media_control", "пауза, следующий или предыдущий трек"),
     ("now_playing", "что сейчас играет"),
     ("open_app", "открыть программу"),
     ("open_url", "открыть сайт в браузере"),
-    ("find_files", "найти файл"),
+    ("find_files", "найти файл по имени"),
+    ("search_text", "найти слово или фразу внутри файлов"),
+    ("disk_usage", "что занимает место на диске или в папке"),
     ("run_shell", "выполнить команду PowerShell или cmd"),
     ("system_info", "нагрузка, память, диски"),
+    (
+        "system_health",
+        "компьютер тормозит, лагает, медленно работает, шумит",
+    ),
     (
         "ui_read",
         "что в окне программы; первый шаг перед нажатием или вводом в окне",
@@ -90,6 +105,10 @@ const HINTS: &[(&str, &str)] = &[
     ("ui_type", "напечатать текст в окне программы"),
     ("ui_keys", "нажать клавиши в окне программы"),
     ("screen_look", "что на экране, описать картинку на экране"),
+    (
+        "screen_click",
+        "нажать в окне, где ui_read не видит кнопок: Telegram, игра, приложение-сайт",
+    ),
     ("generate_image", "нарисовать картинку"),
     ("command_save", "сохранить свою команду из нескольких шагов"),
     (
@@ -103,6 +122,10 @@ const HINTS: &[(&str, &str)] = &[
         "разобрать, переложить, переименовать или скопировать много файлов сразу",
     ),
     ("task_plan", "задача из нескольких действий подряд"),
+    (
+        "chat_watch",
+        "отвечать кому-то в Telegram за пользователя, следить за перепиской",
+    ),
 ];
 
 /// Paragraph for the system prompt: requests and the registered tools that serve them.
@@ -139,9 +162,11 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
 
     if on("system") {
         reg.register(Arc::new(system::VolumeTool(env.volume.clone())));
+        reg.register(Arc::new(system::AppVolumeTool(env.volume.clone())));
         reg.register(Arc::new(system::PowerTool(env.power.clone())));
         reg.register(Arc::new(system::ClipboardTool(env.clipboard.clone())));
         reg.register(Arc::new(system::SystemInfoTool(env.probe.clone())));
+        reg.register(Arc::new(system::SystemHealthTool(env.probe.clone())));
         reg.register(Arc::new(system::ProcessesTool(env.probe.clone())));
         reg.register(Arc::new(system::KillProcessTool(env.runner.clone())));
         reg.register(Arc::new(devices::RadioTool(env.radios.clone())));
@@ -168,6 +193,13 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
         reg.register(Arc::new(apps::FocusWindowTool(env.windows.clone())));
         reg.register(Arc::new(apps::CloseAppTool(env.windows.clone())));
         reg.register(Arc::new(ui::ArrangeWindowTool(ui_env.clone())));
+        reg.register(Arc::new(messenger::MessengerSendTool(screen::ScreenEnv {
+            ui: ui_env.clone(),
+            screen: env.screen.clone(),
+            enabled: env.shared.screen_enabled.clone(),
+            user_profile: profile.clone(),
+        })));
+        reg.register(Arc::new(watch::ChatWatchTool(env.shared.watches.clone())));
     }
 
     if on("files") {
@@ -203,6 +235,12 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
             user_profile: profile.clone(),
         }));
         reg.register(Arc::new(batch::ListFolderTool {
+            user_profile: profile.clone(),
+        }));
+        reg.register(Arc::new(search::SearchTextTool {
+            user_profile: profile.clone(),
+        }));
+        reg.register(Arc::new(search::DiskUsageTool {
             user_profile: profile.clone(),
         }));
         reg.register(Arc::new(batch::FileBatchTool {
@@ -302,6 +340,10 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
             vision: env.shared.vision.clone(),
         }));
         reg.register(Arc::new(screen::ScreenTextTool(screen_env.clone())));
+        reg.register(Arc::new(screen::ScreenClickTool {
+            env: screen_env.clone(),
+            vision: env.shared.vision.clone(),
+        }));
         reg.register(Arc::new(screen::ScreenshotTool(screen_env)));
     }
 
@@ -338,7 +380,7 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register_all(&mut reg, &env, &[]);
         let specs = reg.specs();
-        assert_eq!(specs.len(), 70);
+        assert_eq!(specs.len(), 77);
         for s in specs {
             assert_eq!(s.parameters["type"], "object", "{}", s.name);
             assert!(!s.description.is_empty());
