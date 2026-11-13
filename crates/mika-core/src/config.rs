@@ -304,6 +304,8 @@ pub struct VoiceConfig {
     pub tone_by_mood: bool,
     /// A long reply is not read out: she says a short retelling of it.
     pub brief_long: bool,
+    /// Fish Audio Drama 3 marks up replies for the voice (decision 0026).
+    pub tts_expressive: bool,
 }
 
 impl Default for VoiceConfig {
@@ -326,8 +328,25 @@ impl Default for VoiceConfig {
             tts_style: String::new(),
             tone_by_mood: true,
             brief_long: true,
+            tts_expressive: false,
         }
     }
+}
+
+impl VoiceConfig {
+    /// Replies are marked up for the voice: the switch is on, replies are
+    /// spoken, the provider speaks them and its model performs the marks.
+    pub fn expressive(&self) -> bool {
+        self.tts_expressive
+            && self.speak_replies
+            && self.tts == TtsEngine::Provider
+            && expressive_model(&self.tts_model)
+    }
+}
+
+/// Whether a speech model performs voice marks, like `fish-audio/drama-3`.
+pub fn expressive_model(model: &str) -> bool {
+    model.to_lowercase().contains("drama")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -770,5 +789,60 @@ mod tests {
         std::fs::write(&p, "[voice]\nspeak_replies = false\n").unwrap();
         let old = Config::load(&p).unwrap();
         assert!(old.voice.tone_by_mood && !old.calendar.enabled);
+    }
+
+    #[test]
+    fn expressive_speech_starts_off_and_old_files_load_without_it() {
+        assert!(!VoiceConfig::default().tts_expressive);
+        assert!(!VoiceConfig::default().expressive());
+        let (_d, p) = tmp();
+        std::fs::write(
+            &p,
+            "[voice]\ntts = \"provider\"\ntts_model = \"fish-audio/drama-3\"\n",
+        )
+        .unwrap();
+        let old = Config::load(&p).unwrap();
+        assert!(!old.voice.tts_expressive && !old.voice.expressive());
+        let mut c = old.clone();
+        c.voice.tts_expressive = true;
+        c.save(&p).unwrap();
+        assert_eq!(Config::load(&p).unwrap(), c);
+    }
+
+    #[test]
+    fn expressive_speech_needs_every_condition() {
+        assert!(expressive_model("fish-audio/drama-3"));
+        assert!(expressive_model("Drama-3"));
+        assert!(!expressive_model("fish-audio/s2-pro"));
+        assert!(!expressive_model(""));
+        let on = VoiceConfig {
+            tts_expressive: true,
+            speak_replies: true,
+            tts: TtsEngine::Provider,
+            tts_model: "fish-audio/DRAMA-3".into(),
+            ..Default::default()
+        };
+        assert!(on.expressive());
+        let off = [
+            VoiceConfig {
+                tts_expressive: false,
+                ..on.clone()
+            },
+            VoiceConfig {
+                speak_replies: false,
+                ..on.clone()
+            },
+            VoiceConfig {
+                tts: TtsEngine::Windows,
+                ..on.clone()
+            },
+            VoiceConfig {
+                tts_model: "fish-audio/s2-pro".into(),
+                ..on.clone()
+            },
+        ];
+        for v in off {
+            assert!(!v.expressive(), "{v:?}");
+        }
     }
 }

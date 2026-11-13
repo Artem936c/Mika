@@ -332,4 +332,119 @@ mod tests {
         );
         assert_eq!(error_message("plain"), "plain");
     }
+
+    /// The usual extension of a sound file, by its first bytes.
+    fn sound_extension(sound: &[u8]) -> &'static str {
+        if sound.starts_with(b"RIFF") {
+            "wav"
+        } else if sound.starts_with(b"OggS") {
+            "ogg"
+        } else if sound.starts_with(b"fLaC") {
+            "flac"
+        } else if has_audio_header(sound) {
+            "mp3"
+        } else {
+            "bin"
+        }
+    }
+
+    #[test]
+    fn sound_files_get_their_usual_extension() {
+        assert_eq!(sound_extension(&wav_from_pcm(&[1, 0], 24_000)), "wav");
+        assert_eq!(sound_extension(b"ID3\x04\0"), "mp3");
+        assert_eq!(sound_extension(&[0xFF, 0xFB, 0x90, 0x00]), "mp3");
+        assert_eq!(sound_extension(b"OggS\0"), "ogg");
+        assert_eq!(sound_extension(&[0x12, 0x00]), "bin");
+    }
+
+    /// A phrase marked up for Fish Audio Drama 3 is said by the user's speech
+    /// provider and heard back by their recognition model: the marks must be
+    /// performed, not read aloud (decision 0026). The saved settings and key
+    /// are used as the app uses them; the changes stay in memory.
+    ///
+    /// `cargo test -p mika-providers live_drama -- --ignored --nocapture`.
+    /// `MIKA_DRAMA_VOICE` names the voice, else the provider's first one is taken.
+    #[tokio::test]
+    #[ignore = "calls RouterAI: paid speech synthesis and recognition"]
+    async fn live_drama_marks_are_not_spoken() {
+        use mika_core::config::{Config, TtsEngine};
+        use mika_core::paths::config_path;
+        use mika_core::secrets::KeyringSecretStore;
+        use std::sync::Arc;
+
+        const MODEL: &str = "fish-audio/drama-3";
+        const PHRASE: &str = "[sighs, tired] Ну что ж. <whisper>Иди без меня.</whisper> Я догоню.";
+
+        let mut config = Config::load(&config_path())
+            .unwrap_or_else(|e| panic!("the settings of Mika do not load: {e}"));
+        config.voice.tts = TtsEngine::Provider;
+        config.voice.tts_model = MODEL.into();
+        config.voice.tts_cache = false;
+        config.voice.tts_style = String::new();
+        let live = Live::new(
+            Arc::new(Mutex::new(config)),
+            Arc::new(KeyringSecretStore::new()),
+        );
+
+        // The voices the settings page offers: the same address and key.
+        let named = std::env::var("MIKA_DRAMA_VOICE")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let voice = match named {
+            Some(v) => v,
+            None => {
+                let base = live.base(&live.speech_settings().speech_base_url);
+                let key = live.key(SPEECH_SECRET_KEY);
+                crate::catalog::fetch_voices(&base, key.as_ref(), MODEL)
+                    .await
+                    .into_iter()
+                    .next()
+                    .expect(
+                        "the provider lists no voices for fish-audio/drama-3: \
+                         set MIKA_DRAMA_VOICE to the id of a voice",
+                    )
+            }
+        };
+        println!("voice: {voice}");
+        live.config().lock().voice.tts_voice = voice;
+
+        let sound = live
+            .synthesize_with(PHRASE, "")
+            .await
+            .unwrap_or_else(|e| panic!("speech synthesis failed: {e}"));
+        let ext = sound_extension(&sound);
+        let path = std::env::temp_dir().join(format!("mika-drama-live.{ext}"));
+        std::fs::write(&path, &sound).expect("the sound is written to the temporary folder");
+        println!("sound: {} ({} bytes)", path.display(), sound.len());
+
+        assert!(
+            !live.speech_settings().stt_model.trim().is_empty(),
+            "no recognition model in the settings: listen to the file instead"
+        );
+        let heard = match live.transcribe(&sound).await {
+            Ok(heard) => heard,
+            // The recognizer is sent a WAV file; another sound may not suit it.
+            Err(e) if ext != "wav" => {
+                println!(
+                    "note: the recognizer did not take the {ext} sound ({e}); \
+                     listen to the file instead"
+                );
+                return;
+            }
+            Err(e) => panic!("speech recognition failed: {e}"),
+        };
+        println!("heard: {heard}");
+        let heard = heard.to_lowercase().replace('ё', "е");
+        assert!(
+            heard.contains("без меня"),
+            "the words are not heard: {heard}"
+        );
+        for mark in ["whisper", "виспер", "sigh", "сай", "tired"] {
+            assert!(
+                !heard.contains(mark),
+                "the mark {mark:?} is read aloud: {heard}"
+            );
+        }
+    }
 }

@@ -8,6 +8,7 @@ pub mod emotion;
 pub mod events;
 pub mod gate;
 pub mod llm;
+pub mod marks;
 pub mod memory;
 pub mod paths;
 pub mod policy;

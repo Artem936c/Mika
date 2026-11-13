@@ -39,6 +39,8 @@
     tts_style: string;
     tone_by_mood: boolean;
     brief_long: boolean;
+    tts_expressive: boolean;
+    expressive_model: boolean;
   }
 
   let { name }: { name: string } = $props();
@@ -96,6 +98,16 @@
     try {
       await invoke('set_brief_speech', { value: v });
       s.brief_long = v;
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  async function setExpressive(v: boolean) {
+    if (!s) return;
+    try {
+      await invoke('set_expressive_speech', { value: v });
+      s.tts_expressive = v;
     } catch (e) {
       fail(e);
     }
@@ -182,7 +194,8 @@
   async function saveSpeech(): Promise<boolean> {
     if (!s) return false;
     try {
-      await invoke('save_speech_settings', {
+      // The reply says whether the saved model understands speech marks.
+      const marks = await invoke<unknown>('save_speech_settings', {
         tts: s.tts,
         ttsModel: s.tts_model,
         ttsVoice: s.tts_voice,
@@ -192,6 +205,7 @@
         inputDevice: s.input_device,
         apiKey: key ? key : null,
       });
+      if (typeof marks === 'boolean') s.expressive_model = marks;
       if (key) s.has_speech_key = true;
       key = '';
       note = t('providers.saved');
@@ -234,7 +248,10 @@
     await applyWindows();
     if (!(await saveSpeech())) return;
     note = '';
-    invoke('test_voice', { text: t('voice.test_phrase', { name }) });
+    // With expressive speech on, the phrase carries voice marks to hear them.
+    // The same conditions as `VoiceConfig::expressive` in the core.
+    const marked = s?.tts === 'provider' && s.tts_expressive && s.expressive_model && s.speak_replies;
+    invoke('test_voice', { text: t(marked ? 'voice.test_phrase_expressive' : 'voice.test_phrase', { name }) });
   }
 
   interface VoiceList {
@@ -344,6 +361,8 @@
       <textarea class="fld style" rows="2" maxlength="500" bind:value={s.tts_style} placeholder={t('voice.style_placeholder')} onchange={() => saveStyle()}></textarea>
       <p class="hint">{t('voice.style_sub')}</p>
     </div>
+    <Switch checked={s.tts_expressive} title={t('voice.expressive')} sub={t('voice.expressive_sub')} onchange={setExpressive} />
+    {#if s.tts_expressive && !s.expressive_model}<p class="warn">{t('voice.expressive_other_model')}</p>{/if}
     <Switch checked={s.tts_cache} title={t('voice.cache')} sub={t('voice.cache_sub', { size: cacheSize })} onchange={setCache} />
   {/if}
   <Switch checked={s.brief_long} title={t('voice.brief')} sub={t('voice.brief_sub')} onchange={setBrief} />

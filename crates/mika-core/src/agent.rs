@@ -15,6 +15,7 @@ use crate::gate::{Gate, GateDecision};
 use crate::llm::{
     ChatMessage, LlmChunk, LlmError, LlmProvider, LlmRequest, ThoughtFilter, ToolCall,
 };
+use crate::marks::MarkFilter;
 use crate::memory::Recall;
 use crate::state::{AssistantState, StateHandle};
 use crate::storage::Db;
@@ -29,6 +30,24 @@ const MAX_NUDGES: usize = 2;
 const STALL_NOTE: &str = "(служебная заметка) Ты остановилась, не доделав просьбу. \
 Не обещай и не жди разрешения на уже одобренное: продолжай вызовами инструментов сейчас же. \
 Если всё сделано или что-то мешает, коротко скажи пользователю, что вышло.";
+/// Joins the system prompt while the voice performs marks (decision 0026).
+pub const MARKS_HINT: &str = "Твои ответы озвучивает голос, который исполняет разметку. \
+Размечай ответ для голоса умеренно, одна-две пометки на ответ, там, где они к месту.\n\
+- Ремарка: короткое указание в квадратных скобках прямо перед словами, лучше по-английски, \
+например [softly, with a smile], [barely holding back tears], [sigh], [laughs], [pause]. \
+Она действует до конца строки или до следующей ремарки. Внутри ремарки только слова \
+и знаки препинания, не больше 80 знаков: без цифр, длительностей, смайликов и знаков \
+вроде / ; ( ) < >. Паузу пиши [pause] или [long pause], а не [pause 2s]. \
+Перед [ ставь пробел, не приклеивай ремарку к слову и не ставь ( сразу после ].\n\
+- Парные теги вокруг слов: <whisper>…</whisper> шёпот, <emphasis>…</emphasis> выделить, \
+<soft>…</soft> мягко, <fast>…</fast> быстрее, <slow>…</slow> медленнее, \
+<stress>…</stress> с нажимом, <forceful>…</forceful> напористо. Теги пиши только так, \
+в угловых скобках: не пиши [/whisper], <laugh>, <sigh>, <break> и другую разметку SSML, \
+смех и вздох — ремарками [laughs] и [sigh]. Других тегов нет.\n\
+Пользователь разметку не видит, не упоминай её. Квадратные скобки используй только для ремарок: \
+названия кнопок, пунктов меню и цитаты пиши в «ёлочках». Не ставь разметку в код, \
+в аргументы инструментов, в сообщения, которые отправляешь людям, и в тексты, которые сохраняешь. \
+Не пиши ремарки в круглых скобках: их голос читает вслух.";
 /// Tool output sent back to the LLM, characters.
 const MAX_TOOL_RESULT: usize = 16_000;
 /// Tool output shown in the chat row, characters.
@@ -196,9 +215,25 @@ pub struct TagFilter {
     held: String,
     started: bool,
     skip_space: bool,
+    /// Brackets that make a voice direction pass unchanged and give no cue:
+    /// the voice mark filter after this one cuts them (decision 0026).
+    keep_directions: bool,
+    /// The last character given out.
+    last: Option<char>,
+    /// The character given out before the held `[`.
+    before: Option<char>,
 }
 
 impl TagFilter {
+    /// A filter in front of the voice mark filter: what it cuts leaves both
+    /// the shown and the spoken text, and directions are left to the other.
+    pub fn keeping_directions() -> Self {
+        Self {
+            keep_directions: true,
+            ..Self::default()
+        }
+    }
+
     fn emit(&mut self, out: &mut String, text: &str) {
         for ch in text.chars() {
             // No whitespace before the first visible character, one space less after a tag.
@@ -209,8 +244,16 @@ impl TagFilter {
                 continue;
             }
             self.started = true;
+            self.last = Some(ch);
             out.push(ch);
         }
+    }
+
+    /// Whether `[` + `inner` + `]` is a voice direction for the mark filter.
+    fn direction(&self, inner: &str) -> bool {
+        self.keep_directions
+            && !self.before.is_some_and(char::is_alphanumeric)
+            && crate::marks::is_direction(inner)
     }
 
     /// Returns the text to show and the emotions of the tags that ended in this chunk.
@@ -220,6 +263,7 @@ impl TagFilter {
         for ch in chunk.chars() {
             if self.held.is_empty() {
                 if ch == '[' {
+                    self.before = self.last;
                     self.held.push(ch);
                 } else {
                     self.emit(&mut out, ch.encode_utf8(&mut [0; 4]));
@@ -227,6 +271,11 @@ impl TagFilter {
                 continue;
             }
             match ch {
+                ']' if self.direction(&self.held[1..]) => {
+                    let held = std::mem::take(&mut self.held);
+                    self.emit(&mut out, &held);
+                    self.emit(&mut out, "]");
+                }
                 ']' => {
                     let held = std::mem::take(&mut self.held);
                     match Emotion::from_tag(&held[1..]) {
@@ -248,6 +297,7 @@ impl TagFilter {
                 '[' => {
                     let held = std::mem::replace(&mut self.held, "[".into());
                     self.emit(&mut out, &held);
+                    self.before = self.last;
                 }
                 _ => {
                     self.held.push(ch);
@@ -273,10 +323,24 @@ impl TagFilter {
 /// Adds a paragraph to the system prompt of each request: the time, remembered facts.
 pub type PromptExtra = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
+/// Whether replies are marked up for the voice now. Asked once per LLM step.
+pub type MarksSwitch = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// The spoken copy of one step's reply while the voice marks are on.
+#[derive(Debug, Default)]
+struct StepSpeech {
+    /// Spoken text of the deltas already published.
+    said: String,
+    /// Spoken text that waits for a delta with something to show.
+    pending: String,
+}
+
 pub struct Agent {
     provider: RwLock<Arc<dyn LlmProvider>>,
     registry: RwLock<Arc<ToolRegistry>>,
     extras: RwLock<Vec<PromptExtra>>,
+    /// Voice marks in replies; off while unset.
+    marks: RwLock<Option<MarksSwitch>>,
     recall: RwLock<Option<Arc<dyn Recall>>>,
     /// What memory returned for the message being answered.
     recalled: Mutex<Option<String>>,
@@ -304,6 +368,7 @@ impl Agent {
             provider: RwLock::new(provider),
             registry: RwLock::new(registry),
             extras: RwLock::new(Vec::new()),
+            marks: RwLock::new(None),
             recall: RwLock::new(None),
             recalled: Mutex::new(None),
             gate,
@@ -367,13 +432,28 @@ impl Agent {
         self.extras.write().push(extra);
     }
 
-    fn full_system_prompt(&self) -> String {
+    /// Decides at every step whether replies carry voice marks: the model is
+    /// asked for them, the chat gets the text without them, the speaker with them.
+    pub fn set_marks_switch(&self, switch: MarksSwitch) {
+        *self.marks.write() = Some(switch);
+    }
+
+    fn marks_on(&self) -> bool {
+        let switch = self.marks.read().clone();
+        switch.is_some_and(|on| on())
+    }
+
+    fn full_system_prompt(&self, marks: bool) -> String {
         let mut prompt = self.system_prompt.read().clone();
         for extra in self.extras.read().iter() {
             if let Some(text) = extra().filter(|t| !t.trim().is_empty()) {
                 prompt.push_str("\n\n");
                 prompt.push_str(text.trim());
             }
+        }
+        if marks {
+            prompt.push_str("\n\n");
+            prompt.push_str(MARKS_HINT);
         }
         if let Some(text) = self.recalled.lock().as_deref() {
             prompt.push_str("\n\n");
@@ -445,9 +525,10 @@ impl Agent {
         }
 
         match &result {
-            Ok(reply) => {
+            Ok((reply, spoken)) => {
                 self.bus.publish(Event::AssistantText {
                     text: reply.clone(),
+                    spoken: spoken.clone(),
                 });
             }
             Err(AgentError::Cancelled) => {}
@@ -462,7 +543,7 @@ impl Agent {
         }
         self.commit(new_msgs);
         self.state.set(AssistantState::Idle);
-        result
+        result.map(|(reply, _)| reply)
     }
 
     fn commit(&self, msgs: Vec<ChatMessage>) {
@@ -477,15 +558,23 @@ impl Agent {
     }
 
     /// Runs LLM steps. On error `msgs` keeps only finished steps, so history stays valid.
+    /// Returns the reply and, with voice marks on, its spoken copy.
     async fn run_steps(
         &self,
         msgs: &mut Vec<ChatMessage>,
         cancel: &CancellationToken,
-    ) -> Result<String, AgentError> {
+    ) -> Result<(String, Option<String>), AgentError> {
         let mut step = 0;
         let mut nudges = 0;
+        // The step before had voice marks on.
+        let mut marked = false;
         while step < self.step_limit() {
-            let (text, calls) = self.one_step(msgs, cancel, step == 0).await?;
+            if marked {
+                // The next step finds its marks anew: so must the speaker.
+                self.bus.publish(Event::StepStarted);
+            }
+            let (text, spoken, calls) = self.one_step(msgs, cancel, step == 0).await?;
+            marked = spoken.is_some();
             step += 1;
             if calls.is_empty() {
                 // Small models end a turn in silence after tools, or promise
@@ -521,11 +610,11 @@ impl Agent {
                     continue;
                 }
                 msgs.push(ChatMessage::assistant(text.clone()));
-                return Ok(text);
+                return Ok((text, spoken));
             }
             msgs.push(ChatMessage::assistant_with_calls(text, calls.clone()));
             for call in calls {
-                let result = self.execute(&call, cancel).await;
+                let result = self.execute(&call, cancel, marked).await;
                 msgs.push(ChatMessage::tool_result(call.id, result));
                 if cancel.is_cancelled() {
                     return Err(AgentError::Cancelled);
@@ -535,16 +624,20 @@ impl Agent {
         Err(AgentError::TooManySteps)
     }
 
+    /// One LLM request: the reply text, its spoken copy with voice marks (only
+    /// while they are on) and the tool calls.
     async fn one_step(
         &self,
         msgs: &[ChatMessage],
         cancel: &CancellationToken,
         // The first request of a turn reports how long the provider took to start answering.
         timed: bool,
-    ) -> Result<(String, Vec<ToolCall>), AgentError> {
+    ) -> Result<(String, Option<String>, Vec<ToolCall>), AgentError> {
         let asked = Instant::now();
         let mut waiting_first = timed;
-        let mut messages = vec![ChatMessage::system(self.full_system_prompt())];
+        // One look at the switch decides both the hint and the filter of this step.
+        let marks_on = self.marks_on();
+        let mut messages = vec![ChatMessage::system(self.full_system_prompt(marks_on))];
         messages.extend(
             trim_history(&self.history.lock(), HISTORY_BUDGET)
                 .iter()
@@ -567,15 +660,45 @@ impl Agent {
         let mut raw = String::new();
         let mut raw_chars = 0;
         let mut calls = Vec::new();
-        let mut tags = TagFilter::default();
+        // With voice marks on, emotion tags that are no direction leave both
+        // copies of the reply; the directions are left to the mark filter.
+        let mut tags = if marks_on {
+            TagFilter::keeping_directions()
+        } else {
+            TagFilter::default()
+        };
         let mut thoughts = ThoughtFilter::default();
+        let mut marks = marks_on.then(MarkFilter::default);
+        let mut speech = marks_on.then(StepSpeech::default);
         // A reply that starts like tool calls written as text is held back, see `calls_from_text`.
         let mut written_calls = String::new();
-        let mut route = |agent: &Self, text: &mut String, piece: String| {
+        // The same calls as they came: with voice marks on, the shown copy has
+        // lost what looked like a direction inside their arguments.
+        let mut written_raw = String::new();
+        // Spoken text that waited before the calls: said if they are no calls.
+        let mut written_before = String::new();
+        let mut route = |agent: &Self,
+                         text: &mut String,
+                         speech: Option<&mut StepSpeech>,
+                         piece: String,
+                         spoken: String| {
             if !written_calls.is_empty() || (text.is_empty() && piece.starts_with("[{")) {
+                let raw = if marks_on { spoken } else { piece.clone() };
+                if written_calls.is_empty() {
+                    // Calls are never said, and neither is anything before them,
+                    // unless they turn out to be no calls.
+                    if let Some(s) = speech {
+                        written_before = std::mem::take(&mut s.pending);
+                    }
+                    let at = raw.find("[{").unwrap_or(0);
+                    written_before.push_str(&raw[..at]);
+                    written_raw.push_str(&raw[at..]);
+                } else {
+                    written_raw.push_str(&raw);
+                }
                 written_calls.push_str(&piece);
             } else {
-                agent.say(text, piece);
+                agent.say(text, speech, piece, spoken);
             }
         };
         loop {
@@ -594,23 +717,18 @@ impl Agent {
             }
             match chunk {
                 None => {
-                    let (mut rest, cues) = tags.push(&thoughts.finish());
-                    for emotion in cues {
-                        self.bus.publish(Event::EmotionCue { emotion });
-                    }
-                    rest.push_str(&tags.finish());
-                    route(self, &mut text, rest);
+                    let (shown, spoken) =
+                        self.filter_reply(&mut tags, marks.as_mut(), thoughts.finish(), true);
+                    route(self, &mut text, speech.as_mut(), shown, spoken);
                     break;
                 }
                 Some(Err(e)) => return Err(e.into()),
                 Some(Ok(LlmChunk::Text(t))) => {
                     raw_chars += t.chars().count();
                     raw.push_str(&t);
-                    let (clean, cues) = tags.push(&thoughts.push(&t));
-                    for emotion in cues {
-                        self.bus.publish(Event::EmotionCue { emotion });
-                    }
-                    route(self, &mut text, clean);
+                    let (clean, spoken) =
+                        self.filter_reply(&mut tags, marks.as_mut(), thoughts.push(&t), false);
+                    route(self, &mut text, speech.as_mut(), clean, spoken);
                     let raw_loop = raw_chars > MAX_RAW || (t.contains('\n') && repeating(&raw));
                     if raw_loop || looping(&text) {
                         log::warn!("the model is looping, the reply is stopped");
@@ -621,12 +739,77 @@ impl Agent {
             }
         }
         if !written_calls.is_empty() {
-            match self.calls_from_text(&written_calls) {
+            // A direction in front of the calls spoils their raw copy; the
+            // shown one has lost only what looked like marks.
+            let found = self.calls_from_text(&written_raw).or_else(|| {
+                marks_on
+                    .then(|| self.calls_from_text(&written_calls))
+                    .flatten()
+            });
+            match found {
                 Some(found) if calls.is_empty() => calls = found,
-                _ => self.say(&mut text, written_calls),
+                _ => self.say(
+                    &mut text,
+                    speech.as_mut(),
+                    written_calls,
+                    written_before + &written_raw,
+                ),
+            }
+        } else if let Some(s) = speech.as_mut().filter(|s| !s.pending.trim().is_empty()) {
+            // Marks after the last words, `Удачи! [laughs]`: no delta that
+            // shows something carries them, so an empty one does.
+            if !text.is_empty() {
+                let pending = std::mem::take(&mut s.pending);
+                s.said.push_str(&pending);
+                self.bus.publish(Event::AssistantDelta {
+                    text: String::new(),
+                    spoken: Some(pending),
+                });
             }
         }
-        Ok((text.trim_end().to_string(), calls))
+        let spoken = speech.map(|s| (s.said + &s.pending).trim_end().to_string());
+        Ok((text.trim_end().to_string(), spoken, calls))
+    }
+
+    /// Reply text after the reasoning filter, as shown and as spoken. Emotion
+    /// tags go first, from both copies; with voice marks on, the directions
+    /// they leave are then cut from the shown copy only. `end` closes both
+    /// filters.
+    fn filter_reply(
+        &self,
+        tags: &mut TagFilter,
+        marks: Option<&mut MarkFilter>,
+        text: String,
+        end: bool,
+    ) -> (String, String) {
+        let (mut kept, cues) = tags.push(&text);
+        for emotion in cues {
+            self.bus.publish(Event::EmotionCue { emotion });
+        }
+        if end {
+            kept.push_str(&tags.finish());
+        }
+        self.unmark(marks, kept, end)
+    }
+
+    /// With voice marks on, splits reply text into what is shown and what is
+    /// spoken, and turns the emotion words among the cut directions into cues.
+    /// Without them the text is all shown. `end` closes the filter.
+    fn unmark(&self, marks: Option<&mut MarkFilter>, text: String, end: bool) -> (String, String) {
+        let Some(filter) = marks else {
+            return (text, String::new());
+        };
+        let mut piece = filter.push(&text);
+        if end {
+            let last = filter.finish();
+            piece.shown.push_str(&last.shown);
+            piece.spoken.push_str(&last.spoken);
+            piece.directions.extend(last.directions);
+        }
+        for emotion in piece.directions.iter().filter_map(|d| Emotion::from_tag(d)) {
+            self.bus.publish(Event::EmotionCue { emotion });
+        }
+        (piece.shown, piece.spoken)
     }
 
     /// Tool calls that the model wrote into the reply text instead of the tool-call channel:
@@ -658,8 +841,19 @@ impl Agent {
             .collect()
     }
 
-    /// Adds reply text that is already free of emotion tags.
-    fn say(&self, text: &mut String, piece: String) {
+    /// Adds reply text that is already free of emotion tags and voice marks.
+    /// With marks on, `speech` gets the spoken copy: it rides on the next
+    /// delta that shows something.
+    fn say(
+        &self,
+        text: &mut String,
+        mut speech: Option<&mut StepSpeech>,
+        piece: String,
+        spoken: String,
+    ) {
+        if let Some(s) = speech.as_deref_mut() {
+            s.pending.push_str(&spoken);
+        }
         if piece.is_empty() {
             return;
         }
@@ -667,11 +861,21 @@ impl Agent {
             self.state.set(AssistantState::Speaking);
         }
         text.push_str(&piece);
-        self.bus.publish(Event::AssistantDelta { text: piece });
+        let spoken = speech.map(|s| {
+            let now = std::mem::take(&mut s.pending);
+            s.said.push_str(&now);
+            now
+        });
+        self.bus.publish(Event::AssistantDelta {
+            text: piece,
+            spoken,
+        });
     }
 
     /// Runs one tool call. Always returns text for the LLM, errors included.
-    async fn execute(&self, call: &ToolCall, cancel: &CancellationToken) -> String {
+    /// With voice marks on (`marked`), marks that leaked into its text for
+    /// people are cut first.
+    async fn execute(&self, call: &ToolCall, cancel: &CancellationToken, marked: bool) -> String {
         let started = Instant::now();
         let Some(tool) = self.registry().get(&call.name) else {
             let msg = format!("Ошибка: инструмента `{}` нет.", call.name);
@@ -681,6 +885,11 @@ impl Agent {
         let args = match &call.arguments {
             Value::Null => Value::Object(Default::default()),
             v => v.clone(),
+        };
+        let args = if marked {
+            unmark_args(&call.name, args)
+        } else {
+            args
         };
         let assessment = match tool.assess(&args) {
             Ok(a) => a,
@@ -739,6 +948,60 @@ impl Agent {
             data,
         });
     }
+}
+
+/// Text arguments meant for people, by tool. While voice marks are on, a mark
+/// that leaked into one is cut before the call is shown, confirmed, stored or
+/// sent (decision 0026). Paths, patterns, commands, code, file contents and
+/// typed text are never touched: brackets there are data.
+const PROSE_ARGS: [(&str, &[&str]); 7] = [
+    ("messenger_send", &["text"]),
+    ("reminder_set", &["text"]),
+    ("memory_save", &["text"]),
+    ("note_create", &["text", "title"]),
+    ("todo_add", &["text"]),
+    ("task_plan", &["title", "steps"]),
+    ("task_step", &["note"]),
+];
+
+/// `args` of the tool `name` with voice marks cut from its text for people.
+fn unmark_args(name: &str, mut args: Value) -> Value {
+    let Some((_, fields)) = PROSE_ARGS.iter().find(|(tool, _)| *tool == name) else {
+        return args;
+    };
+    let Value::Object(map) = &mut args else {
+        return args;
+    };
+    let mut cut = false;
+    for field in *fields {
+        match map.get_mut(*field) {
+            Some(Value::String(s)) => cut |= unmark_in_place(s),
+            Some(Value::Array(items)) => {
+                for item in items {
+                    if let Value::String(s) = item {
+                        cut |= unmark_in_place(s);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if cut {
+        log::info!("voice marks cut from the arguments of {name}");
+    }
+    args
+}
+
+/// Cuts voice marks out of `s`; true if it had any. Text without them is
+/// left as it is, spacing included.
+fn unmark_in_place(s: &mut String) -> bool {
+    let marked = crate::marks::tokens(s)
+        .iter()
+        .any(|t| !matches!(t, crate::marks::Token::Text(_)));
+    if marked {
+        *s = crate::marks::strip_marks(s);
+    }
+    marked
 }
 
 pub fn truncate(text: &str, max: usize) -> String {
@@ -903,10 +1166,12 @@ Actually, I'll call generate_image.
             }
         );
         assert!(ev.contains(&Event::AssistantDelta {
-            text: "При".into()
+            text: "При".into(),
+            spoken: None,
         }));
         assert!(ev.contains(&Event::AssistantText {
-            text: "Привет".into()
+            text: "Привет".into(),
+            spoken: None,
         }));
         assert_eq!(state.get(), AssistantState::Idle);
         assert_eq!(a.history().len(), 2);
@@ -1436,12 +1701,13 @@ Actually, I'll call generate_image.
             emotion: Emotion::Joy
         }));
         assert!(ev.contains(&Event::AssistantText {
-            text: "Привет".into()
+            text: "Привет".into(),
+            spoken: None,
         }));
         let deltas: String = ev
             .iter()
             .filter_map(|e| match e {
-                Event::AssistantDelta { text } => Some(text.as_str()),
+                Event::AssistantDelta { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
@@ -1622,7 +1888,7 @@ Actually, I'll call generate_image.
         // The raw call never reached the chat.
         assert!(!ev
             .iter()
-            .any(|e| matches!(e, Event::AssistantDelta { text } if text.contains("echo"))));
+            .any(|e| matches!(e, Event::AssistantDelta { text, .. } if text.contains("echo"))));
     }
 
     #[tokio::test]
@@ -1641,8 +1907,486 @@ Actually, I'll call generate_image.
                 "{reply}"
             );
             assert!(drain(&mut rx).contains(&Event::AssistantDelta {
-                text: reply.to_string()
+                text: reply.to_string(),
+                spoken: None,
             }));
+        }
+    }
+
+    /// Shown and spoken text of every delta.
+    fn deltas(ev: &[Event]) -> Vec<(String, Option<String>)> {
+        ev.iter()
+            .filter_map(|e| match e {
+                Event::AssistantDelta { text, spoken } => Some((text.clone(), spoken.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn marks_switch(on: bool) -> MarksSwitch {
+        Arc::new(move || on)
+    }
+
+    #[tokio::test]
+    async fn voice_marks_reach_only_the_spoken_copy() {
+        let p = FakeProvider::new(vec![Some(vec![
+            text("[jo"),
+            text("y] [softly] Привет, "),
+            text("<whis"),
+            text("per>тихо</whisper>."),
+        ])]);
+        let (a, mut rx, _) = agent(p.clone());
+        a.set_marks_switch(marks_switch(true));
+        assert_eq!(
+            a.handle("x", CancellationToken::new()).await,
+            Ok("Привет, тихо.".into())
+        );
+        let spoken = "[joy] [softly] Привет, <whisper>тихо</whisper>.";
+        let ev = drain(&mut rx);
+        assert!(ev.contains(&Event::EmotionCue {
+            emotion: Emotion::Joy
+        }));
+        assert!(ev.contains(&Event::AssistantText {
+            text: "Привет, тихо.".into(),
+            spoken: Some(spoken.into()),
+        }));
+        let d = deltas(&ev);
+        let shown: String = d.iter().map(|(t, _)| t.as_str()).collect();
+        let said: String = d.iter().filter_map(|(_, s)| s.as_deref()).collect();
+        assert_eq!(shown, "Привет, тихо.");
+        assert_eq!(said, spoken);
+        assert!(d.iter().all(|(t, s)| !t.is_empty() && s.is_some()), "{d:?}");
+        assert_eq!(a.history()[1].content, "Привет, тихо.");
+        assert_eq!(
+            p.requests.lock()[0].messages[0].content,
+            format!("sys\n\n{MARKS_HINT}")
+        );
+    }
+
+    #[tokio::test]
+    async fn spoken_text_without_shown_text_waits_for_the_next_delta() {
+        let p = FakeProvider::new(vec![Some(vec![
+            text("Привет."),
+            text(" [sigh] "),
+            text("Ну."),
+            text(" [laughs]"),
+        ])]);
+        let (a, mut rx, _) = agent(p);
+        a.set_marks_switch(marks_switch(true));
+        assert_eq!(
+            a.handle("x", CancellationToken::new()).await,
+            Ok("Привет. Ну.".into())
+        );
+        let ev = drain(&mut rx);
+        // The last direction has no words after it: an empty delta carries
+        // it to the speaker, which joins it to the last phrase.
+        assert_eq!(
+            deltas(&ev),
+            vec![
+                ("Привет.".into(), Some("Привет.".into())),
+                (" Ну.".into(), Some(" [sigh] Ну.".into())),
+                ("".into(), Some(" [laughs]".into())),
+            ]
+        );
+        assert!(ev.contains(&Event::AssistantText {
+            text: "Привет. Ну.".into(),
+            spoken: Some("Привет. [sigh] Ну. [laughs]".into()),
+        }));
+
+        // A step of marks only shows nothing and has no delta at all.
+        let p = FakeProvider::new(vec![
+            Some(vec![text("[sigh]")]),
+            Some(vec![text("Готово.")]),
+        ]);
+        let (a, mut rx, _) = agent(p);
+        a.set_marks_switch(marks_switch(true));
+        assert_eq!(
+            a.handle("x", CancellationToken::new()).await,
+            Ok("Готово.".into())
+        );
+        assert_eq!(
+            deltas(&drain(&mut rx)),
+            vec![("Готово.".into(), Some("Готово.".into()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_emotion_tag_the_chat_loses_is_not_spoken_either() {
+        for (reply, shown, cue) in [
+            ("Хорошо[joy] Сделаю.", "ХорошоСделаю.", Some(Emotion::Joy)),
+            (
+                "[deep_thought] Хм, давай подумаем.",
+                "Хм, давай подумаем.",
+                None,
+            ),
+            ("[🤔] Хм, давай подумаем.", "Хм, давай подумаем.", None),
+            ("Готово [😊😊]!", "Готово !", None),
+        ] {
+            let p = FakeProvider::new(vec![Some(vec![text(reply)])]);
+            let (a, mut rx, _) = agent(p);
+            a.set_marks_switch(marks_switch(true));
+            assert_eq!(
+                a.handle("x", CancellationToken::new()).await,
+                Ok(shown.to_string()),
+                "{reply}"
+            );
+            let ev = drain(&mut rx);
+            assert!(ev.contains(&Event::AssistantText {
+                text: shown.into(),
+                spoken: Some(shown.into()),
+            }));
+            let said: String = deltas(&ev).iter().filter_map(|(_, s)| s.clone()).collect();
+            assert_eq!(said, shown, "{reply}");
+            assert_eq!(
+                ev.iter()
+                    .filter_map(|e| match e {
+                        Event::EmotionCue { emotion } => Some(*emotion),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                cue.into_iter().collect::<Vec<_>>(),
+                "{reply}"
+            );
+        }
+        // An emotion tag that is a direction still reaches the voice, once.
+        let p = FakeProvider::new(vec![Some(vec![text("[joy] Ура, получилось!")])]);
+        let (a, mut rx, _) = agent(p);
+        a.set_marks_switch(marks_switch(true));
+        a.handle("x", CancellationToken::new()).await.unwrap();
+        let ev = drain(&mut rx);
+        assert!(ev.contains(&Event::AssistantText {
+            text: "Ура, получилось!".into(),
+            spoken: Some("[joy] Ура, получилось!".into()),
+        }));
+        let cues = ev
+            .iter()
+            .filter(|e| matches!(e, Event::EmotionCue { .. }))
+            .count();
+        assert_eq!(cues, 1);
+    }
+
+    #[tokio::test]
+    async fn a_new_step_of_a_reply_is_announced_while_marks_are_on() {
+        for on in [true, false] {
+            let p = FakeProvider::new(vec![
+                Some(vec![text("Минутку, сейчас я посмотрю")]),
+                Some(vec![text("[cheerfully] Завтра будет солнечно.")]),
+            ]);
+            let (a, mut rx, _) = agent(p);
+            a.set_marks_switch(marks_switch(on));
+            a.handle("x", CancellationToken::new()).await.unwrap();
+            let ev = drain(&mut rx);
+            let step = ev.iter().position(|e| *e == Event::StepStarted);
+            assert_eq!(step.is_some(), on);
+            if let Some(at) = step {
+                // Between the deltas of the two steps.
+                let first = ev
+                    .iter()
+                    .position(|e| matches!(e, Event::AssistantDelta { .. }))
+                    .unwrap();
+                let last = ev
+                    .iter()
+                    .rposition(|e| matches!(e, Event::AssistantDelta { .. }))
+                    .unwrap();
+                assert!(first < at && at < last, "{ev:?}");
+                assert_eq!(ev.iter().filter(|e| **e == Event::StepStarted).count(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn without_the_switch_brackets_stay_and_nothing_is_spoken_apart() {
+        let reply = "[очень длинный текст в скобках, не метка] дальше <whisper>да</whisper>";
+        for switch in [None, Some(marks_switch(false))] {
+            let p = FakeProvider::new(vec![Some(vec![text(reply)])]);
+            let (a, mut rx, _) = agent(p.clone());
+            if let Some(s) = switch {
+                a.set_marks_switch(s);
+            }
+            assert_eq!(
+                a.handle("x", CancellationToken::new()).await,
+                Ok(reply.to_string())
+            );
+            let ev = drain(&mut rx);
+            assert!(ev.contains(&Event::AssistantText {
+                text: reply.into(),
+                spoken: None,
+            }));
+            assert!(deltas(&ev).iter().all(|(_, s)| s.is_none()));
+            assert_eq!(p.requests.lock()[0].messages[0].content, "sys");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_switch_is_read_at_every_step() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let p = FakeProvider::new(vec![
+            Some(vec![text("Ну [sigh] а")]),
+            Some(vec![text("Ну [sigh] б")]),
+        ]);
+        let (a, mut rx, _) = agent(p.clone());
+        let on = Arc::new(AtomicBool::new(true));
+        let flag = on.clone();
+        a.add_prompt_extra(Arc::new(|| Some("Помни: кот Барсик".into())));
+        a.set_marks_switch(Arc::new(move || flag.load(Ordering::Relaxed)));
+        assert_eq!(
+            a.handle("1", CancellationToken::new()).await,
+            Ok("Ну а".into())
+        );
+        on.store(false, Ordering::Relaxed);
+        assert_eq!(
+            a.handle("2", CancellationToken::new()).await,
+            Ok("Ну [sigh] б".into())
+        );
+        let reqs = p.requests.lock();
+        assert_eq!(
+            reqs[0].messages[0].content,
+            format!("sys\n\nПомни: кот Барсик\n\n{MARKS_HINT}")
+        );
+        assert_eq!(reqs[1].messages[0].content, "sys\n\nПомни: кот Барсик");
+        let finals: Vec<Option<String>> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::AssistantText { spoken, .. } => Some(spoken),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(finals, vec![Some("Ну [sigh] а".into()), None]);
+    }
+
+    #[tokio::test]
+    async fn written_calls_are_not_spoken_with_marks_on() {
+        let p = FakeProvider::new(vec![
+            Some(vec![
+                text("[{\"name\": \"echo\", "),
+                text("\"arguments\": {\"text\": \"пинг\"}}]"),
+            ]),
+            Some(vec![text("[wink] Готово")]),
+        ]);
+        let (a, mut rx, _) = agent(p.clone());
+        a.set_marks_switch(marks_switch(true));
+        assert_eq!(
+            a.handle("x", CancellationToken::new()).await,
+            Ok("Готово".into())
+        );
+        assert_eq!(tool_results(&p.requests.lock()[1]), vec!["пинг"]);
+        let ev = drain(&mut rx);
+        assert_eq!(
+            deltas(&ev),
+            vec![("Готово".into(), Some("[wink] Готово".into()))]
+        );
+        assert!(ev.contains(&Event::EmotionCue {
+            emotion: Emotion::Wink
+        }));
+
+        // Text that only looks like calls is shown and spoken as it came.
+        let reply = "[{\"a\": 1}]";
+        let p = FakeProvider::new(vec![Some(vec![text(reply)])]);
+        let (a, mut rx, _) = agent(p);
+        a.set_marks_switch(marks_switch(true));
+        assert_eq!(
+            a.handle("x", CancellationToken::new()).await,
+            Ok(reply.to_string())
+        );
+        let ev = drain(&mut rx);
+        assert!(ev.contains(&Event::AssistantDelta {
+            text: reply.into(),
+            spoken: Some(reply.into()),
+        }));
+        assert!(ev.contains(&Event::AssistantText {
+            text: reply.into(),
+            spoken: Some(reply.into()),
+        }));
+    }
+
+    #[tokio::test]
+    async fn text_that_turns_out_to_be_no_calls_keeps_its_marks_for_the_voice() {
+        for chunks in [
+            vec!["[{\"a\": 1}] это пример. [laughs] Шучу."],
+            vec!["[sigh] ", "[{\"a\": 1}] это ", "пример. [laughs] Шучу."],
+        ] {
+            let script = chunks.iter().map(|c| text(c)).collect();
+            let p = FakeProvider::new(vec![Some(script)]);
+            let (a, mut rx, _) = agent(p);
+            a.set_marks_switch(marks_switch(true));
+            let shown = "[{\"a\": 1}] это пример. Шучу.";
+            assert_eq!(
+                a.handle("x", CancellationToken::new()).await,
+                Ok(shown.into())
+            );
+            let ev = drain(&mut rx);
+            let said: String = deltas(&ev).iter().filter_map(|(_, s)| s.clone()).collect();
+            let spoken = chunks.concat();
+            assert_eq!(said, spoken);
+            assert!(ev.contains(&Event::AssistantText {
+                text: shown.into(),
+                spoken: Some(spoken),
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn calls_written_as_text_keep_their_bracketed_arguments_with_marks_on() {
+        for (call, said) in [
+            (
+                "[{\"name\":\"echo\",\"arguments\":{\"text\":\"x\",\"names\":[\"Файл\",\"Сохранить\"]}}]",
+                "x",
+            ),
+            (
+                "[{\"name\":\"echo\",\"arguments\":{\"text\":\"купить [молоко]\"}}]",
+                "купить [молоко]",
+            ),
+            // A direction in front of the calls is no part of them.
+            (
+                "[sigh] [{\"name\":\"echo\",\"arguments\":{\"text\":\"пинг\"}}]",
+                "пинг",
+            ),
+        ] {
+            let p = FakeProvider::new(vec![Some(vec![text(call)]), Some(vec![text("Готово")])]);
+            let (a, mut rx, _) = agent(p.clone());
+            a.set_marks_switch(marks_switch(true));
+            assert_eq!(
+                a.handle("x", CancellationToken::new()).await,
+                Ok("Готово".into()),
+                "{call}"
+            );
+            assert_eq!(tool_results(&p.requests.lock()[1]), vec![said], "{call}");
+            assert!(
+                deltas(&drain(&mut rx)).iter().all(|(t, _)| t == "Готово"),
+                "{call}"
+            );
+        }
+    }
+
+    /// Keeps the arguments of each call; named like a tool with text for people.
+    struct Recorder {
+        name: &'static str,
+        got: Mutex<Vec<Value>>,
+    }
+
+    #[async_trait]
+    impl crate::tools::Tool for Recorder {
+        fn spec(&self) -> crate::llm::ToolSpec {
+            crate::tools::spec(self.name, "test", json!({"type": "object"}))
+        }
+        fn assess(
+            &self,
+            args: &Value,
+        ) -> Result<crate::tools::Assessment, crate::tools::ToolError> {
+            let text = args["text"].as_str().unwrap_or_default();
+            Ok(crate::tools::Assessment::new(
+                crate::tools::RiskLevel::Low,
+                format!("Напомнить: {text}"),
+                text,
+                "r",
+            ))
+        }
+        async fn run(
+            &self,
+            args: Value,
+            _approval: crate::gate::Approval,
+            _cancel: CancellationToken,
+        ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+            self.got.lock().push(args);
+            Ok(crate::tools::ToolOutput::new("ок"))
+        }
+    }
+
+    #[tokio::test]
+    async fn marks_that_leak_into_text_for_people_are_cut_before_the_call() {
+        for on in [true, false] {
+            let p = FakeProvider::new(vec![
+                Some(vec![call(
+                    "c1",
+                    "reminder_set",
+                    json!({"text": "[softly] Выпей <whisper>воды</whisper>", "in_minutes": 5}),
+                )]),
+                Some(vec![text("Готово")]),
+            ]);
+            let bus = EventBus::new(64);
+            let mut rx = bus.subscribe();
+            let tool = Arc::new(Recorder {
+                name: "reminder_set",
+                got: Mutex::new(Vec::new()),
+            });
+            let mut reg = ToolRegistry::new();
+            reg.register(tool.clone());
+            let a = Agent::new(
+                p,
+                Arc::new(reg),
+                Arc::new(LowRiskOnlyGate),
+                bus.clone(),
+                StateHandle::new(bus),
+                "sys".into(),
+            );
+            a.set_marks_switch(marks_switch(on));
+            a.handle("напомни", CancellationToken::new()).await.unwrap();
+            let text = if on {
+                "Выпей воды"
+            } else {
+                "[softly] Выпей <whisper>воды</whisper>"
+            };
+            assert_eq!(
+                *tool.got.lock(),
+                [json!({"text": text, "in_minutes": 5})],
+                "{on}"
+            );
+            assert!(drain(&mut rx).iter().any(|e| matches!(
+                e,
+                Event::ToolStarted { summary, .. } if summary.contains(text)
+            )));
+        }
+    }
+
+    #[test]
+    fn only_text_for_people_loses_its_marks() {
+        assert_eq!(
+            unmark_args(
+                "messenger_send",
+                json!({"contact": "[Аня]", "text": "<whisper>Привет</whisper>, [softly] как ты?"})
+            ),
+            json!({"contact": "[Аня]", "text": "Привет, как ты?"})
+        );
+        assert_eq!(
+            unmark_args(
+                "task_plan",
+                json!({"title": "[sigh] Уборка", "steps": ["[softly] Открыть папку", "Переложить [1] файл"]})
+            ),
+            json!({"title": "Уборка", "steps": ["Открыть папку", "Переложить [1] файл"]})
+        );
+        // Text without marks keeps its spacing; data is never touched.
+        let untouched = [
+            ("memory_save", json!({"text": "  Любит чай  "})),
+            ("search_text", json!({"pattern": "[a-z] [тихо]"})),
+            ("move_path", json!({"from": "C:\\Docs\\[Архив] старое"})),
+            ("write_file", json!({"content": "Нажми [Сохранить]"})),
+            ("ui_type", json!({"text": "[Сохранить]"})),
+        ];
+        for (name, args) in untouched {
+            assert_eq!(unmark_args(name, args.clone()), args, "{name}");
+        }
+    }
+
+    #[test]
+    fn marks_hint_names_every_effect_tag() {
+        for tag in &crate::marks::EFFECT_TAGS[..7] {
+            assert!(MARKS_HINT.contains(&format!("<{tag}>…</{tag}>")), "{tag}");
+        }
+        assert!(MARKS_HINT.contains(".\n- Ремарка: ") && MARKS_HINT.contains("нет.\nПользователь"));
+    }
+
+    #[test]
+    fn marks_hint_states_what_the_filter_takes_for_a_mark() {
+        // The model cannot keep to limits it is not told: these match `marks`.
+        assert!(MARKS_HINT.contains(&format!("не больше {} знаков", crate::marks::MAX_DIRECTION)));
+        for rule in [
+            "без цифр",
+            "[pause 2s]",
+            "Перед [ ставь пробел",
+            "[/whisper]",
+            "<break>",
+        ] {
+            assert!(MARKS_HINT.contains(rule), "{rule}");
         }
     }
 }

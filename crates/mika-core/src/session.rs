@@ -108,6 +108,7 @@ impl Session {
                     text: format!(
                         "Это действие высокого риска. Чтобы подтвердить голосом, скажи его название: «{name}». Или скажи «отмена»."
                     ),
+                    spoken: None,
                 });
                 return Submitted::Hinted;
             }
@@ -127,7 +128,10 @@ impl Session {
                 },
                 None => ANSWER_HINT.to_string(),
             };
-            self.bus.publish(Event::AssistantText { text: hint });
+            self.bus.publish(Event::AssistantText {
+                text: hint,
+                spoken: None,
+            });
             return Submitted::Hinted;
         }
         let token = self.cancel.lock().clone();
@@ -254,7 +258,7 @@ mod tests {
         )));
         assert!(events
             .iter()
-            .any(|e| matches!(e, Event::AssistantText { text } if text.starts_with("итог: "))));
+            .any(|e| matches!(e, Event::AssistantText { text, .. } if text.starts_with("итог: "))));
     }
 
     #[tokio::test]
@@ -268,7 +272,7 @@ mod tests {
         let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(events
             .iter()
-            .any(|e| matches!(e, Event::AssistantText { text } if text == ANSWER_HINT)));
+            .any(|e| matches!(e, Event::AssistantText { text, .. } if text == ANSWER_HINT)));
         s.stop();
     }
 
@@ -321,9 +325,9 @@ mod tests {
         assert!(events.contains(&Event::UserText {
             text: "отбой!".into()
         }));
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, Event::AssistantText { text } if text.ends_with("Выключи звук"))));
+        assert!(events.iter().any(
+            |e| matches!(e, Event::AssistantText { text, .. } if text.ends_with("Выключи звук"))
+        ));
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 // Development-only preview without Tauri: open http://localhost:5173/?mock=chat
 // Scenarios: island, listen, think, speak, chat, cards, reminder, confirm, high, long, settings.
 // `&page=providers|permissions|tools|memory|extensions|voice|island|general` picks a settings page, `&timer` shows a countdown, `&narrow` hides the avatar column,
+// `&cloud` switches the voice page to the provider engine, `&drama` to Drama 3 with expressive speech on,
 // `?view=avatar&mock=speak` shows the desktop avatar window. Not bundled into production builds.
 
 import { mockIPC } from '@tauri-apps/api/mocks';
@@ -227,8 +228,8 @@ export async function install(scenario: string) {
               { name: 'Microsoft David', language: 'en-US' },
             ],
             has_russian: true,
-            tts: params.has('cloud') ? 'provider' : 'windows',
-            tts_model: 'google/gemini-3.8-flash-lite-tts',
+            tts: params.has('cloud') || params.has('drama') ? 'provider' : 'windows',
+            tts_model: params.has('drama') ? 'fish-audio/drama-3' : 'google/gemini-3.8-flash-lite-tts',
             tts_voice: 'Kore',
             tts_cache: true,
             tts_cache_bytes: 3_400_000,
@@ -253,7 +254,12 @@ export async function install(scenario: string) {
             tts_style: '',
             tone_by_mood: true,
             brief_long: true,
+            tts_expressive: params.has('drama'),
+            expressive_model: params.has('drama'),
           };
+        case 'save_speech_settings':
+          // Whether the saved model understands speech marks, as the app decides it.
+          return /drama/i.test(String(a.ttsModel ?? ''));
         case 'test_microphone':
           return 'какая сегодня погода';
         case 'problem_report':

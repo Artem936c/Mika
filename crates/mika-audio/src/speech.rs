@@ -5,7 +5,11 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use mika_core::emotion::Emotion;
 use mika_core::events::{Event, EventBus};
+use mika_core::marks::{
+    code_open, in_code_block_line, strip_marks, tokens, tokens_raw, MarkFilter, Token,
+};
 use mika_core::schedule::ReminderKind;
 use mika_core::state::AssistantState;
 use parking_lot::Mutex;
@@ -32,7 +36,23 @@ pub type RemoteSynth = Arc<dyn Fn(&str) -> Result<Vec<u8>, String> + Send + Sync
 
 /// Something that can speak. Sentences queue up; `stop` drops the queue at once.
 pub trait Voice: Send + Sync {
+    /// Says text that is not from the model: notifications, reminders,
+    /// errors. A remote synthesizer that performs voice marks gets it with
+    /// its brackets made harmless (decision 0026).
     fn speak(&self, text: &str);
+    /// Says words of the model without voice marks: a remote synthesizer
+    /// gets them as they are, as before decision 0026. A voice that wraps
+    /// another must pass it on.
+    fn speak_reply(&self, text: &str) {
+        self.speak(text);
+    }
+    /// Says a phrase of a reply with voice marks (decision 0026): a remote
+    /// synthesizer that performs them gets `marked`, any other voice `plain`,
+    /// the same words without marks. A voice that wraps another must pass it
+    /// on, or the marks are lost.
+    fn speak_marked(&self, _marked: &str, plain: &str) {
+        self.speak(plain);
+    }
     fn stop(&self);
     fn voices(&self) -> Vec<VoiceInfo>;
     /// Picks the voice by name (empty: a Russian one if installed) and the rate, 0.5..=2.0.
@@ -78,12 +98,367 @@ pub fn prosody_ssml(text: &str, language: &str, (pitch, rate): (i8, i8)) -> Stri
 pub type FirstSound = Arc<dyn Fn(u64) + Send + Sync>;
 
 /// Splits streamed text into sentences.
+///
+/// One made by [`SentenceSplitter::marked`] reads a reply with voice marks
+/// (decision 0026). A phrase never ends inside a mark. A paired tag still
+/// open at the end of a phrase is closed there and opened again in the next
+/// one. A direction lasts to the end of its line, so a phrase of the same
+/// line that has none of its own starts with it again, unless it is a sound
+/// said once, like `[sigh]`. Lengths count only the characters of the text.
+/// Marks with no words after them wait for the next phrase and are dropped
+/// at the end. In its phrases square brackets of the text become round, its
+/// angle brackets and backticks go: marks and code are found on the whole
+/// reply, and a phrase read alone must give `tokens` the same marks and
+/// nothing else.
 #[derive(Debug, Default)]
 pub struct SentenceSplitter {
     buf: String,
+    /// Set for a reply with voice marks, which it keeps itself.
+    marks: Option<Marked>,
+}
+
+/// What a splitter of a reply with voice marks knows.
+#[derive(Debug, Default)]
+struct Marked {
+    /// The reply as it came, from its start or from a point where the marks
+    /// are found as from a start: see `forget`.
+    text: String,
+    /// Tells where the marks end: what it still holds may become one.
+    filter: MarkFilter,
+    /// Bytes at the start of `text` whose marks are decided.
+    decided: usize,
+    /// Items at the start of `text` already given out in phrases.
+    said: usize,
+    /// Tags open where the next phrase starts.
+    open: Vec<&'static str>,
+    /// The last direction of the line where the next phrase starts.
+    direction: Option<String>,
+}
+
+/// Sounds said once, not a manner of speech: a direction of them, `[sigh]`
+/// or `[long pause]`, is not said again in the next phrase of its line.
+const ONE_OFF: [&str; 25] = [
+    "sigh",
+    "sighs",
+    "laugh",
+    "laughs",
+    "laughing",
+    "chuckle",
+    "chuckles",
+    "giggle",
+    "giggles",
+    "pause",
+    "cough",
+    "coughs",
+    "gasp",
+    "gasps",
+    "breath",
+    "inhale",
+    "exhale",
+    "sob",
+    "sobs",
+    "sniff",
+    "sniffs",
+    "вздох",
+    "вздыхает",
+    "смеётся",
+    "пауза",
+];
+
+/// Whether a direction goes on into the next phrase of its line: not a
+/// sound said once and not an emotion tag like `[joy]`.
+fn lasting(direction: &str) -> bool {
+    let d = direction.trim().to_lowercase();
+    let words: Vec<&str> = d
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphabetic()))
+        .collect();
+    let sound = words.len() <= 2 && words.last().is_some_and(|w| ONE_OFF.contains(w));
+    !sound && Emotion::from_tag(&d).is_none()
+}
+
+/// A character of the text or a whole voice mark.
+#[derive(Debug, Clone)]
+enum Item {
+    Char(char),
+    /// A mark and its length in the text as it came, bytes.
+    Mark(Token, usize),
+}
+
+impl Item {
+    /// Length in the text as it came, bytes.
+    fn raw_len(&self) -> usize {
+        match self {
+            Item::Char(c) => c.len_utf8(),
+            Item::Mark(_, len) => *len,
+        }
+    }
+}
+
+/// `text` as characters and whole marks. The marks are found from the start
+/// of `text`, so code blocks are known wherever a phrase begins.
+fn items(text: &str) -> Vec<Item> {
+    let mut out = Vec::new();
+    for (token, len) in tokens_raw(text) {
+        match token {
+            Token::Text(t) => out.extend(t.chars().map(Item::Char)),
+            mark => out.push(Item::Mark(mark, len)),
+        }
+    }
+    out
+}
+
+/// End of the first phrase of `items` that has words and is long enough, by
+/// the rules of `SentenceSplitter::boundary` with only the text counted.
+/// Closing tags right after the end of a sentence belong to it.
+fn marked_boundary(items: &[Item]) -> Option<usize> {
+    let mut count = 0usize;
+    let mut words = false;
+    for (i, item) in items.iter().enumerate() {
+        let &Item::Char(c) = item else { continue };
+        count += 1;
+        words |= c.is_alphanumeric();
+        let mut end = i + 1;
+        let stop = match c {
+            '\n' => true,
+            '.' | '!' | '?' | '…' => {
+                while matches!(items.get(end), Some(Item::Mark(Token::Close(_), _))) {
+                    end += 1;
+                }
+                matches!(items.get(end), Some(Item::Char(n)) if n.is_whitespace())
+            }
+            _ => false,
+        };
+        if words && stop && (count >= MIN_SENTENCE || c == '\n') {
+            return Some(end);
+        }
+        if words && count >= MAX_SENTENCE && c.is_whitespace() {
+            return Some(i + 1);
+        }
+    }
+    None
+}
+
+impl Marked {
+    fn push(&mut self, piece: &str) -> Vec<String> {
+        self.text.push_str(piece);
+        self.decided += self.filter.push(piece).spoken.len();
+        let items = items(&self.text[..self.decided]);
+        debug_assert_eq!(items.iter().map(Item::raw_len).sum::<usize>(), self.decided);
+        let mut out = Vec::new();
+        let start = self.said;
+        while let Some(end) = marked_boundary(&items[self.said..]) {
+            let end = self.said + end;
+            out.extend(self.phrase(&items[self.said..end]));
+            self.said = end;
+        }
+        if self.said > start {
+            self.forget(&items[..self.said]);
+        }
+        out
+    }
+
+    /// The rest of the reply. Ready for a new reply afterwards.
+    fn finish(&mut self) -> Option<String> {
+        let items = items(&self.text);
+        let phrase = self.phrase(items.get(self.said..).unwrap_or_default());
+        *self = Self::default();
+        phrase
+    }
+
+    /// Drops the text already said, so a long reply is not read again from
+    /// its start at every piece. It is dropped only where no code is open:
+    /// the marks of the rest are then found as from a start. A dropped line
+    /// that has not ended leaves `.` in its place, so backticks that follow on
+    /// that line are not taken for the start of a code block.
+    fn forget(&mut self, said: &[Item]) {
+        let cut: usize = said.iter().map(Item::raw_len).sum();
+        let stand_in =
+            if said.iter().any(|i| matches!(i, Item::Char('`'))) && code_open(&self.text[..cut]) {
+                // Inside a code block at the start of a line, the block is
+                // opened again in place of what was said; elsewhere in code
+                // nothing is dropped.
+                if !in_code_block_line(&self.text[..cut]) {
+                    return;
+                }
+                "```\n"
+            } else if matches!(said.last(), Some(Item::Char('\n'))) {
+                ""
+            } else {
+                "."
+            };
+        self.text.replace_range(..cut, stand_in);
+        self.decided = self.decided - cut + stand_in.len();
+        self.said = stand_in.len();
+    }
+
+    /// A phrase of these items. Tags left open by the last phrase are opened
+    /// again, tags open at its end are closed. The direction of its line
+    /// comes first, unless a line break or a direction of its own comes
+    /// before its words. `None` when it has no words.
+    fn phrase(&mut self, items: &[Item]) -> Option<String> {
+        let reopen: Vec<Token> = self.open.iter().copied().map(Token::Open).collect();
+        let carried = self.direction.take().filter(|d| {
+            lasting(d)
+                && items
+                    .iter()
+                    .take_while(|i| !matches!(i, Item::Char(c) if c.is_alphanumeric()))
+                    .all(|i| !matches!(i, Item::Char('\n') | Item::Mark(Token::Direction(_), _)))
+        });
+        self.direction.clone_from(&carried);
+        let mut tags = Tags {
+            open: std::mem::take(&mut self.open),
+        };
+        let mut body = Vec::new();
+        let mut words = false;
+        for item in items {
+            match item {
+                Item::Char('\n') => self.direction = None,
+                Item::Mark(Token::Direction(d), _) => self.direction = Some(d.clone()),
+                _ => {}
+            }
+            match item {
+                Item::Char(c) => {
+                    words |= c.is_alphanumeric();
+                    // Code was found on the whole reply: its backticks have
+                    // done their job and are never read out.
+                    let Some(c) = defuse(*c).filter(|c| *c != '`') else {
+                        continue;
+                    };
+                    match body.last_mut() {
+                        Some(Token::Text(t)) => t.push(c),
+                        _ => body.push(Token::Text(c.to_string())),
+                    }
+                }
+                Item::Mark(mark, _) => tags.take(mark.clone(), &mut body),
+            }
+        }
+        let close = tags.closers();
+        self.open = tags.open;
+        let lead = carried.map(|d| format!("[{d}] ")).unwrap_or_default();
+        words.then(|| {
+            format!(
+                "{lead}{}{}{}",
+                render(&reopen),
+                render(&body).trim(),
+                render(&close)
+            )
+        })
+    }
+}
+
+/// Paired tags open in text with voice marks, kept balanced.
+#[derive(Debug, Default)]
+struct Tags {
+    open: Vec<&'static str>,
+}
+
+impl Tags {
+    /// Adds `token` to `out`. A closing tag with no opening one is dropped.
+    /// One that closes an outer tag first closes the tags inside it and opens
+    /// them again after it.
+    fn take(&mut self, token: Token, out: &mut Vec<Token>) {
+        match token {
+            Token::Open(name) => {
+                self.open.push(name);
+                out.push(Token::Open(name));
+            }
+            Token::Close(name) => {
+                let Some(at) = self.open.iter().rposition(|t| *t == name) else {
+                    return;
+                };
+                let inner = self.open.split_off(at + 1);
+                self.open.pop();
+                out.extend(inner.iter().rev().copied().map(Token::Close));
+                out.push(Token::Close(name));
+                out.extend(inner.iter().copied().map(Token::Open));
+                self.open.extend(inner);
+            }
+            other => out.push(other),
+        }
+    }
+
+    /// Closing tags for all that are open, innermost first.
+    fn closers(&self) -> Vec<Token> {
+        self.open.iter().rev().copied().map(Token::Close).collect()
+    }
+}
+
+/// Text with voice marks written from tokens, so that `tokens` finds the
+/// same marks in it again: a direction never sticks to a word before it or
+/// to a `(` after it.
+fn render(tokens: &[Token]) -> String {
+    let mut out = String::new();
+    let mut after_direction = false;
+    for token in tokens {
+        match token {
+            Token::Text(t) if t.is_empty() => continue,
+            Token::Text(t) => {
+                if after_direction && t.starts_with('(') {
+                    out.push(' ');
+                }
+                out.push_str(t);
+            }
+            Token::Direction(d) => {
+                if out.ends_with(char::is_alphanumeric) {
+                    out.push(' ');
+                }
+                out.push('[');
+                out.push_str(d);
+                out.push(']');
+            }
+            Token::Open(name) => {
+                out.push('<');
+                out.push_str(name);
+                out.push('>');
+            }
+            Token::Close(name) => {
+                out.push_str("</");
+                out.push_str(name);
+                out.push('>');
+            }
+        }
+        after_direction = matches!(token, Token::Direction(_));
+    }
+    out
+}
+
+/// A character of text that is not a voice mark, as a synthesizer that
+/// performs marks should get it: Fish S2 and Drama 3 would take words in
+/// square brackets for a direction and swallow them, so the brackets become
+/// round ones, and angle brackets go (decision 0026).
+pub(crate) fn defuse(c: char) -> Option<char> {
+    match c {
+        '[' => Some('('),
+        ']' => Some(')'),
+        '<' | '>' => None,
+        c => Some(c),
+    }
+}
+
+/// A splitter for a reply with voice marks when `marked`, otherwise plain.
+fn splitter(marked: bool) -> SentenceSplitter {
+    if marked {
+        SentenceSplitter::marked()
+    } else {
+        SentenceSplitter::default()
+    }
 }
 
 impl SentenceSplitter {
+    /// A splitter for a reply with voice marks.
+    pub fn marked() -> Self {
+        Self {
+            buf: String::new(),
+            marks: Some(Marked::default()),
+        }
+    }
+
+    /// Whether it reads a reply with voice marks.
+    pub fn is_marked(&self) -> bool {
+        self.marks.is_some()
+    }
+
     /// Byte index just past the first sentence that is long enough, if any.
     fn boundary(&self) -> Option<usize> {
         let mut chars = self.buf.char_indices().peekable();
@@ -109,6 +484,9 @@ impl SentenceSplitter {
 
     /// Adds a piece of the reply and returns the sentences it completed.
     pub fn push(&mut self, piece: &str) -> Vec<String> {
+        if let Some(marks) = self.marks.as_mut() {
+            return marks.push(piece);
+        }
         self.buf.push_str(piece);
         let mut out = Vec::new();
         while let Some(end) = self.boundary() {
@@ -123,40 +501,122 @@ impl SentenceSplitter {
 
     /// The text left when the reply ends.
     pub fn finish(&mut self) -> Option<String> {
+        if let Some(marks) = self.marks.as_mut() {
+            return marks.finish();
+        }
         let rest = std::mem::take(&mut self.buf);
         let rest = rest.trim();
         (!rest.is_empty()).then(|| rest.to_string())
     }
 }
 
-/// Text as it should be read aloud: no markup, no links, no emoji.
-pub fn clean_for_speech(text: &str) -> String {
-    static URL: OnceLock<Regex> = OnceLock::new();
+/// Emoji and pictographs: a synthesizer reads their names or stumbles.
+fn emoji(c: char) -> bool {
+    let u = c as u32;
+    (0x1F000..=0x1FAFF).contains(&u)
+        || (0x2600..=0x27BF).contains(&u)
+        || (0xFE00..=0xFE0F).contains(&u)
+        || u == 0x200D
+}
+
+/// Whitespace runs as one space, none at the ends.
+fn collapse_spaces(text: &str) -> String {
     static SPACES: OnceLock<Regex> = OnceLock::new();
-    let url = URL.get_or_init(|| Regex::new(r"https?://\S+").unwrap());
     let spaces = SPACES.get_or_init(|| Regex::new(r"\s+").unwrap());
-    let text = url.replace_all(text, "ссылка");
-    let text: String = text
+    spaces.replace_all(text.trim(), " ").into_owned()
+}
+
+/// Whitespace runs as one space, or as one line break where they hold one,
+/// none at the ends: a direction lasts to the end of its line (decision 0026).
+fn collapse_lines(text: &str) -> String {
+    static BREAKS: OnceLock<Regex> = OnceLock::new();
+    static SPACES: OnceLock<Regex> = OnceLock::new();
+    let breaks = BREAKS.get_or_init(|| Regex::new(r"\s*\n\s*").unwrap());
+    let spaces = SPACES.get_or_init(|| Regex::new(r"[^\S\n]+").unwrap());
+    let lines = breaks.replace_all(text.trim(), "\n");
+    spaces.replace_all(&lines, " ").into_owned()
+}
+
+/// `clean_for_speech` with the spacing left as it is.
+fn speech_chars(text: &str) -> String {
+    static URL: OnceLock<Regex> = OnceLock::new();
+    let url = URL.get_or_init(|| Regex::new(r"https?://\S+").unwrap());
+    url.replace_all(text, "ссылка")
         .chars()
         .filter(|c| !matches!(c, '*' | '`' | '#' | '_' | '~' | '|' | '>' | '<'))
-        .filter(|c| {
-            let u = *c as u32;
-            // Emoji and pictographs: a synthesizer reads their names or stumbles.
-            !(0x1F000..=0x1FAFF).contains(&u)
-                && !(0x2600..=0x27BF).contains(&u)
-                && !(0xFE00..=0xFE0F).contains(&u)
-                && u != 0x200D
-        })
-        .collect();
-    spaces.replace_all(text.trim(), " ").into_owned()
+        .filter(|c| !emoji(*c))
+        .collect()
+}
+
+/// Text as it should be read aloud: no markup, no links, no emoji.
+pub fn clean_for_speech(text: &str) -> String {
+    collapse_spaces(&speech_chars(text))
+}
+
+/// Text with voice marks as it should be said (decision 0026). The text
+/// between the marks is cleaned as by `clean_for_speech`, and its own
+/// brackets are made harmless; line breaks stay, since a direction ends with
+/// its line. Directions keep their words, paired tags are balanced and empty
+/// pairs dropped. Empty when no words are left outside the marks: marks
+/// alone are not worth a request.
+pub fn clean_marked_for_speech(text: &str) -> String {
+    let mut tags = Tags::default();
+    let mut balanced = Vec::new();
+    for token in tokens(text) {
+        let token = match token {
+            Token::Text(t) => Token::Text(speech_chars(&t).chars().filter_map(defuse).collect()),
+            Token::Direction(d) => {
+                let d: String = d.chars().filter(|c| !emoji(*c)).collect();
+                let d = collapse_spaces(&d);
+                if d.is_empty() {
+                    continue;
+                }
+                Token::Direction(d)
+            }
+            tag => tag,
+        };
+        tags.take(token, &mut balanced);
+    }
+    balanced.extend(tags.closers());
+    // A pair with nothing but whitespace inside does nothing.
+    let mut kept: Vec<Token> = Vec::new();
+    for token in balanced {
+        if let Token::Close(name) = token {
+            let last = kept
+                .iter()
+                .rposition(|t| !matches!(t, Token::Text(s) if s.trim().is_empty()));
+            if let Some(at) = last.filter(|at| kept[*at] == Token::Open(name)) {
+                kept.remove(at);
+                continue;
+            }
+        }
+        kept.push(token);
+    }
+    let words = kept
+        .iter()
+        .any(|t| matches!(t, Token::Text(s) if s.chars().any(char::is_alphanumeric)));
+    if !words {
+        return String::new();
+    }
+    collapse_lines(&render(&kept))
+}
+
+/// A reply phrase with voice marks made ready for the voice: with the marks
+/// and without them. `None` when it has no words to say.
+fn marked_speech(text: &str) -> Option<(String, String)> {
+    let marked = clean_marked_for_speech(text);
+    let plain = clean_for_speech(&strip_marks(text));
+    (!marked.is_empty() && !plain.is_empty()).then_some((marked, plain))
 }
 
 /// Whether anyone can hear her now: false while the system sound is muted.
 pub type Audible = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Makes a short retelling of a long reply for the voice; `None` when it fails.
+/// With `true` the reply carries voice marks (decision 0026), and the
+/// retelling may keep its tone with the same marks.
 pub type Summarize =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
+    Arc<dyn Fn(String, bool) -> Pin<Box<dyn Future<Output = Option<String>> + Send>> + Send + Sync>;
 
 /// A reply longer than this, characters, is not read out when retelling is on.
 pub const LONG_REPLY: usize = 300;
@@ -257,8 +717,9 @@ impl SpeakerSwitch {
     }
 
     /// Says a short retelling of a long reply once it is made, unless she was
-    /// stopped meanwhile. Until then she counts as speaking.
-    fn retell(&self, voice: Arc<dyn Voice>, reply: String) {
+    /// stopped meanwhile. Until then she counts as speaking. A `marked` reply
+    /// carries voice marks, and so may its retelling.
+    fn retell(&self, voice: Arc<dyn Voice>, reply: String, marked: bool) {
         // Nobody would hear it: the model is not asked either.
         if !self.heard() {
             return;
@@ -275,7 +736,7 @@ impl SpeakerSwitch {
             }
             let summary = async {
                 match switch.summarize.clone() {
-                    Some(s) => s(reply.clone()).await,
+                    Some(s) => s(reply.clone(), marked).await,
                     None => None,
                 }
             };
@@ -283,19 +744,47 @@ impl SpeakerSwitch {
                 short = summary => short,
                 () = &mut dropped => return,
             };
-            let text = short
-                .map(|s| clean_for_speech(&s))
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| fallback_brief(&reply));
+            let said = match short {
+                Some(s) if marked => marked_speech(&s).map(|(m, p)| Utterance::Marked(m, p)),
+                Some(s) => Some(clean_for_speech(&s))
+                    .filter(|s| !s.is_empty())
+                    .map(Utterance::Plain),
+                None => None,
+            };
+            let said = said.unwrap_or_else(|| {
+                if marked {
+                    let (m, p) = fallback_brief_marked(&reply);
+                    Utterance::Marked(m, p)
+                } else {
+                    Utterance::Plain(fallback_brief(&reply))
+                }
+            });
             let wanted = switch.get() && switch.heard();
             let r = switch.retellings.lock();
             if wanted && r.generation == pending.generation {
-                voice.speak(&text);
+                said.speak(voice.as_ref());
             }
             drop(r);
             // Let go only after the retelling is queued: the voice is busy by then.
             drop(pending);
         });
+    }
+}
+
+/// A retelling ready for the voice.
+enum Utterance {
+    Plain(String),
+    /// With voice marks, and the same words without them.
+    Marked(String, String),
+}
+
+impl Utterance {
+    fn speak(&self, voice: &dyn Voice) {
+        match self {
+            // Words of the model, retold or cut short.
+            Utterance::Plain(text) => voice.speak_reply(text),
+            Utterance::Marked(marked, plain) => voice.speak_marked(marked, plain),
+        }
     }
 }
 
@@ -340,6 +829,14 @@ struct Retold {
 impl Voice for Retold {
     fn speak(&self, text: &str) {
         self.inner.speak(text);
+    }
+
+    fn speak_reply(&self, text: &str) {
+        self.inner.speak_reply(text);
+    }
+
+    fn speak_marked(&self, marked: &str, plain: &str) {
+        self.inner.speak_marked(marked, plain);
     }
 
     fn stop(&self) {
@@ -392,13 +889,51 @@ pub fn fallback_brief(reply: &str) -> String {
     }
 }
 
+/// `fallback_brief` of a reply with voice marks: its first phrase with the
+/// marks, tags closed, and the same words without them.
+pub fn fallback_brief_marked(reply: &str) -> (String, String) {
+    let mut s = SentenceSplitter::marked();
+    let first = s
+        .push(reply)
+        .into_iter()
+        .chain(s.finish())
+        .find_map(|p| marked_speech(&p));
+    let Some((marked, plain)) = first else {
+        return ("Ответ в чате.".into(), "Ответ в чате.".into());
+    };
+    let plain: String = plain.chars().take(LONG_REPLY).collect();
+    (
+        format!("{} Подробности в чате.", take_words(&marked, LONG_REPLY)),
+        format!("{plain} Подробности в чате."),
+    )
+}
+
+/// Text with voice marks cut after `n` characters of its text, tags closed.
+fn take_words(marked: &str, n: usize) -> String {
+    let mut left = n;
+    let mut kept = Vec::new();
+    for token in tokens(marked) {
+        if let Token::Text(t) = &token {
+            let len = t.chars().count();
+            if len > left {
+                kept.push(Token::Text(t.chars().take(left).collect()));
+                break;
+            }
+            left -= len;
+        }
+        kept.push(token);
+    }
+    clean_marked_for_speech(&render(&kept))
+}
+
 /// The reply being spoken and what is known about it so far.
 #[derive(Default)]
 struct Turn {
     splitter: SentenceSplitter,
-    /// Sentences held back until it is clear the reply is short.
-    held: Vec<String>,
-    /// Characters of the current piece of the reply.
+    /// Sentences held back until it is clear the reply is short, each with
+    /// whether it carries voice marks.
+    held: Vec<(String, bool)>,
+    /// Characters of the current piece of the reply, its marks not counted.
     chars: usize,
     /// The reply grew long: nothing of it is read out.
     long: bool,
@@ -406,6 +941,27 @@ struct Turn {
     task: bool,
     /// How the task of this turn ended, `Some(ok)`, once it has.
     task_end: Option<bool>,
+}
+
+impl Turn {
+    /// The sentences a piece of the reply completes, each with whether it
+    /// carries voice marks. A piece of another kind than the text before it
+    /// ends that text first.
+    fn push(&mut self, piece: &str, marked: bool) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        if self.splitter.is_marked() != marked {
+            out.extend(self.finish());
+            self.splitter = splitter(marked);
+        }
+        out.extend(self.splitter.push(piece).into_iter().map(|s| (s, marked)));
+        out
+    }
+
+    /// The rest of the reply, with whether it carries voice marks.
+    fn finish(&mut self) -> Option<(String, bool)> {
+        let marked = self.splitter.is_marked();
+        self.splitter.finish().map(|s| (s, marked))
+    }
 }
 
 /// Reads replies, questions about actions and reminders aloud until the bus closes.
@@ -427,12 +983,27 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
             voice.speak(&clean);
         }
     };
+    // Words of the model. With voice marks the voice performs them, and a
+    // voice that does not gets the same words without them. Without marks
+    // they reach a remote synthesizer as they are.
+    let say_reply = |text: &str, marked: bool| {
+        if !marked {
+            let clean = clean_for_speech(text);
+            if !clean.is_empty() && switch.heard() {
+                voice.speak_reply(&clean);
+            }
+        } else if let Some((with, without)) = marked_speech(text) {
+            if switch.heard() {
+                voice.speak_marked(&with, &without);
+            }
+        }
+    };
     // A whole reply goes to the voice sentence by sentence: in one piece it
     // would start late and be cut off.
-    let say_all = |text: &str| {
-        let mut s = SentenceSplitter::default();
+    let say_all = |text: &str, marked: bool| {
+        let mut s = splitter(marked);
         for sentence in s.push(text).into_iter().chain(s.finish()) {
-            say(&sentence);
+            say_reply(&sentence, marked);
         }
     };
     // Silence now, a retelling still being made included.
@@ -498,15 +1069,16 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
             }
             _ if !switch.get() => {}
             Event::AssistantDelta { .. } if turn.task => streamed = true,
-            Event::AssistantDelta { text } => {
+            Event::AssistantDelta { text, spoken } => {
                 streamed = true;
-                let sentences = turn.splitter.push(&text);
+                let sentences = turn.push(spoken.as_deref().unwrap_or(&text), spoken.is_some());
                 if !brief {
-                    for sentence in sentences {
-                        say(&sentence);
+                    for (sentence, marked) in sentences {
+                        say_reply(&sentence, marked);
                     }
                     continue;
                 }
+                // Only the words count: marks are not read out.
                 turn.chars += text.chars().count();
                 if turn.chars > LONG_REPLY {
                     turn.long = true;
@@ -516,30 +1088,48 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
                     turn.held.extend(sentences);
                 }
             }
+            // A later step of the same reply with no tool call before it: the
+            // agent finds its marks anew, so the text before it ends here.
+            Event::StepStarted if turn.task || !turn.splitter.is_marked() => {}
+            Event::StepStarted => {
+                if let Some((rest, marked)) = turn.finish() {
+                    if !brief {
+                        say_reply(&rest, marked);
+                    } else if !turn.long {
+                        turn.held.push((rest, marked));
+                    }
+                }
+            }
             // How to answer the question: the turn goes on.
-            Event::AssistantText { text } if confirming => say(&text),
-            Event::AssistantText { text } => {
+            Event::AssistantText { text, spoken } if confirming => {
+                say_reply(spoken.as_deref().unwrap_or(&text), spoken.is_some())
+            }
+            Event::AssistantText { text, spoken } => {
                 let whole = !streamed || turn.task;
+                let marked = spoken.is_some();
+                // Long or short by its words: marks are not read out.
+                let long = text.chars().count() > LONG_REPLY;
+                let said = spoken.unwrap_or(text);
                 if !brief {
                     if whole {
-                        say_all(&text);
-                    } else if let Some(rest) = turn.splitter.finish() {
-                        say(&rest);
+                        say_all(&said, marked);
+                    } else if let Some((rest, marked)) = turn.finish() {
+                        say_reply(&rest, marked);
                     }
                 } else if whole {
-                    if text.chars().count() > LONG_REPLY {
-                        switch.retell(voice.clone(), text);
+                    if long {
+                        switch.retell(voice.clone(), said, marked);
                     } else {
-                        say(&text);
+                        say_reply(&said, marked);
                     }
                 } else if turn.long {
-                    switch.retell(voice.clone(), text);
+                    switch.retell(voice.clone(), said, marked);
                 } else {
-                    for sentence in turn.held.drain(..) {
-                        say(&sentence);
+                    for (sentence, marked) in turn.held.drain(..) {
+                        say_reply(&sentence, marked);
                     }
-                    if let Some(rest) = turn.splitter.finish() {
-                        say(&rest);
+                    if let Some((rest, marked)) = turn.finish() {
+                        say_reply(&rest, marked);
                     }
                 }
                 turn = Turn::default();
@@ -548,13 +1138,13 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
             Event::ToolStarted { .. } if turn.task => {}
             Event::ToolStarted { .. } => {
                 // Words said before a tool call are a finished phrase, unless long.
-                let rest = turn.splitter.finish();
+                let rest = turn.finish();
                 if !turn.long {
-                    for sentence in turn.held.drain(..) {
-                        say(&sentence);
+                    for (sentence, marked) in turn.held.drain(..) {
+                        say_reply(&sentence, marked);
                     }
-                    if let Some(rest) = rest {
-                        say(&rest);
+                    if let Some((rest, marked)) = rest {
+                        say_reply(&rest, marked);
                     }
                 }
                 turn.held.clear();
@@ -585,12 +1175,17 @@ mod tests {
     #[derive(Default)]
     struct FakeVoice {
         said: Mutex<Vec<String>>,
+        /// Phrases with voice marks, and the same words without them.
+        marked: Mutex<Vec<(String, String)>>,
         stops: Mutex<usize>,
     }
 
     impl Voice for FakeVoice {
         fn speak(&self, text: &str) {
             self.said.lock().push(text.into());
+        }
+        fn speak_marked(&self, marked: &str, plain: &str) {
+            self.marked.lock().push((marked.into(), plain.into()));
         }
         fn stop(&self) {
             *self.stops.lock() += 1;
@@ -679,7 +1274,10 @@ mod tests {
     }
 
     fn delta(t: &str) -> Event {
-        Event::AssistantDelta { text: t.into() }
+        Event::AssistantDelta {
+            text: t.into(),
+            spoken: None,
+        }
     }
 
     #[tokio::test]
@@ -693,6 +1291,7 @@ mod tests {
                 delta("Оденься **теплее**"),
                 Event::AssistantText {
                     text: "Сейчас минус десять градусов. Оденься **теплее**".into(),
+                    spoken: None,
                 },
                 Event::UserText {
                     text: "стоп".into(),
@@ -714,6 +1313,7 @@ mod tests {
             vec![
                 Event::AssistantText {
                     text: "Сначала ответь на вопрос.".into(),
+                    spoken: None,
                 },
                 Event::ConfirmRequested {
                     id: 1,
@@ -755,6 +1355,7 @@ mod tests {
                 delta("Это не должно прозвучать. "),
                 Event::AssistantText {
                     text: "Это не должно прозвучать.".into(),
+                    spoken: None,
                 },
                 Event::UserText { text: "x".into() },
             ],
@@ -777,12 +1378,14 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         bus.publish(Event::AssistantText {
             text: "В тишину.".into(),
+            spoken: None,
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(voice.said.lock().is_empty());
         muted.store(false, Ordering::Relaxed);
         bus.publish(Event::AssistantText {
             text: "Теперь слышно.".into(),
+            spoken: None,
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         job.abort();
@@ -803,11 +1406,13 @@ mod tests {
     }
 
     fn brief_switch() -> SpeakerSwitch {
-        let s = SpeakerSwitch::new(true).with_summarizer(Arc::new(|reply: String| {
-            Box::pin(async move {
-                Some(format!("Коротко: {} знаков.", reply.chars().count()))
-            })
-        }));
+        let s = SpeakerSwitch::new(true).with_summarizer(Arc::new(
+            |reply: String, _expressive: bool| {
+                Box::pin(async move {
+                    Some(format!("Коротко: {} знаков.", reply.chars().count()))
+                })
+            },
+        ));
         s.set_brief(true);
         s
     }
@@ -862,15 +1467,16 @@ mod tests {
     fn gated_switch() -> (SpeakerSwitch, tokio::sync::oneshot::Sender<()>) {
         let (go, wait) = tokio::sync::oneshot::channel::<()>();
         let wait = Arc::new(Mutex::new(Some(wait)));
-        let s = SpeakerSwitch::new(true).with_summarizer(Arc::new(move |_reply: String| {
-            let wait = wait.lock().take();
-            Box::pin(async move {
-                if let Some(w) = wait {
-                    let _ = w.await;
-                }
-                Some("Коротко о главном.".into())
-            })
-        }));
+        let s =
+            SpeakerSwitch::new(true).with_summarizer(Arc::new(move |_reply: String, _: bool| {
+                let wait = wait.lock().take();
+                Box::pin(async move {
+                    if let Some(w) = wait {
+                        let _ = w.await;
+                    }
+                    Some("Коротко о главном.".into())
+                })
+            }));
         s.set_brief(true);
         (s, go)
     }
@@ -893,6 +1499,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         bus.publish(Event::AssistantText {
             text: "Это очень длинный ответ про погоду на неделю. ".repeat(10),
+            spoken: None,
         });
         tokio::time::sleep(Duration::from_millis(30)).await;
         // The model is still retelling: she has not finished speaking.
@@ -939,12 +1546,12 @@ mod tests {
         let switch = gated_switch().0;
         let inner = Arc::new(FakeVoice::default());
         let voice = switch.wrap(inner.clone());
-        switch.retell(inner.clone(), "Первый длинный ответ.".into());
+        switch.retell(inner.clone(), "Первый длинный ответ.".into(), false);
         assert!(voice.busy());
         voice.stop();
         assert!(!voice.busy());
         // The next reply is retold and counts as speech until it is said.
-        switch.retell(inner.clone(), "Второй длинный ответ.".into());
+        switch.retell(inner.clone(), "Второй длинный ответ.".into(), false);
         assert!(voice.busy());
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert!(!voice.busy());
@@ -963,6 +1570,7 @@ mod tests {
                 },
                 Event::AssistantText {
                     text: "Скажи «да» или «нет».".into(),
+                    spoken: None,
                 },
                 Event::UserText {
                     text: "да".into()
@@ -977,6 +1585,7 @@ mod tests {
                 task(true),
                 Event::AssistantText {
                     text: "Всё сделала.".into(),
+                    spoken: None,
                 },
             ],
             brief_switch(),
@@ -1003,7 +1612,10 @@ mod tests {
                 confirm_resolved(),
                 delta(&format!("{end} ")),
                 task(true),
-                Event::AssistantText { text: end.into() },
+                Event::AssistantText {
+                    text: end.into(),
+                    spoken: None,
+                },
             ],
             SpeakerSwitch::new(true),
         )
@@ -1027,6 +1639,7 @@ mod tests {
                 task(true),
                 Event::AssistantText {
                     text: "Всё сделала.".into(),
+                    spoken: None,
                 },
             ],
             brief_switch(),
@@ -1055,7 +1668,10 @@ mod tests {
             vec![
                 task(false),
                 task(true),
-                Event::AssistantText { text: end.into() },
+                Event::AssistantText {
+                    text: end.into(),
+                    spoken: None,
+                },
             ],
             SpeakerSwitch::new(true),
         )
@@ -1074,7 +1690,13 @@ mod tests {
     async fn a_short_reply_is_said_whole_and_a_long_one_is_retold() {
         let short = "Сейчас минус десять градусов. Оденься теплее.";
         let v = run_with(
-            vec![delta(short), Event::AssistantText { text: short.into() }],
+            vec![
+                delta(short),
+                Event::AssistantText {
+                    text: short.into(),
+                    spoken: None,
+                },
+            ],
             brief_switch(),
         )
         .await;
@@ -1085,7 +1707,13 @@ mod tests {
 
         let long = "Это очень длинный ответ про погоду на неделю. ".repeat(10);
         let v = run_with(
-            vec![delta(&long), Event::AssistantText { text: long.clone() }],
+            vec![
+                delta(&long),
+                Event::AssistantText {
+                    text: long.clone(),
+                    spoken: None,
+                },
+            ],
             brief_switch(),
         )
         .await;
@@ -1110,6 +1738,7 @@ mod tests {
                 task(true),
                 Event::AssistantText {
                     text: "Всё сделала.".into(),
+                    spoken: None,
                 },
             ],
             brief_switch(),
@@ -1141,5 +1770,648 @@ mod tests {
             "Готово! Вот подробный план на неделю. Подробности в чате."
         );
         assert_eq!(fallback_brief("```код```"), "код Подробности в чате.");
+    }
+
+    fn split_marked(pieces: &[&str]) -> Vec<String> {
+        let mut s = SentenceSplitter::marked();
+        let mut out: Vec<String> = pieces.iter().flat_map(|p| s.push(p)).collect();
+        out.extend(s.finish());
+        out
+    }
+
+    fn marked_delta(text: &str, spoken: &str) -> Event {
+        Event::AssistantDelta {
+            text: text.into(),
+            spoken: Some(spoken.into()),
+        }
+    }
+
+    fn marked_text(text: &str, spoken: &str) -> Event {
+        Event::AssistantText {
+            text: text.into(),
+            spoken: Some(spoken.into()),
+        }
+    }
+
+    fn pair(marked: &str, plain: &str) -> (String, String) {
+        (marked.into(), plain.into())
+    }
+
+    #[test]
+    fn a_tag_across_two_sentences_is_closed_and_opened_again() {
+        let reply =
+            "[sigh] <whisper>Иди без меня, я справлюсь. Я догоню тебя потом.</whisper> Пока!";
+        let phrases = vec![
+            "[sigh] <whisper>Иди без меня, я справлюсь.</whisper>",
+            "<whisper>Я догоню тебя потом.</whisper>",
+            "Пока!",
+        ];
+        assert_eq!(split_marked(&[reply]), phrases);
+        // The same wherever the stream is cut.
+        for (at, _) in reply.char_indices() {
+            assert_eq!(
+                split_marked(&[&reply[..at], &reply[at..]]),
+                phrases,
+                "split at {at}"
+            );
+        }
+        let chars: Vec<String> = reply.chars().map(String::from).collect();
+        let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
+        assert_eq!(split_marked(&refs), phrases, "one character at a time");
+    }
+
+    #[test]
+    fn a_long_marked_reply_is_split_the_same_however_it_comes() {
+        let reply = "Пункт первый\nПервая фраза готова. ```x``` [sigh] Второе предложение тут.\n\
+<whisper>Третья фраза шёпотом. Четвёртая</whisper> тоже.\n\
+Код: `[sigh]` и [1] конец. [laughs] Всё.";
+        let phrases = vec![
+            "Пункт первый",
+            "Первая фраза готова.",
+            // Backticks inside a line open inline code, not a block.
+            "x [sigh] Второе предложение тут.",
+            "<whisper>Третья фраза шёпотом.</whisper>",
+            "<whisper>Четвёртая</whisper> тоже.",
+            "Код: (sigh) и (1) конец.",
+            "[laughs] Всё.",
+        ];
+        assert_eq!(split_marked(&[reply]), phrases);
+        for (at, _) in reply.char_indices() {
+            assert_eq!(
+                split_marked(&[&reply[..at], &reply[at..]]),
+                phrases,
+                "split at {at}"
+            );
+        }
+        let chars: Vec<String> = reply.chars().map(String::from).collect();
+        let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
+        assert_eq!(split_marked(&refs), phrases, "one character at a time");
+        // Said text is let go, also by the second piece of a sentence.
+        let pieces: Vec<&str> = reply.split_inclusive(' ').collect();
+        assert_eq!(split_marked(&pieces), phrases, "word by word");
+    }
+
+    #[test]
+    fn marks_without_words_wait_for_the_next_phrase_and_go_at_the_end() {
+        assert_eq!(
+            split_marked(&["Первая фраза готова.\n[sigh]\nВторая фраза тоже. [laughs]"]),
+            vec!["Первая фраза готова.", "[sigh]\nВторая фраза тоже."]
+        );
+        assert_eq!(
+            split_marked(&["Конец разговора на сегодня. [sigh]"]),
+            vec!["Конец разговора на сегодня."]
+        );
+        assert!(split_marked(&[" [sigh] <whisper></whisper>\n"]).is_empty());
+        // A new reply starts with no tag open.
+        let mut s = SentenceSplitter::marked();
+        s.push("<whisper>Открытый тег без конца");
+        assert_eq!(
+            s.finish().as_deref(),
+            Some("<whisper>Открытый тег без конца</whisper>")
+        );
+        assert_eq!(
+            s.push("Новый ответ готов, да. "),
+            ["Новый ответ готов, да."]
+        );
+    }
+
+    #[test]
+    fn marked_lengths_count_only_the_words() {
+        // Marks make no sentence long enough to stand alone...
+        assert_eq!(
+            split_marked(&["[barely holding back tears] Да. Нет, потом."]),
+            vec!["[barely holding back tears] Да. Нет, потом."]
+        );
+        // ...and no text long enough to be cut.
+        let reply = "[sigh] слово ".repeat(50);
+        assert!(reply.chars().count() > MAX_SENTENCE);
+        assert_eq!(split_marked(&[&reply]).len(), 1);
+        assert!(split(&[&reply]).len() > 1, "plain text is cut");
+    }
+
+    #[test]
+    fn brackets_and_code_of_the_text_never_turn_into_marks() {
+        let phrases =
+            split_marked(&["Смотри [1] и `a[i]`, потом <b>.\n```\n[sigh] тут\n```\nГотово."]);
+        assert_eq!(
+            phrases,
+            vec!["Смотри (1) и a(i), потом b.", "(sigh) тут", "Готово."]
+        );
+        for p in &phrases {
+            assert!(tokens(p).iter().all(|t| matches!(t, Token::Text(_))), "{p}");
+        }
+    }
+
+    #[test]
+    fn speech_with_marks_cleans_only_the_text_between_them() {
+        for (text, said) in [
+            (
+                "[sigh] **Ну** <whisper>иди https://ya.ru/x</whisper> 😀",
+                "[sigh] Ну <whisper>иди ссылка</whisper>",
+            ),
+            (
+                "Ну, <whisper>тихо</whisper>, да",
+                "Ну, <whisper>тихо</whisper>, да",
+            ),
+            (
+                "<whisper>Иди <SOFT>без меня",
+                "<whisper>Иди <soft>без меня</soft></whisper>",
+            ),
+            (
+                "Пока.</whisper> [  softly   now ] да",
+                "Пока. [softly now] да",
+            ),
+            ("<whisper></whisper> Да <soft> </soft>", "Да"),
+            (
+                "<whisper><soft>а</whisper>б</soft>",
+                "<whisper><soft>а</soft></whisper><soft>б</soft>",
+            ),
+            ("Смотри [1] и `[sigh]`, a < b", "Смотри (1) и (sigh), a b"),
+            ("Да [sigh][1]", "Да [sigh] (1)"),
+            // A direction ends with its line, so line breaks stay.
+            ("[angry] Нет!\nНо да.", "[angry] Нет!\nНо да."),
+            ("[sigh]  Ну \n\n  да  ", "[sigh] Ну\nда"),
+            ("[sigh]", ""),
+            ("<whisper>[sigh]</whisper> 🎉", ""),
+            ("", ""),
+        ] {
+            assert_eq!(clean_marked_for_speech(text), said, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_wrapped_voice_passes_the_marks_on() {
+        let inner = Arc::new(FakeVoice::default());
+        let voice = SpeakerSwitch::new(true).wrap(inner.clone());
+        voice.speak_marked("[sigh] Ну да.", "Ну да.");
+        assert_eq!(*inner.marked.lock(), [pair("[sigh] Ну да.", "Ну да.")]);
+        assert!(inner.said.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn marks_reach_only_the_voice_that_performs_them() {
+        let v = run(
+            vec![
+                marked_delta(
+                    "Иди без меня, я справлюсь. ",
+                    "[sigh] <whisper>Иди без меня, я справлюсь. ",
+                ),
+                marked_delta("Я догоню тебя потом.", "Я догоню тебя потом.</whisper>"),
+                marked_text(
+                    "Иди без меня, я справлюсь. Я догоню тебя потом.",
+                    "[sigh] <whisper>Иди без меня, я справлюсь. Я догоню тебя потом.</whisper> [laughs]",
+                ),
+            ],
+            true,
+        )
+        .await;
+        assert!(v.said.lock().is_empty(), "no marks for a plain voice");
+        let marked = v.marked.lock();
+        assert_eq!(
+            *marked,
+            [
+                pair(
+                    "[sigh] <whisper>Иди без меня, я справлюсь.</whisper>",
+                    "Иди без меня, я справлюсь."
+                ),
+                pair(
+                    "<whisper>Я догоню тебя потом.</whisper>",
+                    "Я догоню тебя потом."
+                ),
+            ]
+        );
+        // The Windows voice gets the words only.
+        assert!(marked
+            .iter()
+            .all(|(_, plain)| !plain.contains(['[', ']', '<', '>'])));
+    }
+
+    #[tokio::test]
+    async fn a_whole_marked_reply_is_said_by_phrases_without_a_lone_mark_at_the_end() {
+        let v = run(
+            vec![marked_text(
+                "Хорошо, договорились на завтра. До встречи утром!",
+                "[warmly] Хорошо, договорились на завтра. <soft>До встречи утром!</soft> [sigh]",
+            )],
+            true,
+        )
+        .await;
+        assert!(v.said.lock().is_empty());
+        assert_eq!(
+            *v.marked.lock(),
+            [
+                pair(
+                    "[warmly] Хорошо, договорились на завтра.",
+                    "Хорошо, договорились на завтра."
+                ),
+                // The direction lasts to the end of its line.
+                pair(
+                    "[warmly] <soft>До встречи утром!</soft>",
+                    "До встречи утром!"
+                ),
+            ]
+        );
+    }
+
+    /// Phrases of `reply`, the same however the stream is cut.
+    fn split_marked_anyhow(reply: &str) -> Vec<String> {
+        let phrases = split_marked(&[reply]);
+        for (at, _) in reply.char_indices() {
+            assert_eq!(
+                split_marked(&[&reply[..at], &reply[at..]]),
+                phrases,
+                "{reply}: split at {at}"
+            );
+        }
+        let chars: Vec<String> = reply.chars().map(String::from).collect();
+        let refs: Vec<&str> = chars.iter().map(String::as_str).collect();
+        assert_eq!(
+            split_marked(&refs),
+            phrases,
+            "{reply}: one character at a time"
+        );
+        phrases
+    }
+
+    #[test]
+    fn a_direction_lasts_to_the_end_of_its_line() {
+        for (reply, phrases) in [
+            (
+                "[sadly, barely holding back tears] Я не смогла найти файл. Попробую ещё раз позже, ладно?",
+                vec![
+                    "[sadly, barely holding back tears] Я не смогла найти файл.",
+                    "[sadly, barely holding back tears] Попробую ещё раз позже, ладно?",
+                ],
+            ),
+            // Not past the end of the line, whether the break ends a phrase
+            // or starts the next one.
+            (
+                "[sadly] Я не смогла найти файл. Попробую позже, ладно?\nА пока отдохни, я рядом.",
+                vec![
+                    "[sadly] Я не смогла найти файл.",
+                    "[sadly] Попробую позже, ладно?",
+                    "А пока отдохни, я рядом.",
+                ],
+            ),
+            (
+                "[sadly] Строка без точки в конце\nНовая строка тут.",
+                vec!["[sadly] Строка без точки в конце", "Новая строка тут."],
+            ),
+            // A new direction takes over.
+            (
+                "[sadly] Я не смогла найти файл. [cheerfully] Но нашла другой! И он даже лучше.",
+                vec![
+                    "[sadly] Я не смогла найти файл.",
+                    "[cheerfully] Но нашла другой!",
+                    "[cheerfully] И он даже лучше.",
+                ],
+            ),
+            // It comes before the tags opened again.
+            (
+                "[warmly] <soft>Хорошо, договорились на завтра. До встречи утром!</soft>",
+                vec![
+                    "[warmly] <soft>Хорошо, договорились на завтра.</soft>",
+                    "[warmly] <soft>До встречи утром!</soft>",
+                ],
+            ),
+            // A sound is said once, and so is an emotion tag.
+            (
+                "[sigh] Я не смогла найти файл. Попробую ещё раз позже.",
+                vec!["[sigh] Я не смогла найти файл.", "Попробую ещё раз позже."],
+            ),
+            (
+                "[long pause] Я не смогла найти файл. Попробую ещё раз позже.",
+                vec!["[long pause] Я не смогла найти файл.", "Попробую ещё раз позже."],
+            ),
+            (
+                "[joy] Я нашла этот файл, ура! Он лежал в загрузках.",
+                vec!["[joy] Я нашла этот файл, ура!", "Он лежал в загрузках."],
+            ),
+            (
+                "[sadly] Я не смогла найти файл. [sigh] Попробую позже. И ещё раз завтра.",
+                vec![
+                    "[sadly] Я не смогла найти файл.",
+                    "[sigh] Попробую позже.",
+                    "И ещё раз завтра.",
+                ],
+            ),
+        ] {
+            assert_eq!(split_marked_anyhow(reply), phrases, "{reply}");
+        }
+        // A new reply starts with no direction.
+        let mut s = SentenceSplitter::marked();
+        s.push("[sadly] Открытая строка без конца");
+        assert!(s.finish().is_some());
+        assert_eq!(
+            s.push("Новый ответ готов, да. "),
+            ["Новый ответ готов, да."]
+        );
+    }
+
+    #[test]
+    fn said_text_is_let_go_once_its_code_is_closed() {
+        let mut s = SentenceSplitter::marked();
+        s.push("Файл `a.txt` сохранён, всё хорошо. ");
+        for _ in 0..50 {
+            s.push("Ещё одна фраза про этот файл. ");
+        }
+        let held = s.marks.as_ref().map_or(0, |m| m.text.len());
+        assert!(held < 200, "{held} bytes held");
+        // Inside a code block, said lines are let go too: the block is
+        // opened again in their place.
+        let mut s = SentenceSplitter::marked();
+        let mut whole = String::from("Код:\n```\n");
+        s.push("Код:\n```\n");
+        for _ in 0..2000 {
+            s.push("let [x] = <y>;\n");
+            whole.push_str("let [x] = <y>;\n");
+        }
+        let held = s.marks.as_ref().map_or(0, |m| m.text.len());
+        assert!(held < 200, "{held} bytes held");
+        assert!(s
+            .marks
+            .as_ref()
+            .is_some_and(|m| m.text.starts_with("```\n")));
+        // After the block, marks are found again, as in the whole text.
+        let tail = "```\n[sigh] Готово, код выше работает.\n";
+        let mut out = s.push(tail);
+        out.extend(s.finish());
+        whole.push_str(tail);
+        assert_eq!(out.last(), split_marked(&[&whole]).last());
+        assert_eq!(
+            out.last().map(String::as_str),
+            Some("[sigh] Готово, код выше работает.")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_step_ends_the_marked_text_before_it() {
+        for (first, second, phrases) in [
+            (
+                "Минутку, сейчас я посмотрю",
+                "[cheerfully] Завтра будет солнечно и тепло.",
+                [
+                    pair("Минутку, сейчас я посмотрю", "Минутку, сейчас я посмотрю"),
+                    pair(
+                        "[cheerfully] Завтра будет солнечно и тепло.",
+                        "Завтра будет солнечно и тепло.",
+                    ),
+                ],
+            ),
+            (
+                "Сейчас запущу `npm",
+                "[sigh] Готово, всё работает как надо.",
+                [
+                    pair("Сейчас запущу npm", "Сейчас запущу npm"),
+                    pair(
+                        "[sigh] Готово, всё работает как надо.",
+                        "Готово, всё работает как надо.",
+                    ),
+                ],
+            ),
+        ] {
+            for switch in [SpeakerSwitch::new(true), brief_switch()] {
+                let v = run_with(
+                    vec![
+                        marked_delta(&strip_marks(first), first),
+                        // The agent nudged the model: a new step, no tool between.
+                        Event::StepStarted,
+                        marked_delta(&strip_marks(second), second),
+                        marked_text(&strip_marks(second), second),
+                    ],
+                    switch,
+                )
+                .await;
+                assert!(v.said.lock().is_empty());
+                assert_eq!(*v.marked.lock(), phrases);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_direction_after_the_last_words_reaches_the_voice_when_streamed() {
+        let spoken = "Всё готово, файл сохранён. Удачи! [laughs]";
+        let streamed = vec![
+            marked_delta("Всё готово, файл сохранён.", "Всё готово, файл сохранён."),
+            marked_delta(" Удачи!", " Удачи!"),
+            // What the agent sends for marks after the last words.
+            marked_delta("", " [laughs]"),
+            marked_text("Всё готово, файл сохранён. Удачи!", spoken),
+        ];
+        let whole = vec![marked_text("Всё готово, файл сохранён. Удачи!", spoken)];
+        for events in [streamed, whole] {
+            for switch in [SpeakerSwitch::new(true), brief_switch()] {
+                let v = run_with(events.clone(), switch).await;
+                let marked = v.marked.lock();
+                let (with, without) = marked.last().cloned().unwrap_or_default();
+                assert!(
+                    with.ends_with("Удачи! [laughs]") && without.ends_with("Удачи!"),
+                    "{marked:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_whole_reply_keeps_its_lines_for_the_directions() {
+        let spoken = "[angry] Нет, так нельзя делать!\nНо я помогу, конечно, давай вместе.";
+        let shown = "Нет, так нельзя делать!\nНо я помогу, конечно, давай вместе.";
+        let v = run_with(vec![marked_text(shown, spoken)], brief_switch()).await;
+        assert_eq!(
+            *v.marked.lock(),
+            [pair(
+                spoken,
+                "Нет, так нельзя делать! Но я помогу, конечно, давай вместе."
+            )]
+        );
+    }
+
+    /// Tells the words of the model from other text.
+    #[derive(Default)]
+    struct KindVoice {
+        said: Mutex<Vec<(&'static str, String)>>,
+    }
+
+    impl Voice for KindVoice {
+        fn speak(&self, text: &str) {
+            self.said.lock().push(("other", text.into()));
+        }
+        fn speak_reply(&self, text: &str) {
+            self.said.lock().push(("reply", text.into()));
+        }
+        fn stop(&self) {}
+        fn voices(&self) -> Vec<VoiceInfo> {
+            Vec::new()
+        }
+        fn configure(&self, _voice: &str, _rate: f32) {}
+    }
+
+    #[tokio::test]
+    async fn words_of_the_model_without_marks_go_to_the_voice_as_they_are() {
+        let long = "Это очень длинный ответ про погоду на неделю. ".repeat(10);
+        for (switch, reply) in [
+            (SpeakerSwitch::new(true), "Нажми [Сохранить] и всё."),
+            (brief_switch(), long.trim_end()),
+        ] {
+            let bus = EventBus::new(64);
+            let inner = Arc::new(KindVoice::default());
+            // The voice the app uses wraps the real one.
+            let voice = switch.wrap(inner.clone());
+            let job = tokio::spawn(run_speaker(bus.clone(), voice, switch));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            for e in [
+                delta(&format!("{reply} ")),
+                Event::AssistantText {
+                    text: reply.into(),
+                    spoken: None,
+                },
+                Event::ReminderFired {
+                    id: 1,
+                    text: "чайник".into(),
+                    kind: ReminderKind::Remind,
+                    late_s: 0,
+                },
+            ] {
+                bus.publish(e);
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            job.abort();
+            let said = inner.said.lock();
+            let replies: Vec<&str> = said
+                .iter()
+                .filter(|(kind, _)| *kind == "reply")
+                .map(|(_, t)| t.as_str())
+                .collect();
+            if reply.chars().count() <= LONG_REPLY {
+                assert_eq!(replies, [reply]);
+            } else {
+                // The retelling is words of the model too.
+                assert_eq!(replies.len(), 1, "{said:?}");
+                assert!(replies[0].starts_with("Коротко:"), "{said:?}");
+            }
+            assert!(
+                said.contains(&("other", "Напоминаю: чайник".into())),
+                "{said:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reply_without_marks_never_reaches_the_marked_voice() {
+        let v = run(
+            vec![
+                delta("Смотри [1] и <b>жирный</b> текст. "),
+                Event::AssistantText {
+                    text: "Смотри [1] и <b>жирный</b> текст.".into(),
+                    spoken: None,
+                },
+            ],
+            true,
+        )
+        .await;
+        assert!(v.marked.lock().is_empty());
+        assert_eq!(*v.said.lock(), ["Смотри [1] и bжирный/b текст."]);
+    }
+
+    #[tokio::test]
+    async fn an_answer_to_a_question_keeps_its_marks_and_the_question_has_none() {
+        let v = run(
+            vec![
+                confirm_requested(),
+                marked_text("Скажи «да» или «нет».", "[gently] Скажи «да» или «нет»."),
+            ],
+            true,
+        )
+        .await;
+        assert_eq!(*v.said.lock(), ["Нужно подтверждение. Написать Ане."]);
+        assert_eq!(
+            *v.marked.lock(),
+            [pair(
+                "[gently] Скажи «да» или «нет».",
+                "Скажи «да» или «нет»."
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn marks_do_not_make_a_reply_long() {
+        let words = "Сегодня тепло и солнечно, можно гулять. ".repeat(6);
+        let marks = "[cheerfully] Сегодня тепло и солнечно, можно гулять. ".repeat(6);
+        assert!(words.chars().count() <= LONG_REPLY);
+        assert!(marks.chars().count() > LONG_REPLY);
+        let phrase = pair(
+            "[cheerfully] Сегодня тепло и солнечно, можно гулять.",
+            "Сегодня тепло и солнечно, можно гулять.",
+        );
+
+        // Streamed: said phrase by phrase, not retold.
+        let v = run_with(
+            vec![
+                marked_delta(&words, &marks),
+                marked_text(words.trim_end(), marks.trim_end()),
+            ],
+            brief_switch(),
+        )
+        .await;
+        assert!(v.said.lock().is_empty());
+        assert_eq!(*v.marked.lock(), vec![phrase.clone(); 6]);
+
+        // Whole: said in one piece, not retold.
+        let v = run_with(
+            vec![marked_text(words.trim_end(), marks.trim_end())],
+            brief_switch(),
+        )
+        .await;
+        let said = v.marked.lock();
+        assert_eq!(said.len(), 1);
+        assert!(said[0].0.starts_with(&phrase.0), "{said:?}");
+    }
+
+    #[tokio::test]
+    async fn a_long_marked_reply_is_retold_with_its_marks() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let switch = SpeakerSwitch::new(true).with_summarizer(Arc::new(
+            move |reply: String, expressive: bool| {
+                seen.lock().push((reply, expressive));
+                Box::pin(async {
+                    Some("[softly] <whisper>Коротко</whisper> о главном. 😀".to_string())
+                })
+            },
+        ));
+        switch.set_brief(true);
+        let long = "Это очень длинный ответ про погоду на неделю. ".repeat(10);
+        let spoken = format!("[warmly] {long}");
+        let v = run_with(vec![marked_text(&long, &spoken)], switch).await;
+        assert_eq!(*asked.lock(), [(spoken, true)]);
+        assert!(v.said.lock().is_empty());
+        assert_eq!(
+            *v.marked.lock(),
+            [pair(
+                "[softly] <whisper>Коротко</whisper> о главном.",
+                "Коротко о главном."
+            )]
+        );
+    }
+
+    #[test]
+    fn without_a_retelling_the_first_marked_phrase_keeps_its_tags_closed() {
+        assert_eq!(
+            fallback_brief_marked("<whisper>Иди без меня, я догоню. Потом</whisper> расскажу всё."),
+            pair(
+                "<whisper>Иди без меня, я догоню.</whisper> Подробности в чате.",
+                "Иди без меня, я догоню. Подробности в чате."
+            )
+        );
+        assert_eq!(
+            fallback_brief_marked("[sigh]"),
+            pair("Ответ в чате.", "Ответ в чате.")
+        );
+        // A long first phrase is cut by its words, its tag still closed.
+        let (marked, plain) =
+            fallback_brief_marked(&format!("<soft>{}</soft>", "тишина ".repeat(80)));
+        assert!(marked.starts_with("<soft>тишина"), "{marked}");
+        assert!(marked.ends_with("</soft> Подробности в чате."), "{marked}");
+        assert_eq!(strip_marks(&marked), plain);
     }
 }

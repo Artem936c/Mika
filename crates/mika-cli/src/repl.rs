@@ -17,12 +17,12 @@ pub struct Renderer {
 impl Renderer {
     /// Text to print as is; it carries its own line breaks.
     pub fn render(&mut self, event: &Event) -> String {
-        if let Event::AssistantDelta { text } = event {
+        if let Event::AssistantDelta { text, .. } = event {
             let prefix = if self.in_reply { "" } else { "[mika] " };
             self.in_reply = true;
             return format!("{prefix}{text}");
         }
-        if let Event::AssistantText { text } = event {
+        if let Event::AssistantText { text, .. } = event {
             let out = if self.in_reply {
                 "\n".to_string()
             } else {
@@ -30,6 +30,10 @@ impl Renderer {
             };
             self.in_reply = false;
             return out;
+        }
+        // Only the speaker needs to know where a step of a reply begins.
+        if let Event::StepStarted = event {
+            return String::new();
         }
         let line = match event {
             Event::StateChanged { from, to } => {
@@ -98,7 +102,9 @@ impl Renderer {
             Event::EmotionCue { emotion } | Event::EmotionChanged { emotion } => {
                 format!("[emotion] {}", emotion.as_str())
             }
-            Event::AssistantDelta { .. } | Event::AssistantText { .. } => unreachable!(),
+            Event::AssistantDelta { .. } | Event::AssistantText { .. } | Event::StepStarted => {
+                unreachable!()
+            }
         };
         let lead = if self.in_reply { "\n" } else { "" };
         self.in_reply = false;
@@ -149,13 +155,16 @@ mod tests {
         let mut r = Renderer::default();
         let out: String = [
             Event::AssistantDelta {
-                text: "При".into()
+                text: "При".into(),
+                spoken: None,
             },
             Event::AssistantDelta {
-                text: "вет".into()
+                text: "вет".into(),
+                spoken: None,
             },
             Event::AssistantText {
                 text: "Привет".into(),
+                spoken: None,
             },
         ]
         .iter()
@@ -169,7 +178,8 @@ mod tests {
         let mut r = Renderer::default();
         assert_eq!(
             r.render(&Event::AssistantText {
-                text: "ок".into()
+                text: "ок".into(),
+                spoken: None,
             }),
             "[mika] ок\n"
         );
@@ -203,6 +213,7 @@ mod tests {
         let mut r = Renderer::default();
         r.render(&Event::AssistantDelta {
             text: "Смотрю".into(),
+            spoken: None,
         });
         assert_eq!(
             r.render(&Event::ToolFinished {

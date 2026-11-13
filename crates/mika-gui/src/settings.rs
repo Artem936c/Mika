@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mika_core::config::{
-    McpServerConfig, TtsEngine, EMBEDDING_SECRET_KEY, IMAGE_SECRET_KEY, SPEECH_SECRET_KEY,
-    TELEGRAM_SECRET_KEY,
+    expressive_model, McpServerConfig, TtsEngine, EMBEDDING_SECRET_KEY, IMAGE_SECRET_KEY,
+    SPEECH_SECRET_KEY, TELEGRAM_SECRET_KEY,
 };
+use mika_core::marks::{strip_marks, tokens, Token};
 use mika_core::memory::{Embedder, Fact};
 use mika_core::schedule::{Reminder, ReminderKind};
 use mika_core::secrets::Secret;
@@ -888,6 +889,10 @@ pub struct VoiceSettings {
     tts_style: String,
     tone_by_mood: bool,
     brief_long: bool,
+    /// The switch of expressive speech (decision 0026).
+    tts_expressive: bool,
+    /// The saved speech model performs voice marks, like Drama 3.
+    expressive_model: bool,
 }
 
 /// A long reply retold briefly aloud, or read out whole.
@@ -895,6 +900,14 @@ pub struct VoiceSettings {
 pub fn set_brief_speech(ctx: CtxState<'_>, value: bool) -> Result<(), String> {
     ctx.config.lock().voice.brief_long = value;
     ctx.speaker.set_brief(value);
+    ctx.save_config()
+}
+
+/// Replies marked up for a voice that performs the marks (decision 0026).
+/// The agent reads the setting at every step, so nothing else is told.
+#[tauri::command]
+pub fn set_expressive_speech(ctx: CtxState<'_>, value: bool) -> Result<(), String> {
+    ctx.config.lock().voice.tts_expressive = value;
     ctx.save_config()
 }
 
@@ -937,6 +950,7 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
             cfg.llm.effective_base_url(),
         )
     };
+    let marks_model = expressive_model(&c.tts_model);
     Ok(VoiceSettings {
         speak_replies: c.speak_replies,
         voice: c.voice,
@@ -971,6 +985,8 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
         tts_style: c.tts_style,
         tone_by_mood: c.tone_by_mood,
         brief_long: c.brief_long,
+        tts_expressive: c.tts_expressive,
+        expressive_model: marks_model,
     })
 }
 
@@ -1055,6 +1071,7 @@ pub fn set_wake(ctx: CtxState<'_>, enabled: bool, phrase: String) -> Result<Stri
 
 /// Models and address for speech through a provider.
 /// `api_key`: `None` keeps the stored key, an empty string deletes it.
+/// Answers whether the saved speech model performs voice marks (decision 0026).
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn save_speech_settings(
@@ -1067,9 +1084,9 @@ pub fn save_speech_settings(
     base_url: String,
     input_device: String,
     api_key: Option<String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     store_secret(&ctx, SPEECH_SECRET_KEY, api_key)?;
-    {
+    let marks_model = {
         let mut c = ctx.config.lock();
         c.voice.tts = tts;
         c.voice.tts_model = tts_model.trim().to_string();
@@ -1078,11 +1095,12 @@ pub fn save_speech_settings(
         c.voice.stt_language = stt_language.trim().chars().take(8).collect();
         c.voice.speech_base_url = base_url.trim().to_string();
         c.voice.input_device = input_device.trim().to_string();
-    }
+        expressive_model(&c.voice.tts_model)
+    };
     ctx.set_input_device(&input_device);
     ctx.save_config()?;
     ctx.apply_voice_engine();
-    Ok(())
+    Ok(marks_model)
 }
 
 /// Keep provider phrases on disk, or order every phrase anew.
@@ -1163,8 +1181,40 @@ pub fn set_voice(ctx: CtxState<'_>, voice: String, rate: f32) -> Result<(), Stri
 /// Says a phrase now, whatever the "speak replies" switch says.
 #[tauri::command]
 pub fn test_voice(ctx: CtxState<'_>, text: String) {
+    let expressive = ctx.config.lock().voice.expressive();
     ctx.voice.stop();
-    ctx.voice.speak(&text.chars().take(300).collect::<String>());
+    match test_phrase(&text, expressive) {
+        TestPhrase::Plain(text) => ctx.voice.speak_reply(&text),
+        TestPhrase::Marked { marked, plain } => ctx.voice.speak_marked(&marked, &plain),
+    }
+}
+
+/// What "Проверить голос" says.
+#[derive(Debug, PartialEq)]
+enum TestPhrase {
+    /// Said as before decision 0026: the voice gets it as it is.
+    Plain(String),
+    /// With voice marks for a voice that performs them, and the same words
+    /// without marks for any other (decision 0026).
+    Marked { marked: String, plain: String },
+}
+
+/// The first 300 characters of `text`. With expressive speech on, its marks
+/// go to the voice to be heard; a phrase with no words besides marks is said
+/// as before. With the option off its marks are cut, or the voice would read
+/// them aloud; a phrase without marks is said as before.
+fn test_phrase(text: &str, expressive: bool) -> TestPhrase {
+    let text: String = text.chars().take(300).collect();
+    if expressive {
+        let marked = mika_audio::speech::clean_marked_for_speech(&text);
+        let plain = mika_audio::speech::clean_for_speech(&strip_marks(&text));
+        if !marked.is_empty() && !plain.is_empty() {
+            return TestPhrase::Marked { marked, plain };
+        }
+        return TestPhrase::Plain(text);
+    }
+    let marks = tokens(&text).iter().any(|t| !matches!(t, Token::Text(_)));
+    TestPhrase::Plain(if marks { strip_marks(&text) } else { text })
 }
 
 // ---- first run ----
@@ -1306,5 +1356,72 @@ mod tests {
         ] {
             assert!(!is_own_picture(Path::new(bad), profile), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_test_phrase_keeps_its_marks_only_with_expressive_speech() {
+        let text = "[sighs, tired] Ну что ж. <whisper>Иди без меня.</whisper> Я догоню.";
+        assert_eq!(
+            test_phrase(text, true),
+            TestPhrase::Marked {
+                marked: text.into(),
+                plain: "Ну что ж. Иди без меня. Я догоню.".into(),
+            }
+        );
+        // With the option off the marks are cut, not read aloud.
+        assert_eq!(
+            test_phrase(text, false),
+            TestPhrase::Plain("Ну что ж. Иди без меня. Я догоню.".into())
+        );
+        let typed = "Привет! Это Мика. Так я звучу.";
+        assert_eq!(
+            test_phrase(typed, true),
+            TestPhrase::Marked {
+                marked: typed.into(),
+                plain: typed.into(),
+            }
+        );
+        // A phrase without marks is said exactly as before.
+        for phrase in [typed, "  Смотри [1] и a < b  "] {
+            assert_eq!(test_phrase(phrase, false), TestPhrase::Plain(phrase.into()));
+        }
+    }
+
+    #[test]
+    fn the_marked_test_phrase_of_the_window_is_performed() {
+        let phrase = "[cheerful] Привет! Это Мика. <whisper>Так я звучу.</whisper>";
+        assert_eq!(
+            test_phrase(phrase, true),
+            TestPhrase::Marked {
+                marked: phrase.into(),
+                plain: "Привет! Это Мика. Так я звучу.".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_test_phrase_of_marks_alone_is_said_as_before() {
+        for text in ["[sigh]", "<whisper></whisper>", "", "  "] {
+            assert_eq!(
+                test_phrase(text, true),
+                TestPhrase::Plain(text.into()),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_test_phrase_is_cut_to_300_characters() {
+        let long = "ё".repeat(400);
+        assert_eq!(
+            test_phrase(&long, false),
+            TestPhrase::Plain("ё".repeat(300))
+        );
+        let TestPhrase::Marked { marked, plain } = test_phrase(&format!("[sigh] {long}"), true)
+        else {
+            panic!("a phrase with words keeps its marks");
+        };
+        assert_eq!(marked, format!("[sigh] {}", "ё".repeat(293)));
+        assert_eq!(plain, "ё".repeat(293));
     }
 }

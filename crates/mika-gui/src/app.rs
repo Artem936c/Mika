@@ -29,6 +29,9 @@ pub const CONVERSATION: &str = "main";
 
 /// How a long reply is retold for the voice.
 const RETELL_PROMPT: &str = "Перескажи ответ помощника для озвучки голосом: одна-две короткие разговорные фразы, не больше 200 знаков, от первого лица, о себе в женском роде, по-русски. Главное — суть и итог. Без списков, ссылок, путей к файлам, кода и эмодзи. Ничего нового не добавляй. Ответь только пересказом.";
+/// How a long reply with voice marks is retold (decision 0026): the same
+/// rules, and the tone kept with the same marks.
+const RETELL_PROMPT_EXPRESSIVE: &str = "Перескажи ответ помощника для озвучки голосом: одна-две короткие разговорные фразы, не больше 200 знаков, от первого лица, о себе в женском роде, по-русски. Главное — суть и итог. Без списков, ссылок, путей к файлам, кода и эмодзи. Ничего нового не добавляй. Ответ размечен для голоса: ремарки в квадратных скобках, например [softly] или [sigh], и парные теги <whisper>…</whisper>, <emphasis>…</emphasis>, <soft>…</soft>, <fast>…</fast>, <slow>…</slow>, <stress>…</stress>, <forceful>…</forceful>. Сохрани тон ответа той же разметкой, умеренно: одна-две пометки на пересказ, в 200 знаков они не входят. Других тегов нет. Ремарки не пиши в круглых скобках: их голос читает вслух. Ответь только пересказом.";
 /// Longest reply sent for retelling, characters.
 const RETELL_INPUT: usize = 6000;
 
@@ -265,18 +268,27 @@ impl Ctx {
         }));
         agent.set_recall(Arc::new(memory.clone()));
         agent.set_task_board(task_board);
+        // Replies are marked up for the voice while the settings allow it:
+        // read at every step, so a change applies to the next one.
+        let marks = config.clone();
+        agent.set_marks_switch(Arc::new(move || marks.lock().voice.expressive()));
 
         let agent = Arc::new(agent);
         // A long reply is retold for the voice by the same model.
         let teller = Arc::downgrade(&agent);
-        let speaker = speaker.with_summarizer(Arc::new(move |reply: String| {
+        let speaker = speaker.with_summarizer(Arc::new(move |reply: String, expressive: bool| {
             let agent = teller.upgrade();
             Box::pin(async move {
                 let provider = agent?.provider();
                 let reply: String = reply.chars().take(RETELL_INPUT).collect();
+                let prompt = if expressive {
+                    RETELL_PROMPT_EXPRESSIVE
+                } else {
+                    RETELL_PROMPT
+                };
                 mika_core::llm::complete(
                     provider.as_ref(),
-                    RETELL_PROMPT,
+                    prompt,
                     &reply,
                     std::time::Duration::from_secs(12),
                 )
@@ -398,7 +410,7 @@ impl Ctx {
                 let Some(ctx) = echo.upgrade() else { break };
                 match event {
                     mika_core::Event::UserText { .. } => ctx.speaking.lock().clear(),
-                    mika_core::Event::AssistantDelta { text } => {
+                    mika_core::Event::AssistantDelta { text, .. } => {
                         let mut s = ctx.speaking.lock();
                         s.push_str(&text);
                         if s.chars().count() > 600 {
@@ -974,6 +986,23 @@ mod tests {
             voice_mood(Emotion::Joy, Duration::from_secs(1800)),
             Emotion::Joy
         );
+    }
+
+    #[test]
+    fn an_expressive_retelling_keeps_the_rules_and_names_the_tags() {
+        use super::{RETELL_PROMPT, RETELL_PROMPT_EXPRESSIVE};
+        let end = "Ответь только пересказом.";
+        let rules = RETELL_PROMPT.strip_suffix(end).unwrap();
+        assert!(RETELL_PROMPT_EXPRESSIVE.starts_with(rules));
+        assert!(RETELL_PROMPT_EXPRESSIVE.ends_with(end));
+        // The seven effects, not the language tags.
+        for tag in &mika_core::marks::EFFECT_TAGS[..7] {
+            assert!(
+                RETELL_PROMPT_EXPRESSIVE.contains(&format!("<{tag}>…</{tag}>")),
+                "{tag}"
+            );
+        }
+        assert!(!RETELL_PROMPT_EXPRESSIVE.contains("<french>"));
     }
 
     #[test]

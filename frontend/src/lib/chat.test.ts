@@ -138,6 +138,18 @@ describe('reduceChat', () => {
     ).toEqual([{ kind: 'assistant', text: 'Привет', pending: true }]);
   });
 
+  it('an empty delta never opens a reply of its own', () => {
+    const tool: ChatItem = { kind: 'tool', id: 'c1', name: 'x', text: 'x', pending: true };
+    expect(run([{ type: 'assistant_delta', text: '' }], [tool])).toEqual([tool]);
+    expect(
+      run([
+        { type: 'assistant_delta', text: 'Удачи!' },
+        { type: 'assistant_delta', text: '' },
+        { type: 'step_started' },
+      ]),
+    ).toEqual([{ kind: 'assistant', text: 'Удачи!', pending: true }]);
+  });
+
   it('assistant_text finalizes the streaming item', () => {
     expect(
       run([

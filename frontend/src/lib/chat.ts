@@ -161,7 +161,8 @@ export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
     }
     case 'assistant_delta': {
       const text = str(e.text);
-      if (text === null) return items;
+      // An empty piece carries only voice marks, for the speaker.
+      if (!text) return items;
       const last = items[items.length - 1];
       if (last && last.kind === 'assistant' && last.pending) {
         return [...items.slice(0, -1), { ...last, text: last.text + text }];

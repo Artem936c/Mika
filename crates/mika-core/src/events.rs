@@ -23,11 +23,23 @@ pub enum Event {
     /// Final text of one reply.
     AssistantText {
         text: String,
+        /// The same text with voice marks, for the speaker only (decision 0026).
+        /// Never serialized; `None` means speak `text`.
+        #[serde(skip)]
+        spoken: Option<String>,
     },
     /// Streamed piece of the current reply.
     AssistantDelta {
         text: String,
+        /// The same piece with voice marks, for the speaker only (decision 0026).
+        /// Never serialized; `None` means speak `text`.
+        #[serde(skip)]
+        spoken: Option<String>,
     },
+    /// Another request to the model for the same reply begins, while voice
+    /// marks are on: the marks of its text are found anew, so the speaker
+    /// ends the text before it (decision 0026).
+    StepStarted,
     ToolStarted {
         id: String,
         name: String,
@@ -188,6 +200,33 @@ mod tests {
             serde_json::to_value(&e).unwrap(),
             serde_json::json!({ "type": "state_changed", "from": "idle", "to": "awaiting_confirm" })
         );
+    }
+
+    #[test]
+    fn spoken_copy_with_marks_is_never_serialized() {
+        for e in [
+            Event::AssistantDelta {
+                text: "Привет".into(),
+                spoken: Some("[sigh] <whisper>Привет</whisper>".into()),
+            },
+            Event::AssistantText {
+                text: "Привет".into(),
+                spoken: Some("[sigh] <whisper>Привет</whisper>".into()),
+            },
+        ] {
+            let json = serde_json::to_string(&e).unwrap();
+            assert!(!json.contains("spoken"), "{json}");
+            assert!(
+                !json.contains("sigh") && !json.contains("whisper"),
+                "{json}"
+            );
+            match serde_json::from_str::<Event>(&json).unwrap() {
+                Event::AssistantDelta { text, spoken } | Event::AssistantText { text, spoken } => {
+                    assert_eq!((text.as_str(), spoken), ("Привет", None));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
     }
 
     #[test]

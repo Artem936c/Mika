@@ -16,7 +16,7 @@ use windows::Media::SpeechSynthesis::{SpeechSynthesizer, VoiceInformation};
 use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
-use crate::speech::{prosody_ssml, FirstSound, RemoteSynth, ToneSource, Voice, VoiceInfo};
+use crate::speech::{defuse, prosody_ssml, FirstSound, RemoteSynth, ToneSource, Voice, VoiceInfo};
 
 /// One sentence never plays longer than this, whatever the player reports.
 const MAX_SENTENCE_PLAY: Duration = Duration::from_secs(90);
@@ -455,8 +455,18 @@ impl Drop for FreeOnDrop<'_> {
     }
 }
 
-impl Voice for WindowsVoice {
-    fn speak(&self, text: &str) {
+/// Text that is not from the model, as the remote synthesizer gets it:
+/// notifications, reminders, errors and other text of others would otherwise
+/// become directions for Fish S2 and Drama 3, which swallow them (decision
+/// 0026). The Windows voice gets the text as it is.
+fn remote_plain(text: &str) -> String {
+    text.chars().filter_map(defuse).collect()
+}
+
+impl WindowsVoice {
+    /// Queues a sentence. A remote synthesizer, if any, is asked for
+    /// `remote`; the Windows voice says `local` when there is none or it fails.
+    fn queue(&self, remote: impl FnOnce() -> String, local: &str) {
         let gen = self.generation.load(Ordering::Relaxed);
         // The sound is asked for ahead of playback, but never more than
         // `LOOKAHEAD` sentences ahead: each request is paid.
@@ -464,7 +474,7 @@ impl Voice for WindowsVoice {
             let (tx, rx) = mpsc::channel();
             self.prefetch.submit(Job {
                 generation: gen,
-                text: text.to_string(),
+                text: remote(),
                 tx,
                 synth,
             });
@@ -472,13 +482,31 @@ impl Voice for WindowsVoice {
         });
         self.pending.fetch_add(1, Ordering::Relaxed);
         let _ = self.tx.lock().send(Cmd::Speak(Sentence {
-            text: text.to_string(),
+            text: local.to_string(),
             generation: gen,
             remote,
             asked: std::time::Instant::now(),
             first: self.fresh.swap(false, Ordering::Relaxed),
             tone: self.tone.lock().as_ref().map_or((0, 0), |t| t()),
         }));
+    }
+}
+
+impl Voice for WindowsVoice {
+    fn speak(&self, text: &str) {
+        self.queue(|| remote_plain(text), text);
+    }
+
+    /// Words of the model without voice marks reach the remote synthesizer
+    /// as they are, as before decision 0026.
+    fn speak_reply(&self, text: &str) {
+        self.queue(|| text.to_string(), text);
+    }
+
+    /// The remote synthesizer performs the marks; the Windows voice, also
+    /// when the remote one fails, says the words without them.
+    fn speak_marked(&self, marked: &str, plain: &str) {
+        self.queue(|| marked.to_string(), plain);
     }
 
     fn set_tone(&self, tone: Option<ToneSource>) {
@@ -571,6 +599,15 @@ mod tests {
         got.sort();
         assert_eq!(got, ["s0", "s1", "s2"]);
         assert_eq!(p.in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn text_of_others_reaches_a_remote_voice_without_marks() {
+        assert_eq!(
+            remote_plain("[Фото] от Ани: <whisper>привет</whisper> [sigh]"),
+            "(Фото) от Ани: whisperпривет/whisper (sigh)"
+        );
+        assert_eq!(remote_plain("Напоминаю: чайник."), "Напоминаю: чайник.");
     }
 
     fn v(name: &str, language: &str) -> VoiceInfo {

@@ -296,7 +296,7 @@ pub fn outgoing(event: &Event, origin: Origin) -> Option<(String, Vec<Button>)> 
             ..
         } => Some((format!("⏰ {text}"), Vec::new())),
         _ if origin != Origin::Telegram => None,
-        Event::AssistantText { text } if !text.trim().is_empty() => {
+        Event::AssistantText { text, .. } if !text.trim().is_empty() => {
             Some((text.clone(), Vec::new()))
         }
         Event::ConfirmRequested {
@@ -566,7 +566,8 @@ mod tests {
     #[test]
     fn replies_follow_the_origin_but_reminders_always_go() {
         let reply = Event::AssistantText {
-            text: "ок".into()
+            text: "ок".into(),
+            spoken: None,
         };
         assert_eq!(outgoing(&reply, Origin::Local), None);
         assert_eq!(outgoing(&reply, Origin::Telegram).unwrap().0, "ок");
@@ -577,7 +578,10 @@ mod tests {
             late_s: 0,
         };
         assert_eq!(outgoing(&reminder, Origin::Local).unwrap().0, "⏰ чайник");
-        let delta = Event::AssistantDelta { text: "о".into() };
+        let delta = Event::AssistantDelta {
+            text: "о".into(),
+            spoken: None,
+        };
         assert_eq!(outgoing(&delta, Origin::Telegram), None);
     }
 

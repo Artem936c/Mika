@@ -466,7 +466,10 @@ mod tests {
     #[test]
     fn joy_after_turn_with_ok_tools_only() {
         let t = Instant::now();
-        let reply = Event::AssistantText { text: "ok".into() };
+        let reply = Event::AssistantText {
+            text: "ok".into(),
+            spoken: None,
+        };
 
         let mut c = EmotionCore::new(t);
         c.on_event(&reply, t);
@@ -559,7 +562,10 @@ mod tests {
         tokio::spawn(driver.run());
 
         bus.publish(state(AssistantState::Thinking));
-        bus.publish(Event::AssistantDelta { text: "a".into() });
+        bus.publish(Event::AssistantDelta {
+            text: "a".into(),
+            spoken: None,
+        });
         let mut changes = Vec::new();
         while let Ok(Ok(e)) = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await {
             if let Event::EmotionChanged { emotion } = e {
