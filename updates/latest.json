@@ -1,6 +1,6 @@
 {
-  "sha256": "f398706b4cbb805e848e58a0921f12981fd4b7db75a3006abf0c606f236e0641",
-  "url": "https://github.com/Artem936c/Mika/releases/download/v0.3.3/Mika_0.3.3_x64-setup.exe",
-  "notes": "https://github.com/Artem936c/Mika/releases/tag/v0.3.3",
-  "version": "0.3.3"
+  "notes": "https://github.com/Artem936c/Mika/releases/tag/v0.4.0",
+  "version": "0.4.0",
+  "url": "https://github.com/Artem936c/Mika/releases/download/v0.4.0/Mika_0.4.0_x64-setup.exe",
+  "sha256": "420a13ed60b7e522547943091bacc31981e766c4f50ac9822f846075ddec0f35"
 }
