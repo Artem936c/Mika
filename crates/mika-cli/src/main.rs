@@ -1,6 +1,9 @@
 //! Terminal client for debugging the core without the GUI.
 //! Reads lines from stdin, answers through the configured LLM provider.
 //! Tool calls ask for confirmation in the same terminal: «да», «разреши всегда», «нет».
+//!
+//! The journal goes to stderr and is not written to the files of the app.
+//! Warnings and errors by default; `MIKA_LOG=error|warn|info|debug` changes that.
 
 mod repl;
 mod setup;
@@ -21,6 +24,7 @@ use std::time::Duration;
 use mika_core::agent::{system_prompt, Agent};
 use mika_core::config::Config;
 use mika_core::confirm::Confirmations;
+use mika_core::journal::Level;
 use mika_core::paths::{config_path, database_path};
 use mika_core::policy::{AuditLog, PolicyGate, RuleStore};
 use mika_core::secrets::KeyringSecretStore;
@@ -31,8 +35,37 @@ use mika_core::{AssistantState, Event, EventBus, StateHandle};
 use repl::{decode_line, Renderer};
 use tokio::sync::mpsc;
 
+/// The least severe level the terminal shows: what `MIKA_LOG` says, else
+/// warnings. The `level` of `[log]` is for the app, whose journal is a file;
+/// here every record lands between the lines of the conversation.
+fn log_level(asked: Option<&str>) -> Level {
+    asked
+        .and_then(|text| Level::parse(&text.trim().to_lowercase()))
+        .unwrap_or(Level::Warn)
+}
+
+/// The journal of this program: stderr and memory, no files. The files in the
+/// logs folder belong to the app, and two programs cannot write and rotate
+/// them together. Texts and arguments follow the `[log]` section of
+/// `config.toml`, like in the app.
+fn init_logging() {
+    let mut config = Config::load(&config_path())
+        .map(|c| c.log)
+        .unwrap_or_default();
+    config.level = log_level(std::env::var("MIKA_LOG").ok().as_deref());
+    let installed = mika_core::journal::install(mika_core::journal::Options {
+        dir: None,
+        stderr: true,
+        config,
+        ..Default::default()
+    });
+    if let Err(e) = installed {
+        eprintln!("[error] {e}");
+    }
+}
+
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    init_logging();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(result) = setup::run(&args) {
         match result {
@@ -178,6 +211,15 @@ async fn run() {
     for tool in mcp_tools {
         registry.register(tool);
     }
+    // Names of what is on, not what the settings hold.
+    log::info!(
+        target: "app",
+        "mika-cli {} started: provider={} tools={} switches_on={}",
+        env!("CARGO_PKG_VERSION"),
+        config.llm.kind.as_str(),
+        registry.len(),
+        config.switches_on().join(",")
+    );
     let agent = Agent::new(
         provider,
         Arc::new(registry),
@@ -214,6 +256,8 @@ async fn run() {
         move |text| {
             if mika_core::costs::unattended_allowed() {
                 tasks.submit_task(&text);
+            } else {
+                log::info!(target: "jobs", "scheduled task not started: the budget is reached");
             }
         },
     ));
@@ -298,8 +342,20 @@ async fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{budget_line, pause_line};
+    use super::{budget_line, log_level, pause_line};
     use mika_core::costs::{BudgetAlert, BudgetPause, BudgetPeriod};
+    use mika_core::journal::Level;
+
+    #[test]
+    fn the_terminal_shows_warnings_unless_told_otherwise() {
+        assert_eq!(log_level(None), Level::Warn);
+        assert_eq!(log_level(Some("debug")), Level::Debug);
+        assert_eq!(log_level(Some("error")), Level::Error);
+        assert_eq!(log_level(Some(" Info ")), Level::Info);
+        // Something else is not a level: warnings, as without it.
+        assert_eq!(log_level(Some("everything")), Level::Warn);
+        assert_eq!(log_level(Some("")), Level::Warn);
+    }
 
     #[test]
     fn a_budget_pause_is_one_line_with_the_money() {

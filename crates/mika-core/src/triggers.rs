@@ -506,7 +506,7 @@ impl TriggerStore {
                 })
             })
             .unwrap_or_else(|e| {
-                log::error!("cannot prepare the scenario table: {e}");
+                log::error!("cannot prepare the scenario table, scenarios do not work: {e}");
                 0
             });
         Self {
@@ -536,9 +536,13 @@ impl TriggerStore {
                     r.get::<_, i64>(0)
                 })
             })
-            .unwrap_or(0);
+            .unwrap_or_else(|e| {
+                log::warn!("cannot read the scenario table after it was replaced: {e}");
+                0
+            });
         self.last_id.fetch_max(top, Ordering::Relaxed);
         self.bump();
+        log::info!("scenarios are read again: the table was replaced");
     }
 
     /// Saves a scenario.
@@ -623,6 +627,14 @@ impl TriggerStore {
         let (saved, changed) = saved.ok_or(TriggerError::TooMany)?;
         if changed {
             self.bump();
+            // The name, the filter and the action text are the user's.
+            log::info!(
+                "scenario saved: id={} event={} action={kind} cooldown_s={} max_per_day={}",
+                saved.id,
+                saved.event.as_str(),
+                saved.cooldown_s,
+                saved.max_per_day
+            );
         }
         Ok(saved)
     }
@@ -676,6 +688,7 @@ impl TriggerStore {
         })? > 0;
         if changed {
             self.bump();
+            log::info!("scenario switched: id={id} enabled={enabled}");
         }
         Ok(changed)
     }
@@ -688,6 +701,7 @@ impl TriggerStore {
             > 0;
         if gone {
             self.bump();
+            log::info!("scenario deleted: id={id}");
         }
         Ok(gone)
     }

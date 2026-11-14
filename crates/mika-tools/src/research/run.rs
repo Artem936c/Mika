@@ -261,9 +261,25 @@ impl<'a> Run<'a> {
                         results.push(found);
                     }
                 }
-                Ok(Err(e)) => last_error = Some(e.reason()),
+                Ok(Err(e)) => {
+                    // Why the search engine gave nothing: a status, a
+                    // refusal of the client, no connection. Never the query.
+                    let reason = e.reason();
+                    log::warn!(
+                        target: "web",
+                        "deep search: a search request failed: number={} reason={}",
+                        i + 1,
+                        mika_core::journal::error_text(&reason)
+                    );
+                    last_error = Some(reason);
+                }
                 Err(_) => {
                     self.hit(LimitHit::Time);
+                    log::warn!(
+                        target: "web",
+                        "deep search: a search request failed: number={} reason=out of time",
+                        i + 1
+                    );
                     last_error = Some("кончилось время".into());
                     break;
                 }
@@ -462,12 +478,21 @@ impl<'a> Run<'a> {
         let input = tokens(chars(WRITE_SYSTEM) + chars(&user));
         let cost = input.saturating_add(output_hold(WRITE_CHARS));
         let left = self.pace.clock.left();
+        // Why the report holds the bare facts in place of the model's text.
+        let bare = |reason: &str| {
+            log::warn!(
+                "deep search: the report is written without the model: reason={reason} sources={}",
+                sources.len()
+            );
+        };
         if left < self.pace.write_margin {
             self.hit(LimitHit::Time);
+            bare("no_time_left");
             return fallback_body(sources, "кончилось время");
         }
         if !self.budget.fits(cost) {
             self.hit(LimitHit::Tokens);
+            bare("no_tokens_left");
             return fallback_body(sources, "кончился лимит токенов");
         }
         self.llm_calls += 1;
@@ -479,16 +504,21 @@ impl<'a> Run<'a> {
             Ok(Ok(raw)) => {
                 self.budget
                     .spend(input.saturating_add(tokens(raw.streamed)));
-                clean_body(&raw.text, sources.len())
-                    .unwrap_or_else(|| fallback_body(sources, "ответ модели не разобрался"))
+                clean_body(&raw.text, sources.len()).unwrap_or_else(|| {
+                    bare("answer_not_usable");
+                    fallback_body(sources, "ответ модели не разобрался")
+                })
             }
             Ok(Err(e)) => {
                 self.budget.spend(input.saturating_add(tokens(e.streamed)));
+                // Why it failed is in the record of the request itself.
+                bare("model_failed");
                 fallback_body(sources, MODEL_SILENT)
             }
             Err(_) => {
                 // How much the model wrote before the cut is not known.
                 self.budget.spend(cost);
+                bare("model_timed_out");
                 if left <= WRITE_TIMEOUT {
                     // The run itself ended, not only this request.
                     self.hit(LimitHit::Time);
@@ -552,7 +582,85 @@ pub async fn run(
         hits: Vec::new(),
         llm_calls: 0,
     };
-    run.go(folder, progress, cancel).await
+    // The question is the user's: the record has its size and the limits.
+    log::info!(
+        "deep search started: question_chars={} max_searches={} max_pages={} max_minutes={} max_tokens={}",
+        chars(question),
+        limits.searches,
+        limits.pages,
+        limits.minutes,
+        limits.tokens
+    );
+    let began = std::time::Instant::now();
+    // «Стоп» drops this future in the middle: the search still gets its last record.
+    let mut left = Unfinished { began, done: false };
+    let outcome = run.go(folder, progress, cancel).await;
+    left.done = true;
+    let (level, line) = finish_line(&outcome, began.elapsed().as_millis());
+    log::log!(level, "{line}");
+    outcome
+}
+
+/// Writes the last record of a search that was dropped before its end.
+struct Unfinished {
+    began: std::time::Instant,
+    done: bool,
+}
+
+impl Drop for Unfinished {
+    fn drop(&mut self) {
+        if !self.done {
+            log::info!(
+                "deep search finished: outcome=stopped ms={}",
+                self.began.elapsed().as_millis()
+            );
+        }
+    }
+}
+
+/// The last record of a deep search: its counters, or why it gave nothing.
+fn finish_line(outcome: &Result<Outcome, ToolError>, ms: u128) -> (log::Level, String) {
+    match outcome {
+        Ok(o) => {
+            let limits: Vec<&str> = o.stats.limits_hit.iter().map(|l| l.as_str()).collect();
+            let line = format!(
+                "deep search finished: outcome=ok ms={ms} searches={} pages={} sources={} unread={} unsourced={} llm_calls={} tokens={} refused={} limits_hit={} report_saved={}",
+                o.stats.searches,
+                o.stats.pages,
+                o.sources,
+                o.unread,
+                o.unsourced,
+                o.stats.llm_calls,
+                o.stats.tokens,
+                o.stats.refused,
+                if limits.is_empty() {
+                    "none".to_string()
+                } else {
+                    limits.join(",")
+                },
+                o.saved.is_ok()
+            );
+            match &o.saved {
+                Ok(_) => (log::Level::Info, line),
+                // The work is done and the file is not there: the user will ask why.
+                Err(why) => (
+                    log::Level::Error,
+                    format!("{line} error={}", mika_core::journal::error_text(why)),
+                ),
+            }
+        }
+        Err(ToolError::Cancelled) => (
+            log::Level::Info,
+            format!("deep search finished: outcome=stopped ms={ms}"),
+        ),
+        Err(e) => (
+            log::Level::Warn,
+            format!(
+                "deep search finished: outcome=error ms={ms} error={}",
+                mika_core::journal::guarded_error(e)
+            ),
+        ),
+    }
 }
 
 impl<'a> Run<'a> {
@@ -659,6 +767,58 @@ mod tests {
         fn path(&self) -> PathBuf {
             self.saved.clone().expect("the report was written")
         }
+    }
+
+    #[test]
+    fn the_last_record_of_a_search_has_counters_and_no_question() {
+        let outcome = |saved: Result<PathBuf, String>| Outcome {
+            saved,
+            brief: "тайный вывод".into(),
+            sources: 6,
+            unread: 3,
+            unsourced: 1,
+            stats: Stats {
+                queries: vec!["тайный запрос".into()],
+                searches: 4,
+                pages: 9,
+                llm_calls: 11,
+                tokens: 42_000,
+                seconds: 90,
+                limits_hit: vec![LimitHit::Time],
+                refused: 2,
+            },
+        };
+        let (level, line) = finish_line(
+            &Ok(outcome(Ok(PathBuf::from("C:/secret/report.md")))),
+            90_000,
+        );
+        assert_eq!(level, log::Level::Info);
+        assert_eq!(
+            line,
+            "deep search finished: outcome=ok ms=90000 searches=4 pages=9 sources=6 unread=3 unsourced=1 llm_calls=11 tokens=42000 refused=2 limits_hit=time report_saved=true"
+        );
+        // The work is paid for and the file is not there: an error of its own.
+        let (level, line) = finish_line(&Ok(outcome(Err("нет места на диске".into()))), 1);
+        assert_eq!(level, log::Level::Error);
+        assert!(line.contains("report_saved=false"), "{line}");
+        assert!(line.ends_with("error=нет места на диске"), "{line}");
+        assert!(!line.contains("тайный"), "{line}");
+        assert_eq!(
+            finish_line(&Err(ToolError::Cancelled), 5),
+            (
+                log::Level::Info,
+                "deep search finished: outcome=stopped ms=5".to_string()
+            )
+        );
+        // The words of a failed search are a tool's error: written only
+        // while texts are, and texts are off in tests. What failed is in
+        // the records of the requests before this one.
+        let (level, line) = finish_line(&Err(failed("поиск ничего не нашёл")), 5);
+        assert_eq!(level, log::Level::Warn);
+        assert_eq!(
+            line,
+            "deep search finished: outcome=error ms=5 error=<hidden 21 chars>"
+        );
     }
     use crate::testing::{env_with, Fake, Fakes};
     use crate::util::url_encode;

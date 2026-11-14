@@ -229,7 +229,10 @@ pub fn safe_file_path(path: &str) -> bool {
 /// One line to the owner.
 pub(crate) async fn tell(api: &dyn TelegramApi, owner: i64, text: &str) {
     if let Err(e) = api.send(owner, text, &[]).await {
-        log::warn!("telegram send failed: {e}");
+        log::warn!(
+            "send failed: what=line chars={} error={e}",
+            text.chars().count()
+        );
     }
 }
 
@@ -291,28 +294,51 @@ pub(crate) fn refusal(
     message: &Incoming,
     now: i64,
 ) -> Option<String> {
+    let refused = refused(session, voice, message, now);
+    match &refused {
+        Some((reason, _)) => log::info!(
+            "incoming: kind=voice seconds={} bytes={} taken=false reason={reason}",
+            message.duration_s,
+            message.bytes
+        ),
+        None => log::info!(
+            "incoming: kind=voice seconds={} bytes={} taken=true",
+            message.duration_s,
+            message.bytes
+        ),
+    }
+    refused.map(|(_, line)| line)
+}
+
+/// `refusal` with the reason as the journal names it.
+fn refused(
+    session: &Session,
+    voice: Option<&VoiceBridge>,
+    message: &Incoming,
+    now: i64,
+) -> Option<(&'static str, String)> {
     if !voice.is_some_and(|v| v.service.accepts()) {
-        return Some(VOICE_OFF_REPLY.into());
+        return Some(("voice_off", VOICE_OFF_REPLY.into()));
     }
     if message.forwarded {
-        return Some(VOICE_FORWARDED_REPLY.into());
+        return Some(("forwarded", VOICE_FORWARDED_REPLY.into()));
     }
     // One that waited at Telegram while the app was off. A message without
     // a time is taken for old.
     if now.saturating_sub(message.sent) > VOICE_FRESH_S {
-        return Some(VOICE_OLD_REPLY.into());
+        return Some(("old", VOICE_OLD_REPLY.into()));
     }
     if session.confirms.pending().is_some() {
-        return Some(asked_reply(session));
+        return Some(("question_open", asked_reply(session)));
     }
     if message.duration_s == 0 {
-        return Some(VOICE_SHORT_REPLY.into());
+        return Some(("too_short", VOICE_SHORT_REPLY.into()));
     }
     if message.duration_s > VOICE_MAX_S
         || message.bytes > VOICE_MAX_BYTES
         || message.bytes > honest_bytes(message.duration_s)
     {
-        return Some(VOICE_LONG_REPLY.into());
+        return Some(("too_long", VOICE_LONG_REPLY.into()));
     }
     None
 }
@@ -351,16 +377,26 @@ pub(crate) async fn hear_and_run(
     // What came while this one waited for its turn settles it before
     // anything is downloaded or paid for.
     if stop.is_cancelled() {
+        log::info!("voice message dropped: a stop came while it waited");
         return tell(api, owner, VOICE_STOPPED_REPLY).await;
     }
     if session.confirms.pending().is_some() {
+        log::info!("voice message dropped: a question opened while it waited");
         return tell(api, owner, &asked_reply(session)).await;
     }
     let ogg = match api.download(&message.file_id, VOICE_MAX_BYTES).await {
         Ok(ogg) => ogg,
-        Err(why) => return tell(api, owner, &format!("{VOICE_DOWNLOAD_FAILED}{why}")).await,
+        Err(why) => {
+            log::warn!("voice message not downloaded: error={why}");
+            return tell(api, owner, &format!("{VOICE_DOWNLOAD_FAILED}{why}")).await;
+        }
     };
     if too_long(&ogg, message.duration_s) {
+        log::warn!(
+            "voice message refused after the download: longer than it said: named_s={} bytes={}",
+            message.duration_s,
+            ogg.len()
+        );
         return tell(api, owner, VOICE_LONG_REPLY).await;
     }
     let asked = Instant::now();
@@ -368,13 +404,25 @@ pub(crate) async fn hear_and_run(
     let ms = asked.elapsed().as_millis() as u64;
     let text = match heard {
         Ok(text) => text.trim().to_string(),
-        Err(why) => return tell(api, owner, &format!("{VOICE_HEAR_FAILED}{why}")).await,
+        Err(why) => {
+            log::warn!(
+                "voice message not recognised: ms={ms} bytes={} error={}",
+                ogg.len(),
+                mika_core::journal::error_text(&why)
+            );
+            return tell(api, owner, &format!("{VOICE_HEAR_FAILED}{why}")).await;
+        }
     };
     if text.is_empty() {
+        log::info!("voice message recognised: ms={ms} chars=0: nothing was heard");
         return tell(api, owner, VOICE_EMPTY_REPLY).await;
     }
     // The text itself stays out of the log.
-    log::info!("voice message recognised in {ms} ms");
+    log::info!(
+        "voice message recognised: ms={ms} seconds={} chars={}",
+        message.duration_s,
+        text.chars().count()
+    );
     // The owner sees what was heard, whatever happens to it next.
     tell(api, owner, &format!("{HEARD_MARK}{text}")).await;
     if stop.is_cancelled() {
@@ -423,23 +471,53 @@ pub(crate) fn reply(
 ) -> impl Future<Output = ()> + Send {
     let token = voice.turn.reply.lock().clone();
     async move {
+        let began = std::time::Instant::now();
+        // Why a reply by voice did not come: "she answered with text only"
+        // has its record.
+        let dropped = |reason: &str| {
+            log::info!("voice reply not made: reason={reason}");
+        };
         let said = tokio::select! {
-            _ = token.cancelled() => return,
-            _ = stop.cancelled() => return,
-            _ = closed.cancelled() => return,
+            _ = token.cancelled() => return dropped("dropped_by_new_message"),
+            _ = stop.cancelled() => return dropped("stopped"),
+            _ = closed.cancelled() => return dropped("bridge_closed"),
             said = voice.service.say(&text, spoken.as_deref()) => said,
         };
-        if token.is_cancelled() || stop.is_cancelled() || closed.is_cancelled() {
-            return;
+        if token.is_cancelled() {
+            return dropped("dropped_by_new_message");
+        }
+        if stop.is_cancelled() {
+            return dropped("stopped");
+        }
+        if closed.is_cancelled() {
+            return dropped("bridge_closed");
         }
         let failed = match said {
-            Ok(Some(sound)) => api.send_sound(owner, &sound).await.err(),
-            Ok(None) => None,
+            Ok(Some(sound)) => {
+                let bytes = sound.bytes.len();
+                let sent = api.send_sound(owner, &sound).await.err();
+                if sent.is_none() {
+                    log::info!(
+                        "voice reply sent: chars={} bytes={bytes} ms={}",
+                        text.chars().count(),
+                        began.elapsed().as_millis()
+                    );
+                }
+                sent
+            }
+            Ok(None) => {
+                dropped("nothing_to_say");
+                None
+            }
             Err(why) => Some(why),
         };
         if let Some(why) = failed {
             // The reason only: the text of the reply stays out of the log.
-            log::warn!("telegram voice reply failed: {why}");
+            log::warn!(
+                "voice reply failed: chars={} error={}",
+                text.chars().count(),
+                mika_core::journal::error_text(&why)
+            );
             tell(api.as_ref(), owner, &format!("{VOICE_REPLY_FAILED}{why}")).await;
         }
     }
@@ -505,7 +583,10 @@ impl TelegramVoice for LiveVoice {
                     return Err(format!("{why}. {VOICE_NEEDS_WAV}"))
                 }
                 Err(SttFailure::Refused(why)) => {
-                    log::warn!("recognition refused the sound of Telegram, trying WAV: {why}");
+                    log::warn!(
+                        "recognition refused the sound of Telegram, trying WAV: error={}",
+                        mika_core::journal::error_text(&why)
+                    );
                 }
             }
         }
@@ -546,8 +627,13 @@ impl TelegramVoice for LiveVoice {
                         kind: SoundKind::OggOpus,
                     }))
                 }
-                Ok(_) => log::warn!("the voice reply was converted into something else"),
-                Err(why) => log::warn!("the voice reply was not converted: {why}"),
+                Ok(_) => log::warn!(
+                    "the voice reply was converted into something else, it goes as a file"
+                ),
+                Err(why) => log::warn!(
+                    "the voice reply was not converted, it goes as a file: error={}",
+                    mika_core::journal::error_text(&why)
+                ),
             }
         }
         if kind == SoundKind::Unknown {

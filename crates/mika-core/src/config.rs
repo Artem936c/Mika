@@ -33,6 +33,161 @@ pub struct Config {
     pub screen_ask: ScreenAskConfig,
     pub docs: DocsConfig,
     pub research: ResearchConfig,
+    pub log: LogConfig,
+}
+
+/// The journal (decision 0036): what is written and how long it is kept.
+/// Applied at once, without a restart (`mika_core::journal::apply`).
+///
+/// The section is read leniently, see `LogConfig::deserialize`: it is the
+/// one a user is sent to edit by hand, and a slip in it must not cost the
+/// rest of the settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LogConfig {
+    /// The least severe level that is written: `error`, `warn`, `info`, `debug`.
+    pub level: crate::journal::Level,
+    /// Write texts of the user and the model and arguments of tools. Off:
+    /// only names, sizes, durations and errors are written.
+    pub content: bool,
+    /// Earlier files older than this many days are removed.
+    pub keep_days: u32,
+    /// How many earlier files are kept besides the current one.
+    pub keep_files: u32,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: crate::journal::Level::Info,
+            content: false,
+            keep_days: 14,
+            keep_files: 5,
+        }
+    }
+}
+
+pub const LOG_KEEP_DAYS: (u32, u32) = (1, 365);
+pub const LOG_KEEP_FILES: (u32, u32) = (1, 50);
+
+/// A value of `[log]` as it stands in the file, whatever its kind.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Loose {
+    Flag(bool),
+    Whole(i64),
+    Part(f64),
+    Text(String),
+    Other(serde::de::IgnoredAny),
+}
+
+impl Loose {
+    /// The value for a record about it: a few plain characters.
+    fn brief(&self) -> String {
+        let all = match self {
+            Loose::Flag(flag) => flag.to_string(),
+            Loose::Whole(number) => number.to_string(),
+            Loose::Part(number) => number.to_string(),
+            Loose::Text(written) => written.clone(),
+            Loose::Other(_) => "not a simple value".to_string(),
+        };
+        all.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '.' | '_'))
+            .take(24)
+            .collect()
+    }
+
+    fn level(&self) -> Option<crate::journal::Level> {
+        use crate::journal::Level;
+        let Loose::Text(written) = self else {
+            return None;
+        };
+        match written.trim().to_lowercase().as_str() {
+            "warning" => Some(Level::Warn),
+            "trace" => Some(Level::Debug),
+            name => Level::parse(name),
+        }
+    }
+
+    fn flag(&self) -> Option<bool> {
+        match self {
+            Loose::Flag(flag) => Some(*flag),
+            Loose::Text(written) => written.trim().to_lowercase().parse().ok(),
+            _ => None,
+        }
+    }
+
+    /// A count that is not below zero. One past `u32` is the largest: the
+    /// bounds of the field cut it down.
+    fn count(&self) -> Option<u32> {
+        let number = match self {
+            Loose::Whole(number) => *number,
+            Loose::Part(number) if number.is_finite() => number.round() as i64,
+            Loose::Text(written) => written.trim().parse().ok()?,
+            _ => return None,
+        };
+        (number >= 0).then(|| u32::try_from(number).unwrap_or(u32::MAX))
+    }
+}
+
+/// `[log]` is read value by value. A value that cannot be understood (a
+/// level in another letter case is understood) gives way to the default of
+/// its field, with a warning; the other sections of the file are not
+/// touched by it. Strict reading would fail the whole file, and the app
+/// would start with the defaults of everything.
+impl<'de> Deserialize<'de> for LogConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize, Default)]
+        #[serde(default)]
+        struct Raw {
+            level: Option<Loose>,
+            content: Option<Loose>,
+            keep_days: Option<Loose>,
+            keep_files: Option<Loose>,
+        }
+
+        fn read<T>(
+            field: &str,
+            given: Option<Loose>,
+            by: fn(&Loose) -> Option<T>,
+            default: T,
+        ) -> T {
+            let Some(given) = given else {
+                return default;
+            };
+            by(&given).unwrap_or_else(|| {
+                log::warn!(
+                    "settings: a value of [log] is not understood, the default is used: field={field} given={}",
+                    given.brief()
+                );
+                default
+            })
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let default = LogConfig::default();
+        Ok(LogConfig {
+            level: read("level", raw.level, Loose::level, default.level),
+            content: read("content", raw.content, Loose::flag, default.content),
+            keep_days: read("keep_days", raw.keep_days, Loose::count, default.keep_days),
+            keep_files: read(
+                "keep_files",
+                raw.keep_files,
+                Loose::count,
+                default.keep_files,
+            ),
+        })
+    }
+}
+
+impl LogConfig {
+    /// The same settings with the retention inside its bounds.
+    pub fn normalized(&self) -> LogConfig {
+        LogConfig {
+            keep_days: self.keep_days.clamp(LOG_KEEP_DAYS.0, LOG_KEEP_DAYS.1),
+            keep_files: self.keep_files.clamp(LOG_KEEP_FILES.0, LOG_KEEP_FILES.1),
+            ..self.clone()
+        }
+    }
 }
 
 /// Breaks and her small lines of her own.
@@ -764,6 +919,60 @@ impl Config {
         std::fs::rename(&tmp, path)?;
         Ok(())
     }
+
+    /// Names of the sections that differ from `before`, sorted. For the
+    /// journal: a record of a save names what changed and never a value.
+    pub fn changed_sections(&self, before: &Config) -> Vec<String> {
+        let sections = |config: &Config| match serde_json::to_value(config) {
+            Ok(serde_json::Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        let (now, before) = (sections(self), sections(before));
+        let mut changed: Vec<String> = now
+            .iter()
+            .filter(|(name, value)| before.get(*name) != Some(*value))
+            .map(|(name, _)| name.clone())
+            .collect();
+        changed.sort();
+        changed
+    }
+
+    /// Names of the switches that are on, for the first records of a run.
+    /// Names only: no address, model, phrase or other value of the settings.
+    pub fn switches_on(&self) -> Vec<&'static str> {
+        let switches = [
+            ("web", self.tools.web_enabled),
+            ("screen", self.privacy.screen_enabled),
+            ("microphone", self.privacy.microphone_enabled),
+            ("speak_replies", self.voice.speak_replies),
+            ("provider_voice", self.voice.provider_speaks()),
+            ("wake_phrase", self.voice.wake_enabled),
+            ("dictation", self.dictation.enabled),
+            ("screen_ask", self.screen_ask.enabled),
+            ("telegram", self.telegram.enabled),
+            ("telegram_voice", self.telegram.voice_in),
+            ("telegram_voice_reply", self.telegram.voice_replies()),
+            ("mcp", self.mcp.servers.iter().any(|s| s.enabled)),
+            ("scenarios", self.events.enabled),
+            ("notifications", self.notifications.enabled),
+            ("briefing", self.briefing.enabled),
+            ("evening_summary", self.briefing.evening_enabled),
+            ("calendar", self.calendar.enabled),
+            ("costs", self.costs.enabled),
+            ("app_time", self.tracking.app_time),
+            ("clipboard_history", self.tracking.clipboard),
+            ("documents", !self.docs.folders.is_empty()),
+            ("embeddings", !self.embedding.model.trim().is_empty()),
+            ("pictures", !self.image.model.trim().is_empty()),
+            ("update_check", self.updates.check_at_start),
+            ("journal_texts", self.log.content),
+        ];
+        switches
+            .into_iter()
+            .filter(|(_, on)| *on)
+            .map(|(name, _)| name)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -774,6 +983,38 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let p = d.path().join("config.toml");
         (d, p)
+    }
+
+    #[test]
+    fn a_save_is_told_by_the_names_of_its_sections() {
+        let before = Config::default();
+        assert!(before.changed_sections(&before).is_empty());
+        let mut now = before.clone();
+        now.privacy.microphone_enabled = true;
+        now.assistant.name = "Тайное имя".into();
+        now.log.keep_days = 3;
+        let changed = now.changed_sections(&before);
+        assert_eq!(changed, vec!["assistant", "log", "privacy"]);
+        // Names of sections, never what is in them.
+        assert!(!changed.join(" ").contains("Тайное"));
+    }
+
+    #[test]
+    fn the_switches_of_a_run_are_names_without_values() {
+        let mut c = Config::default();
+        let off = c.switches_on();
+        assert!(!off.contains(&"microphone") && !off.contains(&"screen"));
+        assert!(!off.contains(&"journal_texts"));
+        c.privacy.microphone_enabled = true;
+        c.tools.web_enabled = true;
+        c.docs.folders = vec!["C:\\Users\\secret\\Documents".into()];
+        c.embedding.model = "embed-model".into();
+        let on = c.switches_on();
+        for name in ["microphone", "web", "documents", "embeddings"] {
+            assert!(on.contains(&name), "{name}");
+        }
+        let text = on.join(",");
+        assert!(!text.contains("secret") && !text.contains("embed-model"));
     }
 
     #[test]
@@ -1325,6 +1566,131 @@ mod tests {
             ..Default::default()
         };
         assert!(!edge.limits().high());
+    }
+
+    #[test]
+    fn the_journal_starts_quiet_about_content_and_old_files_load_without_it() {
+        use crate::journal::Level;
+        let l = LogConfig::default();
+        assert_eq!(l.level, Level::Info);
+        assert!(!l.content);
+        assert_eq!((l.keep_days, l.keep_files), (14, 5));
+        assert_eq!(l.normalized(), l);
+
+        let (_d, p) = tmp();
+        std::fs::write(&p, "[voice]\nspeak_replies = false\n").unwrap();
+        assert_eq!(Config::load(&p).unwrap().log, LogConfig::default());
+        // A section with one key keeps the defaults of the others.
+        std::fs::write(&p, "[log]\nlevel = \"debug\"\n").unwrap();
+        let partial = Config::load(&p).unwrap().log;
+        assert_eq!(partial.level, Level::Debug);
+        assert_eq!((partial.keep_days, partial.keep_files), (14, 5));
+
+        let c = Config {
+            log: LogConfig {
+                level: Level::Warn,
+                content: true,
+                keep_days: 30,
+                keep_files: 3,
+            },
+            ..Default::default()
+        };
+        c.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[log]"), "{text}");
+        assert!(text.contains("level = \"warn\""), "{text}");
+        assert!(text.contains("content = true"), "{text}");
+        assert_eq!(Config::load(&p).unwrap(), c);
+    }
+
+    #[test]
+    fn a_slip_in_the_journal_section_does_not_cost_the_other_settings() {
+        use crate::journal::Level;
+        let (_d, p) = tmp();
+        let load = |log: &str| {
+            std::fs::write(
+                &p,
+                format!("[voice]\nspeak_replies = false\n\n[log]\n{log}\n\n[llm]\nmodel = \"zq-model\"\n"),
+            )
+            .unwrap();
+            let c = Config::load(&p).unwrap_or_else(|e| panic!("{log}: {e}"));
+            // The sections around it are read as they are.
+            assert!(!c.voice.speak_replies, "{log}");
+            assert_eq!(c.llm.model, "zq-model", "{log}");
+            c.log
+        };
+        // The level as every line of the file spells it, and near misses.
+        for (written, level) in [
+            ("INFO", Level::Info),
+            ("Warn", Level::Warn),
+            (" debug ", Level::Debug),
+            ("warning", Level::Warn),
+            ("trace", Level::Debug),
+            ("ERROR", Level::Error),
+        ] {
+            assert_eq!(
+                load(&format!("level = \"{written}\"")).level,
+                level,
+                "{written}"
+            );
+        }
+        // What cannot be understood gives way to the default of its field.
+        let default = LogConfig::default();
+        for bad in [
+            "level = \"loud\"",
+            "level = 3",
+            "level = [\"info\"]",
+            "keep_days = -1",
+            "keep_days = \"many\"",
+            "keep_files = true",
+            "content = \"maybe\"",
+            "content = 1",
+        ] {
+            assert_eq!(load(bad), default, "{bad}");
+        }
+        // The fields beside a bad one keep their values.
+        let mixed = load("level = \"loud\"\ncontent = true\nkeep_days = \"30\"\nkeep_files = 3.0");
+        assert_eq!(
+            mixed,
+            LogConfig {
+                content: true,
+                keep_days: 30,
+                keep_files: 3,
+                ..LogConfig::default()
+            }
+        );
+        // Too much is cut down by the bounds, not thrown away.
+        let huge = load("keep_days = 99999999999\nkeep_files = 1000").normalized();
+        assert_eq!((huge.keep_days, huge.keep_files), (365, 50));
+        assert!(load("content = \"TRUE\"").content);
+        // What the page sends is read the same way.
+        let sent: LogConfig =
+            serde_json::from_str(r#"{"level":"warn","content":true,"keep_days":7,"keep_files":5}"#)
+                .unwrap();
+        assert_eq!(
+            (sent.level, sent.content, sent.keep_days),
+            (Level::Warn, true, 7)
+        );
+    }
+
+    #[test]
+    fn the_retention_of_the_journal_stays_inside_its_bounds() {
+        let wild = LogConfig {
+            keep_days: 0,
+            keep_files: 0,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!((wild.keep_days, wild.keep_files), (1, 1));
+        let wild = LogConfig {
+            keep_days: 100_000,
+            keep_files: 100_000,
+            content: true,
+            ..Default::default()
+        }
+        .normalized();
+        assert_eq!((wild.keep_days, wild.keep_files), (365, 50));
+        assert!(wild.content);
     }
 
     #[test]

@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 
 use crate::factory::redact;
 use crate::sse::{SseEvent, SseParser};
+use crate::trace::RequestLog;
 
 pub fn client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -51,10 +52,18 @@ pub enum Step {
 /// silent or sends only events that give no chunk (reasoning, pings): the
 /// connection closes and the provider stops generating. A body that ends
 /// before `Step::Finished` is reported as a network error, because the answer
-/// was cut.
-pub fn sse_stream<H>(resp: reqwest::Response, key: Option<Secret>, mut handler: H) -> LlmStream
+/// was cut. `log` is the record of the request: it is written once, when the
+/// task ends, and says how the answer ended.
+pub(crate) fn sse_stream<H>(
+    resp: reqwest::Response,
+    key: Option<Secret>,
+    mut log: RequestLog,
+    mut handler: H,
+) -> LlmStream
 where
-    H: FnMut(SseEvent, &mut Vec<LlmChunk>) -> Result<Step, LlmError> + Send + 'static,
+    H: FnMut(SseEvent, &mut Vec<LlmChunk>, &mut RequestLog) -> Result<Step, LlmError>
+        + Send
+        + 'static,
 {
     let (tx, rx) = mpsc::channel::<Result<LlmChunk, LlmError>>(64);
     tokio::spawn(async move {
@@ -70,20 +79,20 @@ where
             let bytes = match next {
                 Some(Ok(b)) => b,
                 Some(Err(e)) => {
-                    let _ = tx.send(Err(network_error(e, key.as_ref()))).await;
+                    let error = network_error(e, key.as_ref());
+                    log.failed(&error);
+                    let _ = tx.send(Err(error)).await;
                     return;
                 }
                 None => {
-                    let _ = tx
-                        .send(Err(LlmError::Network(
-                            "соединение оборвалось посреди ответа".into(),
-                        )))
-                        .await;
+                    let error = LlmError::Network("соединение оборвалось посреди ответа".into());
+                    log.failed(&error);
+                    let _ = tx.send(Err(error)).await;
                     return;
                 }
             };
             for event in parser.push(&bytes) {
-                let step = handler(event, &mut out);
+                let step = handler(event, &mut out, &mut log);
                 for chunk in out.drain(..) {
                     if tx.send(Ok(chunk)).await.is_err() {
                         return;
@@ -91,8 +100,12 @@ where
                 }
                 match step {
                     Ok(Step::Continue) => {}
-                    Ok(Step::Finished) => return,
+                    Ok(Step::Finished) => {
+                        log.finished();
+                        return;
+                    }
                     Err(e) => {
+                        log.failed(&e);
                         let _ = tx.send(Err(e)).await;
                         return;
                     }

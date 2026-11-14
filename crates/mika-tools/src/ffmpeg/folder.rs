@@ -325,8 +325,15 @@ impl Walk<'_> {
             Err(e) if depth == 0 => {
                 return Err(bad(format!("папку не удалось прочитать: {e}")));
             }
-            // A nested folder that cannot be read is passed by.
-            Err(_) => return Ok(()),
+            // A nested folder that cannot be read is passed by. Its name is
+            // the user's: the record has the reason only.
+            Err(e) => {
+                log::warn!(
+                    target: "jobs",
+                    "a nested folder cannot be read, its files are passed by: depth={depth} error={e}"
+                );
+                return Ok(());
+            }
         };
         for entry in entries.flatten() {
             self.looked += 1;
@@ -674,10 +681,18 @@ async fn run_items(
         }
         ctx.handle
             .set_note(&format!("{} из {n}: {}", i + 1, item.shown));
+        let failed_before = failed.len();
         // The job may have waited for hours: only the file the card saw is
         // worked on, and uploaded.
         if !item.stamp.holds() {
             failed.push((item.shown, CHANGED_FILE.to_string()));
+            log::warn!(
+                target: "jobs",
+                "folder job: file failed: job={} file={}/{n} operation={} error=the file changed since it was listed",
+                ctx.handle.id(),
+                i + 1,
+                op.name()
+            );
             ctx.handle.set_share((((i + 1) * 100) / n) as u8);
             continue;
         }
@@ -720,12 +735,38 @@ async fn run_items(
             Err(ToolError::BadArguments(why)) => failed.push((item.shown, why)),
             Err(e) => failed.push((item.shown, e.to_string())),
         }
+        // A file that failed: its number, never its name. The reason is the
+        // tool's text, written only while texts are.
+        if let Some((_, why)) = failed.get(failed_before..).and_then(|new| new.first()) {
+            log::warn!(
+                target: "jobs",
+                "folder job: file failed: job={} file={}/{n} operation={} error={}",
+                ctx.handle.id(),
+                i + 1,
+                op.name(),
+                mika_core::journal::guarded_error(why)
+            );
+        }
         ctx.handle.set_share((((i + 1) * 100) / n) as u8);
         if done > 0 {
             ctx.handle
                 .set_partial(&outcome(done, n, &results, &failed), Some(card(&files)));
         }
     }
+    // The job ends as done when one file was made: the counts tell a whole
+    // success from a partial one.
+    log::log!(
+        target: "jobs",
+        if failed.is_empty() {
+            log::Level::Info
+        } else {
+            log::Level::Warn
+        },
+        "folder job finished: job={} operation={} files={n} done={done} failed={}",
+        ctx.handle.id(),
+        op.name(),
+        failed.len()
+    );
     if done == 0 {
         return Err(ToolError::Failed(format!(
             "ни один файл не обработан: {}",

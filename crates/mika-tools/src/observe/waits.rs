@@ -440,6 +440,14 @@ impl Waits {
             seen: None,
         };
         let view = item.view();
+        // What is watched (a file, a program, a phrase) is the user's: the
+        // record names the kind of the condition only.
+        log::info!(
+            "watch started: id={} kind={} timeout_min={}",
+            item.id,
+            item.condition.kind(),
+            (until - at) / 60
+        );
         inner.items.push(item);
         Ok(view)
     }
@@ -453,12 +461,20 @@ impl Waits {
         let mut inner = self.0.lock();
         let before = inner.items.len();
         inner.items.retain(|i| i.id != id);
-        inner.items.len() != before
+        let stopped = inner.items.len() != before;
+        if stopped {
+            log::info!("watch ended: id={id} outcome=stopped");
+        }
+        stopped
     }
 
     /// How many watches were stopped.
     pub fn stop_all(&self) -> usize {
-        std::mem::take(&mut self.0.lock().items).len()
+        let stopped = std::mem::take(&mut self.0.lock().items).len();
+        if stopped > 0 {
+            log::info!("watches ended: count={stopped} outcome=stopped");
+        }
+        stopped
     }
 
     pub fn is_empty(&self) -> bool {
@@ -480,6 +496,11 @@ impl Waits {
         let mut told = Vec::new();
         self.0.lock().items.retain(|item| match &item.condition {
             Condition::WindowText { process, .. } => {
+                log::info!(
+                    "watch ended: id={} kind={} outcome=window_reading_off",
+                    item.id,
+                    item.condition.kind()
+                );
                 told.push((
                     item.id,
                     format!("Чтение окон выключено, больше не слежу за окном программы {process}."),
@@ -520,16 +541,28 @@ impl Waits {
             if item.id > world.upto {
                 return true;
             }
-            let text = match item.check(world, at) {
-                Verdict::Done(text) if !item.say.is_empty() => format!("{text} {}", item.say),
-                Verdict::Done(text) | Verdict::Dropped(text) => text,
-                Verdict::Keep if item.overdue(world, at) => format!(
-                    "Не дождалась за {} мин: {}.",
-                    (item.until - item.since) / 60,
-                    item.condition.not_yet()
+            let (outcome, text) = match item.check(world, at) {
+                Verdict::Done(text) if !item.say.is_empty() => {
+                    ("happened", format!("{text} {}", item.say))
+                }
+                Verdict::Done(text) => ("happened", text),
+                Verdict::Dropped(text) => ("cannot_go_on", text),
+                Verdict::Keep if item.overdue(world, at) => (
+                    "timed_out",
+                    format!(
+                        "Не дождалась за {} мин: {}.",
+                        (item.until - item.since) / 60,
+                        item.condition.not_yet()
+                    ),
                 ),
                 Verdict::Keep => return true,
             };
+            log::info!(
+                "watch ended: id={} kind={} outcome={outcome} waited_s={}",
+                item.id,
+                item.condition.kind(),
+                at - item.since
+            );
             told.push((item.id, text));
             false
         });

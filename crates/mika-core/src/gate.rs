@@ -13,18 +13,25 @@ use crate::tools::RiskLevel;
 /// Proof that a gate approved one tool call. Not `Clone`, not `Default`.
 #[derive(Debug)]
 pub struct Approval {
-    _private: (),
+    /// How it was given, for the journal: `rule`, `asked_yes`, `asked_always`.
+    how: &'static str,
 }
 
 impl Approval {
-    pub(crate) fn new() -> Self {
-        Self { _private: () }
+    /// An approval that remembers how it was given.
+    pub(crate) fn given(how: &'static str) -> Self {
+        Self { how }
+    }
+
+    /// How the gate came to approve the call, for the journal.
+    pub fn how(&self) -> &'static str {
+        self.how
     }
 
     /// Lets tool crates unit-test `run` without a gate.
     #[cfg(any(test, feature = "testing"))]
     pub fn for_tests() -> Self {
-        Self::new()
+        Self::given("test")
     }
 }
 
@@ -48,7 +55,7 @@ pub struct LowRiskOnlyGate;
 impl Gate for LowRiskOnlyGate {
     async fn check(&self, _tool: &str, _args: &Value, assessment: &Assessment) -> GateDecision {
         if assessment.level == RiskLevel::Low {
-            GateDecision::Approved(Approval::new())
+            GateDecision::Approved(Approval::given("test"))
         } else {
             GateDecision::Denied("действие требует подтверждения".into())
         }

@@ -40,6 +40,10 @@ pub enum Event {
     /// marks are on: the marks of its text are found anew, so the speaker
     /// ends the text before it (decision 0026).
     StepStarted,
+    /// The model asked for the reply that begins now to be said whole,
+    /// however long: a joke, a poem, a story (decision 0037). Comes before
+    /// the first piece of that reply.
+    SayWhole,
     ToolStarted {
         id: String,
         name: String,

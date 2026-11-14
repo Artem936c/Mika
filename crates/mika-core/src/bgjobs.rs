@@ -351,6 +351,7 @@ impl JobBoard {
             }
             let waits = !spec.live && b.worker;
             if waits && b.queue.len() >= MAX_QUEUED {
+                log::warn!("job refused: the queue is full: kind={}", spec.kind);
                 return Err(JobError::QueueFull);
             }
             b.last_id += 1;
@@ -399,6 +400,22 @@ impl JobBoard {
             self.publish(&view);
             (view, ahead, start)
         };
+        // The title is the summary of the call and may name a file: the
+        // record carries the tool and the number only.
+        if start.is_some() {
+            log::info!(
+                "job started: id={} kind={} live={}",
+                view.id,
+                view.kind,
+                view.live
+            );
+        } else {
+            log::info!(
+                "job queued: id={} kind={} ahead={ahead}",
+                view.id,
+                view.kind
+            );
+        }
         if let Some(work) = start {
             let board = self.clone();
             let id = view.id;
@@ -425,6 +442,11 @@ impl JobBoard {
                     continue;
                 };
                 job.view.state = JobState::Running;
+                log::info!(
+                    "job started: id={id} kind={} live=false waited_ms={}",
+                    job.view.kind,
+                    job.taken.elapsed().as_millis()
+                );
                 job.taken = Instant::now();
                 self.publish(&job.view);
                 next = Some((id, work));
@@ -459,37 +481,58 @@ impl JobBoard {
             with_progress_handle(progress, async move { work(ctx).await }),
         );
         let mut fut = Box::pin(AssertUnwindSafe(scoped).catch_unwind());
+        let mut dropped = false;
         let outcome: Outcome = tokio::select! {
             r = &mut fut => r,
             _ = cancel.cancelled() => match tokio::time::timeout(grace, &mut fut).await {
                 Ok(r) => r,
                 // The work did not end in time: dropping it kills its
-                // programs and removes its half-written files.
-                Err(_) => Ok(Err(ToolError::Cancelled)),
+                // programs and removes its half-written files. For a
+                // recording this is "the file was not saved", so it is told
+                // apart from a stop that ended well.
+                Err(_) => {
+                    dropped = true;
+                    log::warn!(
+                        "job did not end within its grace after the stop, its work is dropped: id={id} grace_ms={}",
+                        grace.as_millis()
+                    );
+                    Ok(Err(ToolError::Cancelled))
+                }
             },
         };
         drop(fut);
         if let Some(rest) = CARD_LEAD.checked_sub(taken.elapsed()) {
             tokio::time::sleep(rest).await;
         }
-        self.finish(id, outcome);
+        self.finish(id, outcome, dropped);
     }
 
-    fn finish(&self, id: JobId, outcome: Outcome) {
+    /// `dropped`: the work was thrown away because it did not end in time
+    /// after the stop.
+    fn finish(&self, id: JobId, outcome: Outcome, dropped: bool) {
         let mut b = self.inner.board.lock();
         let Some(job) = b.jobs.get_mut(&id) else {
             return;
         };
         let (partial_text, partial_data) = job.partial.take().unwrap_or_default();
+        let ms = job.taken.elapsed().as_millis();
         let view = &mut job.view;
         match outcome {
             Ok(Ok(out)) => {
+                log::info!(
+                    "job finished: id={id} kind={} state=done ms={ms}",
+                    view.kind
+                );
                 view.state = JobState::Done;
                 view.share = 100;
                 view.text = out.text;
                 view.data = out.data;
             }
             Ok(Err(ToolError::Cancelled)) => {
+                log::info!(
+                    "job finished: id={id} kind={} state=stopped ms={ms} dropped={dropped}",
+                    view.kind
+                );
                 view.state = JobState::Stopped;
                 view.text = if partial_text.trim().is_empty() {
                     STOPPED_TEXT.to_string()
@@ -499,12 +542,27 @@ impl JobBoard {
                 view.data = partial_data;
             }
             Ok(Err(e)) => {
+                // The text of the error is the tool's: it may quote a path
+                // or a title, so it is written only while texts are.
+                let error_kind = match &e {
+                    ToolError::BadArguments(_) => "bad_arguments",
+                    ToolError::NotReady { .. } => "not_ready",
+                    _ => "failed",
+                };
+                log::error!(
+                    "job finished: id={id} kind={} state=failed ms={ms} error_kind={error_kind} error={}",
+                    view.kind,
+                    crate::journal::guarded_error(&e)
+                );
                 view.state = JobState::Failed;
                 view.text = join_text(&e.to_string(), &partial_text);
                 view.data = partial_data;
             }
             Err(_) => {
-                log::error!("background job {id} ({}) panicked", view.kind);
+                log::error!(
+                    "job finished: id={id} kind={} state=failed ms={ms} error=the work panicked",
+                    view.kind
+                );
                 view.state = JobState::Failed;
                 view.text = join_text("внутренняя ошибка задания", &partial_text);
                 view.data = partial_data;
@@ -556,6 +614,10 @@ impl JobBoard {
             let job = b.jobs.get_mut(&id).ok_or(JobError::NotFound(id))?;
             match job.view.state {
                 JobState::Queued => {
+                    log::info!(
+                        "job finished: id={id} kind={} state=stopped before it started",
+                        job.view.kind
+                    );
                     job.view.state = JobState::Stopped;
                     job.view.text = STOPPED_TEXT.to_string();
                     let work = job.work.take();
@@ -567,6 +629,7 @@ impl JobBoard {
                     (view, work)
                 }
                 JobState::Running => {
+                    log::info!("job asked to stop: id={id} kind={}", job.view.kind);
                     job.view.state = JobState::Stopping;
                     job.cancel.cancel();
                     self.publish(&job.view);
@@ -612,13 +675,26 @@ impl JobBoard {
         let mut ended = self.inner.ended.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
         self.inner.board.lock().closed = true;
-        for job in self.active() {
+        let active = self.active();
+        if !active.is_empty() {
+            log::info!(
+                "jobs are stopped, the app is closing: active={}",
+                active.len()
+            );
+        }
+        for job in active {
             let _ = self.stop(job.id);
         }
         while !self.active().is_empty() {
             match tokio::time::timeout_at(deadline, ended.changed()).await {
                 Ok(Ok(())) => {}
-                _ => break,
+                _ => {
+                    log::warn!(
+                        "jobs did not end in time, the app closes anyway: active={}",
+                        self.active().len()
+                    );
+                    break;
+                }
             }
         }
     }

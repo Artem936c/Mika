@@ -395,8 +395,20 @@ pub(crate) async fn pick_h264(
     if chosen.is_none() && list.has("libopenh264") {
         chosen = Some(H264::Openh264);
     }
-    let h = chosen
-        .ok_or_else(|| ToolError::Failed("в этой сборке FFmpeg нет кодировщика H.264".into()))?;
+    let Some(h) = chosen else {
+        log::warn!(target: "jobs", "h264 encoder not found: this FFmpeg has none that works");
+        return Err(ToolError::Failed(
+            "в этой сборке FFmpeg нет кодировщика H.264".into(),
+        ));
+    };
+    // Once per FFmpeg: the choice is kept. A video card encoder that failed
+    // its trial and gave way to a slow one explains "it is slow".
+    log::info!(
+        target: "jobs",
+        "h264 encoder picked: encoder={} ffmpeg={}",
+        h.name(),
+        paths.source.as_str()
+    );
     with_known(&key, |k| k.h264 = Some(h));
     Ok(h)
 }

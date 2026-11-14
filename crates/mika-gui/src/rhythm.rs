@@ -508,18 +508,23 @@ impl Ctx {
                             // empty calendar: the meetings already known stay.
                             match parsed {
                                 Ok(parsed) => {
-                                    log::info!("calendar read: {} events", parsed.len());
+                                    // Read every quarter of an hour: detail.
+                                    log::debug!("calendar read: events={}", parsed.len());
                                     state.set(parsed, Local::now().timestamp());
                                 }
                                 Err(e) => {
-                                    log::warn!("calendar not parsed: {e}");
+                                    log::warn!("calendar not understood, the meetings known before stay: {e}");
                                     state.fail(&tr("calendar.not_ics"));
                                 }
                             }
                         }
                         Ok(_) => state.fail(&tr("calendar.not_ics")),
                         Err(e) => {
-                            log::warn!("calendar not read: {e}");
+                            // The link is a secret and is never part of the text.
+                            log::warn!(
+                                "calendar not read, the meetings known before stay: {}",
+                                mika_core::journal::error_text(&e)
+                            );
                             state.fail(&e);
                         }
                     }
@@ -573,9 +578,12 @@ impl Ctx {
                 // the app does not look like an empty list that wipes the index.
                 let current = move || folder_paths(&config.lock().docs.folders, &profile);
                 let cancel = tokio_util::sync::CancellationToken::new();
-                match index.run_with(current, &cancel).await {
-                    Ok(report) => log::info!("documents: {report}"),
-                    Err(e) => log::warn!("documents not indexed: {e}"),
+                // A pass that went through writes its own record with the counts.
+                if let Err(e) = index.run_with(current, &cancel).await {
+                    log::warn!(
+                        "documents not indexed: {}",
+                        mika_core::journal::error_text(&e)
+                    );
                 }
             }
         });

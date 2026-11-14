@@ -444,6 +444,11 @@ impl Runner for ProcessRunner {
         tokio::select! {
             out = &mut work => Ok(out),
             _ = tokio::time::sleep(quit_wait) => {
+                log::warn!(
+                    target: "jobs",
+                    "a program did not end when asked and was killed, what it wrote may be cut: waited_ms={}",
+                    quit_wait.as_millis()
+                );
                 kill_tree(pid).await;
                 // Killed, its pipes close; a child of it may still hold them.
                 match tokio::time::timeout(KILLED_WAIT, &mut work).await {

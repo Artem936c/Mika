@@ -239,7 +239,7 @@ impl UiEnv {
                 return Ok(());
             }
         }
-        self.windows.focus(id).map_err(failed)?;
+        crate::sys::focus(&self.windows, id).await.map_err(failed)?;
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         let (x, y) = rect.center();
         self.input.click(x, y, btn, double).map_err(failed)
@@ -670,7 +670,7 @@ impl Tool for UiClickTool {
                 return Ok(ToolOutput::new(format!("{what}: элемент №{n}.\n{report}")));
             }
         }
-        env.windows.focus(id).map_err(failed)?;
+        crate::sys::focus(&env.windows, id).await.map_err(failed)?;
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
         env.input.click(x, y, btn, double).map_err(failed)?;
         let report = env.outcome(&w, &before).await;
@@ -745,7 +745,7 @@ impl Tool for UiTypeTool {
                 .map_err(|e| failed(e.to_string()))?
                 .map_err(failed)?;
             if !typed_by_pattern {
-                env.windows.focus(id).map_err(failed)?;
+                crate::sys::focus(&env.windows, id).await.map_err(failed)?;
                 let ui = env.ui.clone();
                 tokio::task::spawn_blocking(move || ui.focus(id, n))
                     .await
@@ -753,7 +753,7 @@ impl Tool for UiTypeTool {
                     .map_err(failed)?;
             }
         } else {
-            env.windows.focus(id).map_err(failed)?;
+            crate::sys::focus(&env.windows, id).await.map_err(failed)?;
         }
         if !typed_by_pattern {
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -765,7 +765,7 @@ impl Tool for UiTypeTool {
         }
         if enter {
             if typed_by_pattern {
-                env.windows.focus(id).map_err(failed)?;
+                crate::sys::focus(&env.windows, id).await.map_err(failed)?;
                 tokio::time::sleep(std::time::Duration::from_millis(120)).await;
             }
             env.input.chord(&[VK_RETURN]).map_err(failed)?;
@@ -943,7 +943,9 @@ impl Tool for UiKeysTool {
         let chords = parse_keys(arg_str(&args, "keys")?).map_err(ToolError::BadArguments)?;
         refuse_own_hotkeys(&chords)?;
         let before = self.0.foreign_windows();
-        self.0.windows.focus(w.id).map_err(failed)?;
+        crate::sys::focus(&self.0.windows, w.id)
+            .await
+            .map_err(failed)?;
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         for chord in &chords {
             self.0.keys_may_land()?;

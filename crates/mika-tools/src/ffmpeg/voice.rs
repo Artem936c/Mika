@@ -67,6 +67,7 @@ impl FfmpegSound {
         std::fs::write(&input, sound)
             .map_err(|e| format!("не удалось записать временный файл: {e}"))?;
         run_ffmpeg(
+            "voice",
             self.runner.as_ref(),
             &paths,
             &args(&input, demuxer, &out),

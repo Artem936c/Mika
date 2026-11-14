@@ -63,7 +63,10 @@ impl LlmProvider for UnconfiguredProvider {
 /// Like `build_provider`, but never fails.
 pub fn build_or_placeholder(cfg: &LlmConfig, secrets: &dyn SecretStore) -> Arc<dyn LlmProvider> {
     build_provider(cfg, secrets).unwrap_or_else(|e| {
-        log::warn!("LLM provider not ready: {e}");
+        log::warn!(
+            "the model provider is not ready, the chat will say what to fix: kind={:?} error={e}",
+            cfg.kind
+        );
         Arc::new(UnconfiguredProvider {
             reason: format!("{e}. Открой настройки и проверь провайдера"),
         })

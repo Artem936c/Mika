@@ -1,6 +1,7 @@
 //! Entry point for user text: answers an open question or starts a reply.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -37,6 +38,61 @@ pub enum Origin {
     Telegram,
     /// Said into the microphone.
     Voice,
+}
+
+/// What started a turn, as the journal names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// Typed in the window, or sent by an action of the user at this computer.
+    Window,
+    Telegram,
+    Voice,
+    /// A scenario by event.
+    Scenario,
+    /// A scheduled task, a reminder with a task, a summary of the day.
+    Task,
+}
+
+impl Source {
+    fn of(origin: Origin) -> Self {
+        match origin {
+            Origin::Local => Source::Window,
+            Origin::Telegram => Source::Telegram,
+            Origin::Voice => Source::Voice,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Source::Window => "window",
+            Source::Telegram => "telegram",
+            Source::Voice => "voice",
+            Source::Scenario => "scenario",
+            Source::Task => "task",
+        }
+    }
+}
+
+/// The first record of a turn. The text is the user's: its size is always
+/// written, its beginning only while texts are allowed, and never when it
+/// reads like the blind zone.
+fn started_line(
+    number: u64,
+    source: &str,
+    text: &str,
+    expanded: bool,
+    waited_ms: u128,
+    content: bool,
+) -> String {
+    let mut line = format!(
+        "turn started: turn={number} source={source} chars={} expanded={expanded} waited_ms={waited_ms}",
+        text.chars().count()
+    );
+    if content {
+        line.push_str(" text=");
+        line.push_str(&crate::journal::guarded_if(true, text));
+    }
+    line
 }
 
 pub struct Session {
@@ -109,19 +165,31 @@ impl Session {
     async fn turn(
         self: Arc<Self>,
         origin: Origin,
+        source: Source,
         shown: String,
         text: String,
         token: CancellationToken,
     ) {
+        let asked = Instant::now();
         let _own = self.turns.lock().await;
         *self.origin.lock() = origin;
-        let _ = self.agent.handle_expanded(&shown, &text, token).await;
+        // How the turn ended is written by the agent, with the same number.
+        let number = crate::journal::next_turn();
+        let line = started_line(
+            number,
+            source.as_str(),
+            &text,
+            shown != text,
+            asked.elapsed().as_millis(),
+            crate::journal::content_allowed(),
+        );
+        log::info!("{line}");
+        let work = self.agent.handle_expanded(&shown, &text, token);
+        let _ = crate::journal::in_turn(number, work).await;
     }
 
-    /// Like `submit_task`, but the chat shows `shown` while the model gets
-    /// `text`: a scenario by event shows one short line and sends its whole
-    /// instruction (decision 0031).
-    pub fn submit_task_as(self: &Arc<Self>, shown: &str, text: &str) {
+    /// Starts a turn that answers no open question and stays at this computer.
+    fn start_task(self: &Arc<Self>, shown: &str, text: &str, source: Source) {
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
@@ -129,13 +197,20 @@ impl Session {
         let shown = shown.trim().to_string();
         // The token of now: a "stop" that comes before this turn drops it.
         let token = self.cancel.lock().clone();
-        tokio::spawn(self.clone().turn(Origin::Local, shown, text, token));
+        tokio::spawn(self.clone().turn(Origin::Local, source, shown, text, token));
+    }
+
+    /// Like `submit_task`, but the chat shows `shown` while the model gets
+    /// `text`: a scenario by event shows one short line and sends its whole
+    /// instruction (decision 0031).
+    pub fn submit_task_as(self: &Arc<Self>, shown: &str, text: &str) {
+        self.start_task(shown, text, Source::Scenario);
     }
 
     /// Starts a scheduled task. It never answers an open question:
     /// it waits for the running reply and then runs as its own turn.
     pub fn submit_task(self: &Arc<Self>, text: &str) {
-        self.submit_task_as(text, text);
+        self.start_task(text, text, Source::Task);
     }
 
     /// Must run inside a tokio runtime: a reply starts as a task.
@@ -152,6 +227,10 @@ impl Session {
         if let Some(p) = self.confirms.pending() {
             // Only someone who was shown the question answers it.
             if self.question_unseen(origin) {
+                log::info!(
+                    "message is not an answer: question {} was never shown in Telegram",
+                    p.id
+                );
                 return Submitted::Unseen;
             }
             // An answer belongs to the running turn: it goes on where the
@@ -204,7 +283,10 @@ impl Session {
             .as_ref()
             .map(expand)
             .unwrap_or_else(|| shown.clone());
-        tokio::spawn(self.clone().turn(origin, shown, full, token));
+        tokio::spawn(
+            self.clone()
+                .turn(origin, Source::of(origin), shown, full, token),
+        );
         Submitted::Started
     }
 
@@ -229,7 +311,10 @@ impl Session {
             .unwrap_or_else(|| shown.clone());
         // Through `turn`, like every other turn: it waits for the turn before
         // it and takes the origin when it starts (decision 0031).
-        tokio::spawn(self.clone().turn(origin, shown, full, token));
+        tokio::spawn(
+            self.clone()
+                .turn(origin, Source::of(origin), shown, full, token),
+        );
         Some(Submitted::Started)
     }
 
@@ -247,6 +332,7 @@ impl Session {
         c.cancel();
         *c = CancellationToken::new();
         drop(c);
+        log::debug!("stop: the running reply and the queued ones are dropped");
         self.confirms.deny_pending(DecidedBy::Policy);
     }
 
@@ -288,7 +374,15 @@ impl Session {
                 *turn.origin.lock() = Origin::Local;
                 answer.await
             };
-            let _ = this.agent.handle_direct(&shown, answer, token).await;
+            // What is shown is made by the app: the name of the program in
+            // front and the question, of which only the size is written.
+            let number = crate::journal::next_turn();
+            log::info!(
+                "turn started: turn={number} source=direct chars={}",
+                shown.chars().count()
+            );
+            let work = this.agent.handle_direct(&shown, answer, token);
+            let _ = crate::journal::in_turn(number, work).await;
         });
         Submitted::Started
     }
@@ -307,6 +401,40 @@ mod tests {
     use async_trait::async_trait;
     use futures::StreamExt;
     use std::time::Duration;
+
+    #[test]
+    fn the_first_record_of_a_turn_has_its_number_and_its_text_only_when_allowed() {
+        assert_eq!(
+            started_line(7, "window", "напомни про отчёт", false, 12, false),
+            "turn started: turn=7 source=window chars=17 expanded=false waited_ms=12"
+        );
+        assert_eq!(
+            started_line(8, "telegram", "напомни про отчёт", true, 0, true),
+            "turn started: turn=8 source=telegram chars=17 expanded=true waited_ms=0 text=напомни про отчёт"
+        );
+        // A text that reads like the blind zone is not written in any mode.
+        let line = started_line(9, "voice", "мой пароль 12345", false, 0, true);
+        assert!(!line.contains("12345"), "{line}");
+        assert!(line.contains("chars=16"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn the_number_of_a_turn_is_known_inside_it_and_nowhere_else() {
+        use crate::journal;
+        assert_eq!(journal::turn(), None);
+        assert_eq!(journal::turn_field(), "");
+        let number = journal::next_turn();
+        assert!(journal::next_turn() > number);
+        let inside = journal::in_turn(number, async {
+            // A task started from the turn is not the turn: a background
+            // job or the voice must not sign its requests with the number.
+            let spawned = tokio::spawn(async { journal::turn() }).await.unwrap();
+            (journal::turn(), journal::turn_field(), spawned)
+        })
+        .await;
+        assert_eq!(inside, (Some(number), format!("turn={number} "), None));
+        assert_eq!(journal::turn(), None);
+    }
 
     /// Calls get_time first, then answers with the tool result.
     struct TimeThenAnswer;

@@ -36,7 +36,11 @@ the window closed: compare it with what you expected and correct it if it went w
 At the very start of a reply you may put one emotion tag in square brackets: \
 [joy] joy, [shy] embarrassment, [surprise] surprise, [sad] sadness, [angry] anger, \
 [think] thinking, [wink] joking, [sleepy] sleepy, [worry] worry. \
-Use a tag only when the emotion fits. The user does not see the tag; do not mention it.",
+Use a tag only when the emotion fits. The user does not see the tag; do not mention it. \
+You decide what is said aloud. The voice does not read a long reply, it says a short retelling of it. \
+When the reply must sound whole, word for word (a joke, an anecdote, a poem, a fairy tale, a story, \
+a toast, a greeting, or you were asked to read something aloud), put the tag [aloud] at the very start, \
+next to the emotion tag. Tell such a text in full, do not describe it. The user does not see this tag either.",
         name = assistant.name,
         persona = persona_en(assistant),
     )
@@ -99,6 +103,7 @@ mod tests {
         assert!(p.starts_with("You are Mika,"), "{p}");
         assert!(p.contains("caring and attentive"));
         assert!(p.contains("[joy]") && p.contains("[worry]"));
+        assert!(p.contains("[aloud]") && p.contains("do not describe it"));
         assert!(p.contains("memory_save") && p.contains("ui_read"));
         assert!(p.contains("Reply in the language of the user's own last message"));
         assert!(!cyrillic(&p), "{p}");

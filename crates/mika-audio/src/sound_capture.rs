@@ -102,7 +102,13 @@ fn open_loopback(tx: mpsc::Sender<Vec<f32>>) -> Result<(cpal::Stream, u32, u16),
     let format = config.sample_format();
     let stream_config: cpal::StreamConfig = config.into();
 
-    let on_error = |e| log::warn!("loopback stream error: {e}");
+    // A broken stream may call this again and again: once is enough.
+    let told = std::sync::atomic::AtomicBool::new(false);
+    let on_error = move |e| {
+        if !told.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log::warn!("loopback stream error: {e}");
+        }
+    };
     // An input stream on an output device is its loopback on WASAPI.
     let stream = match format {
         cpal::SampleFormat::F32 => device.build_input_stream(
@@ -175,7 +181,7 @@ impl WavFile {
             return;
         }
         if let Err(e) = self.out.write_all(bytes) {
-            log::warn!("sound take cannot write: {e}");
+            log::warn!("sound take cannot write, the rest of the sound is lost: {e}");
             self.failed = Some(format!("не удалось записать звук: {e}"));
         }
     }

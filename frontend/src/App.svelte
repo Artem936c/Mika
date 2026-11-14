@@ -24,6 +24,7 @@
     type ScreenAsk,
   } from './lib/hotkeys';
   import { t } from './lib/i18n';
+  import { crashedOf } from './lib/journal';
   import { lang } from './lib/locale.svelte';
   import { reduceTask, type TaskView } from './lib/task';
   import {
@@ -69,7 +70,7 @@
 
   let current = $state<AssistantState>('idle');
   let view = $state<View>('island');
-  let settingsStart = $state<'persona' | 'providers'>('persona');
+  let settingsStart = $state<'persona' | 'providers' | 'journal'>('persona');
   let items = $state<ChatItem[]>([]);
   let name = $state('');
   let speak = $state(true);
@@ -96,6 +97,8 @@
   const noticing = $derived(showsNotice(current, notice, noticeUrgent));
   let task = $state<TaskView | null>(null);
   let needsSetup = $state(false);
+  /** The previous run was cut short and the user has not been told yet. */
+  let crashed = $state(false);
   /** Id of the screen recording that runs now. */
   let recording = $state<number | null>(null);
   /** Newest state of every background job the events told about. */
@@ -251,6 +254,27 @@
     }
   }
 
+  async function loadCrash() {
+    try {
+      crashed = crashedOf(await invoke<unknown>('journal_view'));
+    } catch {
+      // The notice is a courtesy: the journal page itself shows what went wrong.
+      crashed = false;
+    }
+  }
+
+  /** The notice is read: the journal page opens and tells the app so. */
+  function openJournal() {
+    crashed = false;
+    settingsStart = 'journal';
+    view = 'settings';
+  }
+
+  function closeCrash() {
+    crashed = false;
+    invoke('journal_crash_seen').catch(() => {});
+  }
+
   function openPanel() {
     if (view !== 'island') return;
     settingsStart = needsSetup ? 'providers' : 'persona';
@@ -279,6 +303,7 @@
     });
     loadUi();
     refreshSetup();
+    loadCrash();
     loadIdle();
     // Often enough to follow the player; the weather behind it is cached for half an hour.
     const idleTimer = setInterval(loadIdle, 15_000);
@@ -341,6 +366,8 @@
       refreshSetup();
       loadUi();
       loadIdle();
+      // The journal page may have shown the notice itself.
+      if (crashed) loadCrash();
     }}
   />
 {/snippet}
@@ -370,6 +397,9 @@
     {windowed}
     wide={avatarInIsland && (!windowed || innerWidth >= WIDE_FROM)}
     {needsSetup}
+    {crashed}
+    onjournal={openJournal}
+    oncrashclose={closeCrash}
     onanswer={answer}
     onsend={(text) => invoke('send_message', { text })}
     onstop={() => invoke('stop')}

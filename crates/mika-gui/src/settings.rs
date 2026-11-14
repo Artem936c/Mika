@@ -374,7 +374,7 @@ fn ffmpeg_view_now(setting: String) -> FfmpegView {
         .and_then(|p| match mika_tools::ffmpeg::version(p) {
             Ok(v) => Some(v),
             Err(e) => {
-                log::warn!("ffmpeg -version failed: {e}");
+                log::warn!(target: "jobs", "ffmpeg -version failed: {e}");
                 None
             }
         });
@@ -1476,7 +1476,7 @@ pub async fn install_update(app: AppHandle, ctx: tauri::State<'_, Arc<Ctx>>) -> 
         .clone()
         .ok_or_else(|| crate::strings::tr("error.update_none"))?;
     let installer = crate::update::download(&manifest).await?;
-    log::info!("installing version {}", manifest.version);
+    log::info!(target: "update", "installing the downloaded version, the app closes");
     ctx.session.stop();
     ctx.save_config()?;
     crate::update::run_installer(&installer)?;
@@ -1486,31 +1486,15 @@ pub async fn install_update(app: AppHandle, ctx: tauri::State<'_, Arc<Ctx>>) -> 
 
 // ---- report a problem ----
 
-/// Version, settings without secrets and the tail of the log, for the user to copy.
-/// Nothing is sent anywhere.
+/// Version, settings without secrets and the end of the journal, for the user
+/// to copy: the last records and the errors of the last day. Nothing is sent
+/// anywhere. The journal is read from its files, so not on the main thread.
 #[tauri::command]
-pub fn problem_report(ctx: CtxState<'_>) -> String {
-    let c = ctx.config.lock();
-    let log =
-        std::fs::read_to_string(mika_core::paths::logs_dir().join("mika.log")).unwrap_or_default();
-    let tail: Vec<&str> = log.lines().rev().take(60).collect();
-    let tail: Vec<&str> = tail.into_iter().rev().collect();
-    format!(
-        "Mika {}\nWindows: {}\nProvider: {} · {} · {}\nTools: {} (off: {})\nWeb: {} · Screen: {} · Telegram: {} · MCP servers: {}\nEmbeddings: {}\n\n--- log ---\n{}",
-        env!("CARGO_PKG_VERSION"),
-        std::env::var("OS").unwrap_or_default(),
-        c.llm.kind.as_str(),
-        c.llm.effective_base_url(),
-        c.llm.model,
-        ctx.session.agent.registry().len(),
-        c.tools.disabled_groups.join(", "),
-        c.tools.web_enabled,
-        c.privacy.screen_enabled,
-        ctx.telegram_status.lock(),
-        c.mcp.servers.len(),
-        if c.embedding.model.is_empty() { "off" } else { c.embedding.model.as_str() },
-        tail.join("\n")
-    )
+pub async fn problem_report(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<String, String> {
+    let ctx = ctx.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || crate::journal::problem_report(&ctx))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

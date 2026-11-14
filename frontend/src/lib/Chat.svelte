@@ -37,6 +37,9 @@
     wide,
     windowed = false,
     needsSetup = false,
+    crashed = false,
+    onjournal = () => {},
+    oncrashclose = () => {},
     onanswer,
     onsend,
     onstop,
@@ -74,6 +77,10 @@
     /** The chat lives in an ordinary window, not in the island. */
     windowed?: boolean;
     needsSetup?: boolean;
+    /** The previous run was cut short: said once, with a way to the journal. */
+    crashed?: boolean;
+    onjournal?: () => void;
+    oncrashclose?: () => void;
     onanswer: (a: 'once' | 'always' | 'deny') => void;
     onsend: (text: string) => void;
     onstop: () => void;
@@ -197,6 +204,13 @@
       <div class="setup">
         <span>{t('chat.setup', { name })}</span>
         <button class="bt pri" onclick={onsettings}>{t('chat.setup_button')}</button>
+      </div>
+    {/if}
+    {#if crashed}
+      <div class="crash">
+        <span>{t('journal.crash')}</span>
+        <button class="link" onclick={onjournal}>{t('journal.crash_open')}</button>
+        <button class="ib" title={t('journal.crash_close')} aria-label={t('journal.crash_close')} onclick={oncrashclose}><Icon name="x" size={13} /></button>
       </div>
     {/if}
 
@@ -407,6 +421,43 @@
     border: 1px solid rgba(143, 125, 255, 0.35);
     background: rgba(143, 125, 255, 0.1);
     font-size: 13px;
+  }
+  /* A calm line, not an alarm: the app works, it only tells where to look. */
+  .crash {
+    flex: none;
+    margin: 10px 14px 0;
+    padding: 8px 8px 8px 14px;
+    display: flex;
+    align-items: center;
+    gap: 6px 12px;
+    border-radius: 14px;
+    border: 1px solid var(--line2);
+    background: rgba(255, 255, 255, 0.04);
+    font-size: 12.5px;
+    color: var(--mute);
+  }
+  .crash span {
+    flex: 1;
+    min-width: 0;
+  }
+  .crash .link {
+    all: unset;
+    flex: none;
+    cursor: pointer;
+    font-weight: 700;
+    color: var(--v);
+    white-space: nowrap;
+  }
+  .crash .link:hover {
+    text-decoration: underline;
+  }
+  .crash .link:focus-visible {
+    outline: 2px solid rgba(143, 125, 255, 0.7);
+    outline-offset: 2px;
+  }
+  .crash .ib {
+    width: 24px;
+    height: 24px;
   }
   .msgs {
     flex: 1;

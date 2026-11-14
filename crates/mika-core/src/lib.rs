@@ -13,6 +13,7 @@ pub mod events;
 pub mod gate;
 pub mod hotkeys;
 pub mod i18n;
+pub mod journal;
 pub mod llm;
 pub mod marks;
 pub mod memory;

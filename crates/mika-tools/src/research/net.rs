@@ -68,6 +68,23 @@ impl NetRefusal {
     }
 }
 
+impl NetRefusal {
+    /// The reason as the journal names it.
+    pub fn code(self) -> &'static str {
+        match self {
+            NetRefusal::Malformed => "malformed",
+            NetRefusal::TooLong => "too_long",
+            NetRefusal::Scheme => "scheme",
+            NetRefusal::Credentials => "credentials",
+            NetRefusal::Port => "port",
+            NetRefusal::LocalName => "local_name",
+            NetRefusal::PrivateAddress => "private_address",
+            NetRefusal::Blind => "blind_zone",
+            NetRefusal::TooManyRedirects => "too_many_redirects",
+        }
+    }
+}
+
 impl std::fmt::Display for NetRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
@@ -309,9 +326,72 @@ fn mime_name(mime: &str) -> String {
     }
 }
 
+/// An address for a record: nothing of a page of the blind zone, and no
+/// query (what was searched for) unless texts are written.
+fn logged_address(url: &str) -> String {
+    if is_blind_url(url) {
+        mika_core::journal::BLIND_MARK.to_string()
+    } else {
+        mika_core::journal::address(url)
+    }
+}
+
+/// The record of a page the guarded client did not give: its level and text.
+/// A refusal is a milestone; a site that failed is detail, the search
+/// counts it in its own record.
+fn failure_line(error: &NetError, url: &str, ms: u128) -> (log::Level, String) {
+    match error {
+        NetError::Refused(why) => (
+            log::Level::Info,
+            format!(
+                "guarded client refused an address: reason={} address={}",
+                why.code(),
+                logged_address(url)
+            ),
+        ),
+        other => {
+            let reason = match other {
+                NetError::Status(code) => format!("status_{code}"),
+                NetError::NotText(_) => "not_text".to_string(),
+                NetError::TimedOut => "timed_out".to_string(),
+                NetError::Failed(_) | NetError::Refused(_) => "no_connection".to_string(),
+            };
+            (
+                log::Level::Debug,
+                format!(
+                    "page not read: reason={reason} ms={ms} address={}",
+                    logged_address(url)
+                ),
+            )
+        }
+    }
+}
+
 #[async_trait]
 impl Net for GuardedHttp {
     async fn get(&self, url: &str, max_bytes: usize) -> Result<Fetched, NetError> {
+        let began = std::time::Instant::now();
+        let got = self.fetch(url, max_bytes).await;
+        let ms = began.elapsed().as_millis();
+        match &got {
+            Ok(page) => log::debug!(
+                "page read: bytes={} truncated={} ms={ms} address={}",
+                page.html.len(),
+                page.truncated,
+                logged_address(&page.url)
+            ),
+            Err(e) => {
+                let (level, line) = failure_line(e, url, ms);
+                log::log!(level, "{line}");
+            }
+        }
+        got
+    }
+}
+
+impl GuardedHttp {
+    /// `get` without its record.
+    async fn fetch(&self, url: &str, max_bytes: usize) -> Result<Fetched, NetError> {
         let parsed = check_url(url).map_err(NetError::Refused)?;
         let mut resp = self.client.get(parsed).send().await.map_err(send_error)?;
         check_url(resp.url().as_str()).map_err(NetError::Refused)?;
@@ -431,6 +511,62 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[test]
+    fn a_refusal_is_recorded_with_its_reason_and_without_the_query() {
+        let (level, line) = failure_line(
+            &NetError::Refused(NetRefusal::PrivateAddress),
+            "http://192.168.1.10/status?user=ivan",
+            3,
+        );
+        assert_eq!(level, log::Level::Info);
+        assert_eq!(
+            line,
+            "guarded client refused an address: reason=private_address address=http://192.168.1.10/status?<hidden>"
+        );
+        // Nothing of a page of the blind zone, not even its site.
+        let (_, line) = failure_line(
+            &NetError::Refused(NetRefusal::Blind),
+            "https://online.sberbank.ru/payments",
+            3,
+        );
+        assert_eq!(
+            line,
+            "guarded client refused an address: reason=blind_zone address=<blind zone>"
+        );
+        // A site that failed is detail of the search.
+        let (level, line) = failure_line(&NetError::Status(404), "https://example.org/a?q=1", 20);
+        assert_eq!(level, log::Level::Debug);
+        assert_eq!(
+            line,
+            "page not read: reason=status_404 ms=20 address=https://example.org/a?<hidden>"
+        );
+        for (error, reason) in [
+            (NetError::TimedOut, "timed_out"),
+            (NetError::NotText("application/pdf".into()), "not_text"),
+            (NetError::Failed("dns".into()), "no_connection"),
+        ] {
+            let (_, line) = failure_line(&error, "https://example.org/", 1);
+            assert!(line.contains(&format!("reason={reason} ")), "{line}");
+        }
+        // Every refusal has a name of its own.
+        use NetRefusal::*;
+        let codes: std::collections::HashSet<&str> = [
+            Malformed,
+            TooLong,
+            Scheme,
+            Credentials,
+            Port,
+            LocalName,
+            PrivateAddress,
+            Blind,
+            TooManyRedirects,
+        ]
+        .into_iter()
+        .map(NetRefusal::code)
+        .collect();
+        assert_eq!(codes.len(), 9);
+    }
 
     #[test]
     fn check_url_refuses_what_is_not_a_public_web_page() {

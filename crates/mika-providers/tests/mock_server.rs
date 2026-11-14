@@ -202,6 +202,6 @@ async fn anthropic_error_event_is_reported() {
     let p = AnthropicProvider::new(url, "claude".into(), None);
     assert!(matches!(
         collect(&p).await.last(),
-        Some(Err(LlmError::Protocol(_)))
+        Some(Err(LlmError::Provider(said))) if said.contains("overloaded_error")
     ));
 }

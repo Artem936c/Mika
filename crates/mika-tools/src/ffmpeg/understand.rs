@@ -404,6 +404,7 @@ impl AvTranscribeTool {
         let wav_path = work.path().join("audio.wav");
         let argv = args::wav_args(&job.input, limit, &wav_path);
         run_ffmpeg(
+            "av_understand",
             runner,
             &paths,
             &argv,
@@ -417,6 +418,7 @@ impl AvTranscribeTool {
         .await?;
         let argv = args::silence_args(&wav_path, "-35dB", "0.35");
         let out = run_ffmpeg(
+            "av_understand",
             runner,
             &paths,
             &argv,
@@ -653,6 +655,7 @@ impl Tool for VideoDescribeTool {
                 ((i + 1) * 80 / times.len()) as u8,
             );
             run_ffmpeg(
+                "av_understand",
                 self.0.runner.as_ref(),
                 &paths,
                 &argv,
@@ -669,7 +672,7 @@ impl Tool for VideoDescribeTool {
                     shown.push(format!("{} — {}", pngs.len() + 1, show_time(*t)));
                     pngs.push(png);
                 }
-                _ => log::warn!("no frame at {t:.1} s"),
+                _ => log::warn!("no frame came out of the video: at_s={t:.1}"),
             }
         }
         if pngs.is_empty() {

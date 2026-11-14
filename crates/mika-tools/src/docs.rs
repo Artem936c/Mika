@@ -690,7 +690,7 @@ impl DocIndex {
                 Err(e) => {
                     // The file stays as it was and is read again next pass:
                     // the reason may go away (a recognition language, a lock).
-                    log::info!("document not read: {e}");
+                    log::debug!("document not read, it is tried again next pass: {e}");
                     failed_files += 1;
                     continue;
                 }
@@ -740,6 +740,25 @@ impl DocIndex {
             read += 1;
         }
         let (embedded, refused) = self.embed_missing(current, &mut seen, cancel).await?;
+        // A pass that found nothing to do comes every hour: it is detail.
+        let idle = read == 0
+            && gone.is_empty()
+            && failed_files == 0
+            && embedded == 0
+            && refused == 0
+            && !full;
+        log::log!(
+            if idle {
+                log::Level::Debug
+            } else if failed_files > 0 || refused > 0 || full {
+                log::Level::Warn
+            } else {
+                log::Level::Info
+            },
+            "documents indexed: files={} read={read} removed={} not_read={failed_files} vectors={embedded} refused_pieces={refused} index_full={full}",
+            found.len(),
+            gone.len()
+        );
         let mut report = format!(
             "Файлов в папках: {}, прочитано заново: {read}, убрано: {}.",
             found.len(),

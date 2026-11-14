@@ -11,13 +11,14 @@
   import Extensions from './settings/Extensions.svelte';
   import Hotkeys from './settings/Hotkeys.svelte';
   import IslandPage from './settings/IslandPage.svelte';
+  import Journal from './settings/Journal.svelte';
   import Memory from './settings/Memory.svelte';
   import Persona from './settings/Persona.svelte';
   import Providers from './settings/Providers.svelte';
   import Tools from './settings/Tools.svelte';
   import Voice from './settings/Voice.svelte';
 
-  type Page = 'persona' | 'providers' | 'permissions' | 'tools' | 'memory' | 'extensions' | 'voice' | 'island' | 'hotkeys' | 'costs' | 'general';
+  type Page = 'persona' | 'providers' | 'permissions' | 'tools' | 'memory' | 'extensions' | 'voice' | 'island' | 'hotkeys' | 'costs' | 'journal' | 'general';
 
   let {
     name,
@@ -37,6 +38,7 @@
     { id: 'island', icon: 'mon', lead: 'island.lead' },
     { id: 'hotkeys', icon: 'kbd', lead: 'hotkeys.lead' },
     { id: 'costs', icon: 'coins', lead: 'costs.lead' },
+    { id: 'journal', icon: 'log', lead: 'journal.lead' },
     { id: 'general', icon: 'set', lead: 'general.lead' },
   ];
 
@@ -88,6 +90,8 @@
           <Hotkeys />
         {:else if page === 'costs'}
           <Costs />
+        {:else if page === 'journal'}
+          <Journal />
         {:else}
           <General {name} />
         {/if}
@@ -142,12 +146,12 @@
     gap: 10px;
     width: 100%;
     box-sizing: border-box;
-    padding: 8px 12px;
+    padding: 6px 12px;
     border-radius: 12px;
     font-size: 13.5px;
     font-weight: 600;
     color: var(--mute);
-    margin-bottom: 2px;
+    margin-bottom: 1px;
     transition: color 0.2s;
   }
   nav button:hover:not(:disabled) {
@@ -157,7 +161,9 @@
     color: #fff;
     background: rgba(143, 125, 255, 0.18);
   }
+  /* A size container: a page can ask how tall the room is (the journal sizes its list by it). */
   .page {
+    container-type: size;
     min-width: 0;
     min-height: 0;
     overflow-y: auto;

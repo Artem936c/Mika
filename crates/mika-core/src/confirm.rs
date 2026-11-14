@@ -96,6 +96,7 @@ impl Drop for DropGuard<'_> {
         if p.as_ref().is_some_and(|p| p.view.id == self.id) {
             *p = None;
             drop(p);
+            log::info!("question dropped: id={} the reply was stopped", self.id);
             self.owner.bus.publish(Event::ConfirmResolved {
                 id: self.id,
                 answer: Answer::Deny,
@@ -139,6 +140,13 @@ impl Confirmations {
             id,
             done: false,
         };
+        log::info!(
+            "question asked: {}id={id} tool={tool} risk={} forever_offered={} timeout_s={}",
+            crate::journal::turn_field(),
+            assessment.level.as_str(),
+            view.allow_always,
+            timeout.as_secs()
+        );
         self.state.set(AssistantState::AwaitingConfirm);
         self.bus.publish(Event::ConfirmRequested {
             id,

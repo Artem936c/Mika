@@ -40,7 +40,7 @@ pub fn start(config: &mut Config, fresh: bool) {
         first_start(config, detect());
         // Saved at once, so the next start is not a first one.
         if let Err(e) = config.save(&config_path()) {
-            log::warn!("cannot save config: {e}");
+            log::warn!("cannot save settings: {e}");
         }
     }
     i18n::set_lang(config.i18n.lang());

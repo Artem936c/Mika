@@ -274,6 +274,7 @@ impl Tool for AvCutTool {
             part.path(),
         );
         run_ffmpeg(
+            "av_edit",
             runner,
             &paths,
             &argv,
@@ -569,6 +570,7 @@ impl Tool for AvJoinTool {
             }
         };
         run_ffmpeg(
+            "av_edit",
             runner,
             &paths,
             &argv,
@@ -712,6 +714,7 @@ impl Tool for VideoGifTool {
             part.path(),
         );
         run_ffmpeg(
+            "av_edit",
             self.0.runner.as_ref(),
             &paths,
             &argv,
@@ -824,6 +827,7 @@ impl Tool for VideoRotateTool {
         let argv = args::rotate_args(&job.input, job.angle, &codec, &job.ext, part.path());
         let duration = job.info.duration();
         run_ffmpeg(
+            "av_edit",
             runner,
             &paths,
             &argv,
@@ -974,6 +978,7 @@ impl Tool for AvSpeedTool {
         let input_len = job.info.duration();
         let out_len = input_len / job.factor;
         run_ffmpeg(
+            "av_edit",
             runner,
             &paths,
             &argv,

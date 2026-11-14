@@ -228,6 +228,14 @@ fn periods(day: NaiveDate, cfg: &CostsConfig) -> [Period; 2] {
 }
 
 /// The key in `cost_alerts` under which a period remembers that the user was
+/// The period as the journal names it.
+fn period_name(period: BudgetPeriod) -> &'static str {
+    match period {
+        BudgetPeriod::Day => "day",
+        BudgetPeriod::Month => "month",
+    }
+}
+
 /// told about its pause.
 fn pause_key(period: &Period) -> String {
     format!("pause:{}", period.key)
@@ -381,7 +389,7 @@ impl Costs {
                     );
                 }
             }
-            Err(e) => log::warn!("stored prices not read: {e}"),
+            Err(e) => log::warn!("stored prices not read, calls wait for a price list: {e}"),
         }
         Costs(Arc::new(Inner {
             db,
@@ -457,6 +465,16 @@ impl Costs {
     fn fire(&self, alerts: Vec<BudgetAlert>) {
         if alerts.is_empty() {
             return;
+        }
+        for alert in &alerts {
+            log::warn!(
+                "budget warning: period={} level={} spent={:.2} limit={:.2} currency={}",
+                period_name(alert.period),
+                alert.level,
+                alert.spent,
+                alert.limit,
+                alert.currency
+            );
         }
         let Some(tell) = self.0.alert.read().clone() else {
             return;
@@ -879,13 +897,24 @@ impl Costs {
         let (pause, first) = match checked {
             Ok(found) => found,
             Err(e) => {
-                log::warn!("budget pause not checked: {e}");
+                log::warn!("budget pause not checked, paid work of her own goes on: {e}");
                 return true;
             }
         };
         let Some(pause) = pause else {
             return true;
         };
+        // Later refusals leave no record here: this is asked every half a
+        // minute while a summary waits. Who was held says so itself, once.
+        if first {
+            log::warn!(
+                "budget pause: period={} spent={:.2} limit={:.2} currency={}: paid work of her own waits for the end of the period",
+                period_name(pause.period),
+                pause.spent,
+                pause.limit,
+                pause.currency
+            );
+        }
         if first {
             let tell = self.0.pause.read().clone();
             if let Some(tell) = tell {
@@ -897,7 +926,9 @@ impl Costs {
 
     /// Forgets the spending and the shown warnings. Prices stay.
     pub fn clear(&self) -> Result<(), DbError> {
-        self.0.db.with(store::clear)
+        self.0.db.with(store::clear)?;
+        log::info!("spending and shown budget warnings are cleared");
+        Ok(())
     }
 
     /// Gives money to the rows that waited for a price, of one provider or of
@@ -960,7 +991,11 @@ impl Costs {
                 // A period that is no longer held forgets that its pause was
                 // told: reached again, it is told again.
                 if now < 100 || !cfg.enabled || !cfg.pause_unattended {
-                    store::set_alert_level(c, &pause_key(&p), 0)?;
+                    let key = pause_key(&p);
+                    if store::alert_level(c, &key)? > 0 {
+                        log::info!("budget pause lifted: period={}", period_name(p.kind));
+                    }
+                    store::set_alert_level(c, &key, 0)?;
                 }
             }
             Ok(())

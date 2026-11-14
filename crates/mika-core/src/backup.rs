@@ -542,7 +542,15 @@ fn scan(
     walk.finish()?;
     let config = config_text.and_then(|text| {
         let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-        toml::from_str::<Config>(text).ok()
+        // The message only: the full error quotes the line of the settings.
+        toml::from_str::<Config>(text)
+            .map_err(|e| {
+                log::warn!(
+                    "the settings of the copy cannot be read, they are left out: {}",
+                    e.message()
+                )
+            })
+            .ok()
     });
     Ok(Scan {
         schema: reader.schema(),
@@ -819,6 +827,15 @@ pub fn restore(
         tx.commit()?;
         Ok::<_, BackupError>(scan)
     })?;
+    // What the file held and this restore did not take: counts only.
+    if scan.dropped_rows > 0 || scan.allow_rules_dropped > 0 || scan.skipped_unknown > 0 {
+        log::warn!(
+            "parts of the copy were left out: unusable_rows={} allow_rules={} unknown_lines={}",
+            scan.dropped_rows,
+            scan.allow_rules_dropped,
+            scan.skipped_unknown
+        );
+    }
 
     let landing = scan
         .config
@@ -837,7 +854,14 @@ pub fn restore(
             }
             match here.secrets.set(&name.key(), &value) {
                 Ok(()) => keys_written += 1,
-                Err(_) => keys_failed.push(name),
+                Err(e) => {
+                    // The name of the entry, never what it holds.
+                    log::warn!(
+                        "a key of the copy was not written: entry={} error={e}",
+                        name.key()
+                    );
+                    keys_failed.push(name);
+                }
             }
         }
     }

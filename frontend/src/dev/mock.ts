@@ -1,6 +1,6 @@
 // Development-only preview without Tauri: open http://localhost:5173/?mock=chat
 // Scenarios: island, listen, think, speak, chat, cards, av, reminder, confirm, high, long, settings.
-// `&page=providers|permissions|tools|memory|extensions|voice|island|general` picks a settings page, `&timer` shows a countdown, `&narrow` hides the avatar column,
+// `&page=providers|permissions|tools|memory|extensions|voice|island|hotkeys|costs|journal|general` picks a settings page, `&timer` shows a countdown, `&narrow` hides the avatar column,
 // `&cloud` switches the voice page to the provider engine, `&drama` to Drama 3 with expressive speech on,
 // FFmpeg on the tools page: not found by default, `&ffmpeg` found in PATH, `&ffmpeg_dl` downloaded by Mika,
 // `&ffmpeg_gpl` a GPL build, `&ffmpeg_bad` a saved path without ffmpeg.exe, `&ffmpeg_fail` a download that fails its checksum,
@@ -34,6 +34,11 @@
 // `&backup_cancel` the file dialog is cancelled, `&backup_keysfail` one key is not written. The copy holds three scenarios
 // by event: one of an instruction, one of a saved command the copy holds, one of a command that is nowhere.
 // `?mock=chat&welcome` shows the restore link on the first-run screen.
+// Journal: scenario `journal` opens the journal page of the settings with rows of every level and category, a long row,
+// a row of several lines and the line about a run that was cut short; a new row is written every three seconds, so «follow»
+// has something to show. `&notice` stops in the chat with the notice of that run (its link opens the page), `&journal_empty`
+// is an empty journal, `&journal_fail` makes reading the next page and saving the settings fail, `&journal_cancel` closes
+// the save dialog without a file. `?mock=settings&page=journal` is the same page without the unclean run.
 // `&lang=en` starts the preview in English; the language picker on `&page=general` and on `&welcome` switches it in place.
 
 import { mockIPC } from '@tauri-apps/api/mocks';
@@ -445,6 +450,88 @@ const BACKUP_RESULT = {
   safety_copy: BACKUP_SAFETY,
 };
 
+/** A row of the journal as the journal commands send it. */
+interface MockRow {
+  seq: number | null;
+  t: string;
+  level: 'error' | 'warn' | 'info' | 'debug';
+  category: string;
+  message: string;
+}
+
+const JOURNAL_LONG =
+  'ffmpeg exited with code 1 after 41.3 s: job 7 (video_compress), input 245 MB, 12:31, h264 1920x1080; ' +
+  'last line: [libx264 @ 000001d5c0a4f3c0] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height. ' +
+  'The unfinished file was removed. The queue goes on with job 8 (av_convert). ' +
+  'Arguments: <hidden 212 chars>. Free space on the target disk: 18.4 GB. Hardware encoder: none, software x264 with preset medium. ' +
+  'The same input failed 2 times today.';
+
+const JOURNAL_LINES = [
+  'request failed: provider=routerai.ru model=mistralai/mistral-nemo 2210 ms, http=500, retries=3',
+  'body: {"error":{"message":"upstream timeout","type":"server_error"}}',
+  'the turn ended with an error shown in the chat',
+].join('\n');
+
+/** One row of every level and of every category; the same texts are written again and again further back. */
+const JOURNAL_SAMPLES: [MockRow['level'], string, string][] = [
+  ['info', 'turn', 'turn finished: turn=12 outcome=ok ms=4800 steps=2 tools=1 reply_chars=148'],
+  ['info', 'voice', 'synthesis done: 148 chars, 620 ms, engine=provider'],
+  ['info', 'llm', 'request done: provider=routerai.ru model=mistralai/mistral-nemo 1840 ms, tokens in=2140 out=96, stop=stop, http=200, retries=0'],
+  ['info', 'tool', 'tool call finished: turn=12 tool=open_app risk=low decision=rule ms=212 outcome=ok'],
+  ['debug', 'llm', 'retry 1 of 3 after http=429, wait 800 ms'],
+  ['info', 'llm', 'request done: provider=routerai.ru model=mistralai/mistral-nemo 960 ms, tokens in=1980 out=41, stop=tool_calls, http=200, retries=1'],
+  ['info', 'turn', 'turn started: turn=12 source=window chars=42 expanded=false waited_ms=0'],
+  ['error', 'jobs', JOURNAL_LONG],
+  ['warn', 'costs', 'day budget at 80%: 80.40 of 100 RUB'],
+  ['info', 'policy', 'question asked in the island: run_shell, risk=medium; answer=once'],
+  ['warn', 'tool', 'tool call finished: turn=11 tool=run_shell risk=medium decision=asked_yes ms=30012 outcome=error error=<hidden 38 chars>'],
+  ['error', 'llm', JOURNAL_LINES],
+  ['warn', 'telegram', 'polling failed: connection reset by peer; next try in 5 s'],
+  ['info', 'telegram', 'incoming: voice, 7 s'],
+  ['error', 'mcp', 'server "files" exited with code 1'],
+  ['info', 'mcp', 'server "remote" started: 4 tools'],
+  ['info', 'events', 'scenario 3 fired: audio_connected'],
+  ['debug', 'events', 'scenario 5 skipped: pause of 2 h is not over'],
+  ['info', 'jobs', 'job 6 finished: av_convert, 19.8 s'],
+  ['info', 'backup', 'copy created: 12 categories, 4.6 MB, encrypted'],
+  ['info', 'update', 'check done: no newer version'],
+  ['warn', 'hotkeys', 'registration refused: Ctrl+Alt+D is taken by another program'],
+  ['info', 'web', 'deep search finished: searches=5 pages=8 sources=6, 143 s'],
+  ['warn', 'web', 'guarded client refused https://example.com/v1/items?key=***: private address'],
+  ['warn', 'lib', 'reqwest: connection closed before message completed'],
+  ['debug', 'voice', 'microphone opened: 16000 Hz, mono'],
+  ['info', 'voice', 'recognition done: 1840 ms, 4.2 s of audio, ok'],
+  ['info', 'app', 'settings saved: log, voice'],
+  ['info', 'app', 'Mika 0.4.0 started: Windows build 26100, lang=ru, switches: speak, web, costs'],
+  ['warn', 'app', 'the previous run did not exit cleanly'],
+  ['error', 'app', 'panic at crates/mika-gui/src/window.rs:276: called `Option::unwrap()` on a `None` value'],
+];
+
+/** A time as the journal writes it: RFC 3339 with milliseconds and the local offset. */
+function journalStamp(ms: number): string {
+  const d = new Date(ms);
+  const two = (n: number) => String(n).padStart(2, '0');
+  const offset = -d.getTimezoneOffset();
+  const zone = `${offset < 0 ? '-' : '+'}${two(Math.floor(Math.abs(offset) / 60))}:${two(Math.abs(offset) % 60)}`;
+  return (
+    `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}T${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}` +
+    `.${String(d.getMilliseconds()).padStart(3, '0')}${zone}`
+  );
+}
+
+/** 260 rows, newest first, the oldest from days ago. Only the newest 120 are «in memory» and have a number. */
+function journalRows(): MockRow[] {
+  const now = Date.now();
+  const rows: MockRow[] = [];
+  for (let i = 0; i < 260; i += 1) {
+    const [level, category, message] = JOURNAL_SAMPLES[i % JOURNAL_SAMPLES.length];
+    // Every row a little further back, with a jump of a day after each hundred.
+    const at = now - 4000 - i * 97_531 - Math.floor(i / 100) * 24 * 3_600_000;
+    rows.push({ seq: i < 120 ? 120 - i : null, t: journalStamp(at), level, category, message });
+  }
+  return rows;
+}
+
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function install(scenario: string) {
@@ -771,6 +858,56 @@ export async function install(scenario: string) {
     });
     emit('mika://event', { type: 'remark', kind: 'job', text: `Готово: ${job.title}` });
   };
+  // The journal: rows newest first, and what the journal commands answer with.
+  const journal = {
+    rows: scenario === 'journal' && params.has('journal_empty') ? [] : journalRows(),
+    lastSeq: 120,
+    level: 'info',
+    content: false,
+    keepDays: 14,
+    keepFiles: 5,
+    crashed: scenario === 'journal' && !params.has('journal_empty'),
+  };
+  const journalWrite = (level: MockRow['level'], category: string, message: string) => {
+    journal.lastSeq += 1;
+    journal.rows.unshift({ seq: journal.lastSeq, t: journalStamp(Date.now()), level, category, message });
+  };
+  const journalView = () => {
+    const bytes = journal.rows.reduce((n, r) => n + r.message.length + 48, 0);
+    return {
+      level: journal.level,
+      content: journal.content,
+      keep_days: journal.keepDays,
+      keep_files: journal.keepFiles,
+      dir: String.raw`C:\Users\me\AppData\Local\Mika\logs`,
+      // Two earlier files of five megabytes each, unless the journal was cleared.
+      size_bytes: journal.rows.length > 200 ? bytes + 2 * 5_242_880 : bytes,
+      files: journal.rows.length > 200 ? 3 : 1,
+      oldest: journal.rows.length > 0 ? journal.rows[journal.rows.length - 1].t : null,
+      crashed: journal.crashed,
+    };
+  };
+  /** The rows a query asks for, newest first; the page mark is the place in the list. */
+  const journalRead = (query: Record<string, unknown> | null) => {
+    const levels = (query?.levels ?? []) as string[];
+    const categories = (query?.categories ?? []) as string[];
+    const text = String(query?.text ?? '').toLowerCase();
+    const found = journal.rows.filter(
+      (r) => (levels.length === 0 || levels.includes(r.level)) && (categories.length === 0 || categories.includes(r.category)) && r.message.toLowerCase().includes(text),
+    );
+    const from = query?.before ? Number(query.before) : 0;
+    const limit = Math.min(500, Number(query?.limit) || 100);
+    return { rows: structuredClone(found.slice(from, from + limit)), next: from + limit < found.length ? String(from + limit) : null };
+  };
+  // The app goes on working while the page is looked at.
+  if (scenario === 'journal' && !params.has('journal_empty')) {
+    let beat = 0;
+    setInterval(() => {
+      const [level, category, message] = JOURNAL_SAMPLES[beat % 7];
+      journalWrite(level, category, message);
+      beat += 1;
+    }, 3000);
+  }
   // The recording of scenario `rec` started before the page came up: the page learns of it from `bg_jobs_list`.
   if (scenario === 'rec') {
     jobs.set(5, { id: 5, kind: 'screen_record', title: REC_TITLE, state: 'running', live: true, share: 0, note: '0:02 из 30:00' });
@@ -1223,6 +1360,42 @@ export async function install(scenario: string) {
         case 'backup_import_cancel':
         case 'backup_restart':
           return null;
+        case 'journal_view':
+          return journalView();
+        case 'journal_read': {
+          const query = (a.query ?? null) as Record<string, unknown> | null;
+          if (params.has('journal_fail') && query?.before) throw 'The log file could not be read: access is denied';
+          return journalRead(query);
+        }
+        case 'journal_tail': {
+          const after = typeof a.after === 'number' ? a.after : 0;
+          // Oldest first, as the app sends them.
+          return { rows: structuredClone(journal.rows.filter((r) => r.seq !== null && r.seq > after).reverse()), last: journal.lastSeq };
+        }
+        case 'set_journal': {
+          const s = (a.settings ?? {}) as { level?: string; content?: boolean; keep_days?: number; keep_files?: number };
+          if (params.has('journal_fail')) throw 'The settings were not saved: config.toml is read-only';
+          if (!Number.isInteger(s.keep_days) || Number(s.keep_days) < 1 || Number(s.keep_days) > 365) throw 'Keep days: a whole number from 1 to 365';
+          journal.level = String(s.level);
+          journal.content = s.content === true;
+          journal.keepDays = Number(s.keep_days);
+          journal.keepFiles = Number(s.keep_files);
+          journalWrite('info', 'app', 'settings saved: log');
+          return journalView();
+        }
+        case 'journal_export':
+          return (async () => {
+            await wait(400);
+            if (params.has('journal_cancel')) return null;
+            return String.raw`C:\Users\me\Documents\mika-journal-2026-11-14.txt`;
+          })();
+        case 'journal_clear':
+          journal.rows = [];
+          journalWrite('info', 'app', 'journal cleared');
+          return journalView();
+        case 'journal_crash_seen':
+          journal.crashed = false;
+          return null;
         default:
           return null;
       }
@@ -1248,7 +1421,7 @@ export async function install(scenario: string) {
 
   setTimeout(async () => {
     // The page may still be loading modules: wait until it is mounted and listening.
-    while (!document.querySelector('.iw, .stage')) await wait(50);
+    while (!document.querySelector('.iw, .stage, .win')) await wait(50);
     await wait(300);
     switch (scenario) {
       case 'listen':
@@ -1703,15 +1876,21 @@ export async function install(scenario: string) {
         break;
       }
       case 'settings':
+      case 'journal': {
         click('.iw');
         await wait(500);
-        click('.cbar .ib:nth-last-child(2)');
+        // `&notice`: the chat stays, with the notice of a run that was cut short.
+        if (scenario === 'journal' && params.has('notice')) break;
+        // The settings button: the last one of an ordinary window, the one before «close» in the island.
+        click(windowed ? '.cbar .ib:last-child' : '.cbar .ib:nth-last-child(2)');
         await wait(500);
-        if (params.get('page')) {
-          const pages = ['persona', 'providers', 'permissions', 'tools', 'memory', 'extensions', 'voice', 'island', 'hotkeys', 'costs', 'general'];
-          click(`.side nav button:nth-child(${pages.indexOf(params.get('page')!) + 1})`);
+        const page =scenario === 'journal' ? 'journal' : params.get('page');
+        if (page) {
+          const pages = ['persona', 'providers', 'permissions', 'tools', 'memory', 'extensions', 'voice', 'island', 'hotkeys', 'costs', 'journal', 'general'];
+          click(`.side nav button:nth-child(${pages.indexOf(page) + 1})`);
         }
         break;
+      }
       default:
         break;
     }

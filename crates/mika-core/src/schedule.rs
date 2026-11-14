@@ -163,13 +163,22 @@ impl ReminderStore {
         kind: ReminderKind,
         repeat: Repeat,
     ) -> Result<i64, DbError> {
-        self.db.with(|c| {
+        let id = self.db.with(|c| {
             c.execute(
                 "INSERT INTO reminders (created_at, due_at, text, kind, repeat) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![now(), due_at, text.trim(), kind.as_str(), repeat.encode()],
             )?;
             Ok(c.last_insert_rowid())
-        })
+        })?;
+        // What to remind of is the user's text: the record has its size only.
+        log::info!(
+            "reminder set: id={id} kind={} repeat={} due_in_s={} chars={}",
+            kind.as_str(),
+            repeat.encode(),
+            due_at - Local::now().timestamp(),
+            text.trim().chars().count()
+        );
+        Ok(id)
     }
 
     /// Open reminders, the nearest first.
@@ -202,9 +211,14 @@ impl ReminderStore {
     }
 
     pub fn cancel(&self, id: i64) -> Result<bool, DbError> {
-        self.db
+        let cancelled = self
+            .db
             .with(|c| c.execute("DELETE FROM reminders WHERE id = ?1 AND done = 0", [id]))
-            .map(|n| n > 0)
+            .map(|n| n > 0)?;
+        if cancelled {
+            log::info!("reminder cancelled: id={id}");
+        }
+        Ok(cancelled)
     }
 
     /// Reminders whose time has come. One-shot ones are closed, repeating ones move
@@ -224,6 +238,10 @@ impl ReminderStore {
     }
 }
 
+/// How often a store that keeps failing is written to the journal, in looks
+/// of the scheduler: every ten minutes.
+const FAILURE_NOTE_EVERY: u64 = 600;
+
 /// Checks the store every second and publishes `Event::ReminderFired`.
 /// For `ReminderKind::Task` it also calls `on_task` with the text.
 pub async fn run_scheduler(
@@ -233,17 +251,36 @@ pub async fn run_scheduler(
 ) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Looks in a row that failed: the store is asked every second, the
+    // journal is told at the first failure and then once in a while.
+    let mut failed: u64 = 0;
     loop {
         tick.tick().await;
         let now = Local::now().timestamp();
         let due = match store.take_due(now) {
             Ok(d) => d,
             Err(e) => {
-                log::error!("cannot read reminders: {e}");
+                if failed.is_multiple_of(FAILURE_NOTE_EVERY) {
+                    log::error!(
+                        "cannot read reminders, none fires: failed_looks={failed} error={e}"
+                    );
+                }
+                failed += 1;
                 continue;
             }
         };
+        if failed > 0 {
+            log::info!("reminders are read again: failed_looks={failed}");
+            failed = 0;
+        }
         for r in due {
+            log::info!(
+                "reminder fired: id={} kind={} repeat={} late_s={}",
+                r.id,
+                r.kind.as_str(),
+                r.repeat.encode(),
+                (now - r.due_at).max(0)
+            );
             bus.publish(Event::ReminderFired {
                 id: r.id,
                 text: r.text.clone(),

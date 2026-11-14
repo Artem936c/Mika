@@ -246,7 +246,8 @@ impl AudioProcessTool {
         if job.trim {
             let argv = args::silence_args(&job.input, "-50dB", "0.3");
             let out = run_ffmpeg(
-                runner, &paths, &argv, None, total, detect_w, &progress, &cancel, timeout,
+                "av_audio", runner, &paths, &argv, None, total, detect_w, &progress, &cancel,
+                timeout,
             )
             .await?;
             match trim_edges(&parse_silences(&out.stderr), total)? {
@@ -293,7 +294,8 @@ impl AudioProcessTool {
         let measured = if job.normalize {
             let argv = args::loudnorm_measure_args(&job.input, &opts, &filters);
             let out = run_ffmpeg(
-                runner, &paths, &argv, None, kept, measure_w, &progress, &cancel, timeout,
+                "av_audio", runner, &paths, &argv, None, kept, measure_w, &progress, &cancel,
+                timeout,
             )
             .await?;
             Some(parse_loudnorm(&out.stderr).ok_or_else(|| {
@@ -313,6 +315,7 @@ impl AudioProcessTool {
             part.path(),
         );
         run_ffmpeg(
+            "av_audio",
             runner,
             &paths,
             &argv,
@@ -480,6 +483,7 @@ impl Tool for VideoSubtitlesTool {
         let argv = args::subtitles_args(&job.input, &filter, &codec, part.path());
         let duration = job.info.duration();
         run_ffmpeg(
+            "av_audio",
             runner,
             &paths,
             &argv,

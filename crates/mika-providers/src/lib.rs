@@ -12,5 +12,6 @@ pub mod speech;
 pub mod sse;
 pub mod telegram;
 mod text;
+mod trace;
 
 pub use factory::{build_or_placeholder, build_provider, probe, redact};

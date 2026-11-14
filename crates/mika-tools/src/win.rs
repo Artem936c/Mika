@@ -3,6 +3,7 @@
 mod audio;
 mod browser;
 mod clipboard;
+mod front;
 mod http;
 mod input;
 mod launcher;

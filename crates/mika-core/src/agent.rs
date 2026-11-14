@@ -20,7 +20,7 @@ use crate::memory::Recall;
 use crate::state::{AssistantState, StateHandle};
 use crate::storage::Db;
 use crate::task::{TaskBoard, TASK_MAX_STEPS};
-use crate::tools::{with_progress, ToolError, ToolRegistry};
+use crate::tools::{with_progress, RiskLevel, ToolError, ToolRegistry};
 
 /// LLM calls per user message. A task with a plan gets `task::TASK_MAX_STEPS`.
 pub const MAX_STEPS: usize = 14;
@@ -94,6 +94,198 @@ pub enum AgentError {
     Looping,
 }
 
+impl AgentError {
+    /// The kind of the error as the journal names it.
+    fn kind(&self) -> &'static str {
+        match self {
+            AgentError::Llm(e) => e.kind(),
+            AgentError::Cancelled => "stopped",
+            AgentError::TooManySteps => "too_many_steps",
+            AgentError::Looping => "looping",
+        }
+    }
+}
+
+/// What a turn did, for its last record in the journal.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TurnStats {
+    /// Requests to the model.
+    steps: usize,
+    /// Tool calls the model asked for.
+    tools: usize,
+}
+
+/// `turn=N ` for a record, or nothing for a turn without a number.
+fn turn_field(turn: Option<u64>) -> String {
+    turn.map_or_else(String::new, |turn| format!("turn={turn} "))
+}
+
+/// The last record of a turn: how it ended, how long it took, what it did.
+/// The reply itself is the model's text: its size is always written, its
+/// beginning only while texts are (`content`).
+fn turn_line(
+    result: &Result<(String, Option<String>), AgentError>,
+    stats: TurnStats,
+    ms: u128,
+    turn: Option<u64>,
+    content: bool,
+) -> (log::Level, String) {
+    let did = format!("ms={ms} steps={} tools={}", stats.steps, stats.tools);
+    let turn = turn_field(turn);
+    match result {
+        Ok((reply, _)) => {
+            let mut line = format!(
+                "turn finished: {turn}outcome=ok {did} reply_chars={}",
+                reply.chars().count()
+            );
+            if content {
+                line.push_str(" reply=");
+                line.push_str(&crate::journal::guarded_if(true, reply));
+            }
+            (log::Level::Info, line)
+        }
+        Err(AgentError::Cancelled) => (
+            log::Level::Info,
+            format!("turn finished: {turn}outcome=stopped {did}"),
+        ),
+        Err(e) => {
+            let text = match e {
+                AgentError::Llm(e) => {
+                    let status = match e {
+                        LlmError::Http { status, .. } => format!("http={status} "),
+                        _ => String::new(),
+                    };
+                    format!("{status}error={}", e.journal_text())
+                }
+                other => format!("error={}", crate::journal::error_text(other)),
+            };
+            (
+                log::Level::Error,
+                format!(
+                    "turn finished: {turn}outcome=error kind={} {did} {text}",
+                    e.kind()
+                ),
+            )
+        }
+    }
+}
+
+/// What the journal says about one tool call besides its name and time.
+#[derive(Debug, Clone, PartialEq)]
+struct CallNote {
+    /// Not known for a call that never got to its assessment.
+    risk: Option<RiskLevel>,
+    /// `rule`, `asked_yes`, `asked_always`, `denied`, `stopped`; `-` when the
+    /// gate was never asked.
+    decision: &'static str,
+    /// `ok`, `error`, `denied`, `stopped`, `unknown_tool`, `bad_arguments`,
+    /// `not_ready`, `blind_zone`. It is also the kind of the error: the text
+    /// of the error is written only while texts are.
+    outcome: &'static str,
+    /// The text of the error, already made fit for a record.
+    error: Option<String>,
+    /// The blind zone refused the call: nothing of it is written, neither
+    /// the error nor the arguments, which may hold what was to be typed
+    /// into that window.
+    blind: bool,
+}
+
+impl CallNote {
+    fn new(outcome: &'static str) -> Self {
+        Self {
+            risk: None,
+            decision: "-",
+            outcome,
+            error: None,
+            blind: false,
+        }
+    }
+
+    fn risk(mut self, risk: RiskLevel) -> Self {
+        self.risk = Some(risk);
+        self
+    }
+
+    fn decision(mut self, decision: &'static str) -> Self {
+        self.decision = decision;
+        self
+    }
+
+    fn outcome(mut self, outcome: &'static str) -> Self {
+        self.outcome = outcome;
+        self
+    }
+
+    /// The error of the call. What a tool says when it fails quotes what
+    /// it was given and what it saw (titles of the open windows, what a
+    /// window shows, paths), so the text is written only while texts are
+    /// (`content`). The refusal of the blind zone is told by what it is and
+    /// leaves no text at all.
+    fn error(mut self, error: &dyn std::fmt::Display, content: bool) -> Self {
+        if crate::journal::is_blind_refusal(error) {
+            self.outcome = "blind_zone";
+            self.blind = true;
+            self.error = None;
+        } else {
+            self.error = Some(crate::journal::guarded_error_if(content, error));
+        }
+        self
+    }
+
+    /// A call that ended the way it was meant to: done, refused by the user
+    /// or stopped by him.
+    fn expected(&self) -> bool {
+        matches!(self.outcome, "ok" | "denied" | "stopped")
+    }
+}
+
+/// Longest name of a tool in a record: a name the model made up may be long.
+const MAX_LOGGED_NAME: usize = 64;
+
+/// The record that a tool starts to run, after the gate let it through. A
+/// hang or a crash in the middle of a call leaves this one behind.
+fn call_started_line(name: &str, note: &CallNote, turn: Option<u64>) -> String {
+    let name: String = name.chars().take(MAX_LOGGED_NAME).collect();
+    format!(
+        "tool call started: {}tool={name} risk={} decision={}",
+        turn_field(turn),
+        note.risk.map_or("-", RiskLevel::as_str),
+        note.decision
+    )
+}
+
+/// The record of one tool call. `args` are the arguments as they go into the
+/// record: given only while texts are allowed.
+fn call_line(
+    name: &str,
+    note: &CallNote,
+    ms: u128,
+    args: Option<&str>,
+    turn: Option<u64>,
+) -> String {
+    let name: String = name.chars().take(MAX_LOGGED_NAME).collect();
+    let mut line = format!(
+        "tool call finished: {}tool={name} risk={} decision={} ms={ms} outcome={}",
+        turn_field(turn),
+        note.risk.map_or("-", RiskLevel::as_str),
+        note.decision,
+        note.outcome
+    );
+    if let Some(args) = args {
+        line.push_str(" args=");
+        line.push_str(if note.blind {
+            crate::journal::BLIND_MARK
+        } else {
+            args
+        });
+    }
+    if let Some(error) = &note.error {
+        line.push_str(" error=");
+        line.push_str(error);
+    }
+    line
+}
+
 /// Longest reply text of one step, characters: past it the model is rambling.
 const MAX_REPLY: usize = 12_000;
 
@@ -164,7 +356,11 @@ pub fn system_prompt(assistant: &AssistantConfig) -> String {
 В самом начале ответа можешь поставить одну метку эмоции в квадратных скобках: \
 [joy] радость, [shy] смущение, [surprise] удивление, [sad] грусть, [angry] сердишься, \
 [think] задумалась, [wink] шутишь, [sleepy] сонная, [worry] тревога. \
-Ставь метку, только когда эмоция уместна. Пользователь метку не видит, не упоминай её.",
+Ставь метку, только когда эмоция уместна. Пользователь метку не видит, не упоминай её. \
+Ты сама решаешь, что прозвучит голосом. Длинный ответ голос не зачитывает, а говорит его короткий пересказ. \
+Если ответ должен прозвучать целиком, слово в слово (анекдот, шутка, стихотворение, сказка, история, \
+тост, поздравление, или тебя попросили прочитать что-то вслух), поставь в самом начале метку [aloud], \
+рядом с меткой эмоции. Такой текст рассказывай полностью, а не описывай его. Эту метку пользователь тоже не видит.",
         name = assistant.name,
         persona = assistant.persona_prompt(),
     )
@@ -211,6 +407,12 @@ fn is_emoji_tag(inner: &str) -> bool {
             .all(|c| (c as u32 >= 0x2600 && !c.is_alphanumeric()) || c == '\u{200d}')
 }
 
+/// The tag at the very start of a reply that asks the voice to say it whole,
+/// however long: a joke, a poem, a story (decision 0037).
+fn is_whole_tag(inner: &str) -> bool {
+    matches!(inner.trim().to_lowercase().as_str(), "aloud" | "вслух")
+}
+
 /// Cuts emotion tags like `[joy]` out of streamed reply text.
 ///
 /// A tag may arrive split across chunks, so text after `[` is held back until `]`
@@ -227,6 +429,10 @@ pub struct TagFilter {
     last: Option<char>,
     /// The character given out before the held `[`.
     before: Option<char>,
+    /// `[aloud]` stood at the start and nobody has taken it yet.
+    whole: bool,
+    /// Words were given out, not only voice directions: the start is over.
+    worded: bool,
 }
 
 impl TagFilter {
@@ -249,6 +455,7 @@ impl TagFilter {
                 continue;
             }
             self.started = true;
+            self.worded |= !ch.is_whitespace();
             self.last = Some(ch);
             out.push(ch);
         }
@@ -276,10 +483,20 @@ impl TagFilter {
                 continue;
             }
             match ch {
+                // Before the directions: `[aloud]` is words in brackets too,
+                // and the voice must not get it as one.
+                ']' if !self.worded && is_whole_tag(&self.held[1..]) => {
+                    self.held.clear();
+                    self.whole = true;
+                    self.skip_space = true;
+                }
                 ']' if self.direction(&self.held[1..]) => {
                     let held = std::mem::take(&mut self.held);
+                    // A direction in front of `[aloud]` is not the words yet.
+                    let worded = self.worded;
                     self.emit(&mut out, &held);
                     self.emit(&mut out, "]");
+                    self.worded = worded;
                 }
                 ']' => {
                     let held = std::mem::take(&mut self.held);
@@ -314,6 +531,11 @@ impl TagFilter {
             }
         }
         (out, cues)
+    }
+
+    /// Whether the reply asked to be said whole since the last call.
+    pub fn take_whole(&mut self) -> bool {
+        std::mem::take(&mut self.whole)
     }
 
     /// Text still held back when the stream ends.
@@ -507,6 +729,7 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<String, AgentError> {
         let _turn = self.turn.lock().await;
+        let started = Instant::now();
         let text = text.trim();
         self.bus.publish(Event::UserText {
             text: shown.trim().into(),
@@ -528,10 +751,19 @@ impl Agent {
             b.clear();
         }
         let mut new_msgs = vec![ChatMessage::user(text)];
-        let result = self.run_steps(&mut new_msgs, &cancel).await;
+        let mut stats = TurnStats::default();
+        let result = self.run_steps(&mut new_msgs, &cancel, &mut stats).await;
         if let Some(b) = &board {
             b.finish(result.is_err());
         }
+        let (level, line) = turn_line(
+            &result,
+            stats,
+            started.elapsed().as_millis(),
+            crate::journal::turn(),
+            crate::journal::content_allowed(),
+        );
+        log::log!(level, "{line}");
 
         match &result {
             Ok((reply, spoken)) => {
@@ -571,6 +803,7 @@ impl Agent {
         F: std::future::Future<Output = Result<String, String>> + Send,
     {
         let _turn = self.turn.lock().await;
+        let started = Instant::now();
         let shown = shown.trim();
         self.bus.publish(Event::UserText { text: shown.into() });
         self.state.set(AssistantState::Thinking);
@@ -589,6 +822,12 @@ impl Agent {
         };
         let reply = match outcome {
             Some(Ok(reply)) => {
+                log::info!(
+                    "turn finished: {}outcome=ok ms={} direct=true reply_chars={}",
+                    crate::journal::turn_field(),
+                    started.elapsed().as_millis(),
+                    reply.chars().count()
+                );
                 self.bus.publish(Event::AssistantText {
                     text: reply.clone(),
                     spoken: None,
@@ -600,11 +839,33 @@ impl Agent {
                 Some(reply)
             }
             Some(Err(message)) => {
+                // The reason may quote what the model sent or what was on
+                // the screen: written only while texts are. Its kind is
+                // always written; what made the answer wrote the cause in a
+                // record of its own before this one.
+                let kind = if message == EMPTY_DIRECT_REPLY {
+                    "empty_answer"
+                } else {
+                    "failed"
+                };
+                log::error!(
+                    "turn finished: {}outcome=error error_kind={kind} ms={} direct=true error={}",
+                    crate::journal::turn_field(),
+                    started.elapsed().as_millis(),
+                    crate::journal::guarded(&message)
+                );
                 self.bus.publish(Event::Error { message });
                 None
             }
             // Stopped by the user: nothing more is said and nothing is kept.
-            None => None,
+            None => {
+                log::info!(
+                    "turn finished: {}outcome=stopped ms={} direct=true",
+                    crate::journal::turn_field(),
+                    started.elapsed().as_millis()
+                );
+                None
+            }
         };
         self.state.set(AssistantState::Idle);
         reply
@@ -621,7 +882,7 @@ impl Agent {
         if let Some((db, conv)) = &self.store {
             for m in &msgs {
                 if let Err(e) = db.append_message(conv, m) {
-                    log::warn!("cannot save message: {e}");
+                    log::warn!("cannot save a message of the conversation: {e}");
                 }
             }
         }
@@ -634,6 +895,7 @@ impl Agent {
         &self,
         msgs: &mut Vec<ChatMessage>,
         cancel: &CancellationToken,
+        stats: &mut TurnStats,
     ) -> Result<(String, Option<String>), AgentError> {
         let mut step = 0;
         let mut nudges = 0;
@@ -647,9 +909,11 @@ impl Agent {
                 // The next step finds its marks anew: so must the speaker.
                 self.bus.publish(Event::StepStarted);
             }
+            stats.steps += 1;
             let (text, spoken, calls) = self.one_step(msgs, cancel, step == 0).await?;
             marked = spoken.is_some();
             step += 1;
+            stats.tools += calls.len();
             if calls.is_empty() {
                 // Small models end a turn in silence after tools, or promise
                 // «подожди секунду» and stop: remind them to act or to report.
@@ -657,6 +921,10 @@ impl Agent {
                 let stalled = text.trim().is_empty() || (promises_action(&text) && !backgrounded);
                 if stalled && nudges < MAX_NUDGES {
                     nudges += 1;
+                    log::info!(
+                        "the model stopped without an answer, reminded: step={step} empty={}",
+                        text.trim().is_empty()
+                    );
                     if !text.is_empty() {
                         msgs.push(ChatMessage::assistant(text));
                     }
@@ -672,6 +940,10 @@ impl Agent {
                     .unwrap_or_default();
                 if !open.is_empty() && nudges < MAX_NUDGES {
                     nudges += 1;
+                    log::info!(
+                        "the model left plan steps open, reminded: step={step} open={}",
+                        open.len()
+                    );
                     if !text.is_empty() {
                         msgs.push(ChatMessage::assistant(text));
                     }
@@ -784,7 +1056,7 @@ impl Agent {
             if waiting_first && matches!(chunk, Some(Ok(_))) {
                 waiting_first = false;
                 let ms = asked.elapsed().as_millis() as u64;
-                log::info!("first piece of the answer after {ms} ms");
+                log::info!("first piece of the answer: ms={ms}");
                 self.bus.publish(Event::Timing {
                     stage: "llm".into(),
                     ms,
@@ -806,7 +1078,10 @@ impl Agent {
                     route(self, &mut text, speech.as_mut(), clean, spoken);
                     let raw_loop = raw_chars > MAX_RAW || (t.contains('\n') && repeating(&raw));
                     if raw_loop || looping(&text) {
-                        log::warn!("the model is looping, the reply is stopped");
+                        log::warn!(
+                            "the model is looping, the reply is stopped: raw_chars={raw_chars} shown_chars={}",
+                            text.chars().count()
+                        );
                         return Err(AgentError::Looping);
                     }
                 }
@@ -858,6 +1133,10 @@ impl Agent {
         end: bool,
     ) -> (String, String) {
         let (mut kept, cues) = tags.push(&text);
+        // Before the text it stands in front of: the speaker must know in time.
+        if tags.take_whole() {
+            self.bus.publish(Event::SayWhole);
+        }
         for emotion in cues {
             self.bus.publish(Event::EmotionCue { emotion });
         }
@@ -954,7 +1233,8 @@ impl Agent {
         let started = Instant::now();
         let Some(tool) = self.registry().get(&call.name) else {
             let msg = format!("Ошибка: инструмента `{}` нет.", call.name);
-            self.finish(call, false, &msg, None, started);
+            let note = CallNote::new("unknown_tool");
+            self.finish(call, false, &msg, None, started, &note, None);
             return msg;
         };
         let args = match &call.arguments {
@@ -966,37 +1246,63 @@ impl Agent {
         } else {
             args
         };
+        // The arguments are the user's and the model's: written only while
+        // texts are allowed, and never when they read like the blind zone or
+        // when the blind zone refused the call.
+        let content = crate::journal::content_allowed();
+        let logged_args = content.then(|| crate::journal::guarded_if(true, &args.to_string()));
+        let logged_args = logged_args.as_deref();
         let assessment = match tool.assess(&args) {
             Ok(a) => a,
             Err(ToolError::NotReady { message, data }) => {
                 let msg = format!("Ошибка: {message}");
-                self.finish(call, false, &msg, Some(data), started);
+                let note = CallNote::new("not_ready").error(&message, content);
+                self.finish(call, false, &msg, Some(data), started, &note, logged_args);
                 return msg;
             }
             Err(e) => {
                 let msg = format!("Ошибка: {e}");
-                self.finish(call, false, &msg, None, started);
+                let outcome = match e {
+                    ToolError::BadArguments(_) => "bad_arguments",
+                    _ => "error",
+                };
+                let note = CallNote::new(outcome).error(&e, content);
+                self.finish(call, false, &msg, None, started, &note, logged_args);
                 return msg;
             }
         };
+        let risk = assessment.level;
         self.bus.publish(Event::ToolStarted {
             id: call.id.clone(),
             name: call.name.clone(),
             summary: assessment.summary.clone(),
         });
 
+        let mut stopped = false;
         let decision = tokio::select! {
-            _ = cancel.cancelled() => GateDecision::Denied("остановлено пользователем".into()),
+            _ = cancel.cancelled() => {
+                stopped = true;
+                GateDecision::Denied("остановлено пользователем".into())
+            }
             d = self.gate.check(&call.name, &args, &assessment) => d,
         };
         let approval = match decision {
             GateDecision::Approved(a) => a,
             GateDecision::Denied(reason) => {
                 let msg = format!("Действие не выполнено: {reason}.");
-                self.finish(call, false, &msg, None, started);
+                // Who refused is in the record of the gate, just before this one.
+                let said = if stopped { "stopped" } else { "denied" };
+                let note = CallNote::new(said).risk(risk).decision(said);
+                self.finish(call, false, &msg, None, started, &note, logged_args);
                 return msg;
             }
         };
+        let decided = CallNote::new("ok").risk(risk).decision(approval.how());
+        log::info!(
+            target: "tool",
+            "{}",
+            call_started_line(&call.name, &decided, crate::journal::turn())
+        );
         self.state.set(AssistantState::Thinking);
         // "Stop" ends the wait for any tool, even one that does not watch its token.
         let run = with_progress(
@@ -1004,20 +1310,37 @@ impl Agent {
             self.bus.clone(),
             tool.run(args, approval, cancel.child_token()),
         );
-        let (ok, text, data) = tokio::select! {
-            _ = cancel.cancelled() => (false, "Остановлено пользователем.".to_string(), None),
+        let (ok, text, data, note) = tokio::select! {
+            _ = cancel.cancelled() => (
+                false,
+                "Остановлено пользователем.".to_string(),
+                None,
+                decided.outcome("stopped"),
+            ),
             r = run => match r {
-                Ok(out) => (true, out.text, out.data),
+                Ok(out) => (true, out.text, out.data, decided),
                 Err(ToolError::NotReady { message, data }) => {
-                    (false, format!("Ошибка: {message}"), Some(data))
+                    let note = decided.outcome("not_ready").error(&message, content);
+                    (false, format!("Ошибка: {message}"), Some(data), note)
                 }
-                Err(e) => (false, format!("Ошибка: {e}"), None),
+                Err(ToolError::Cancelled) => (
+                    false,
+                    format!("Ошибка: {}", ToolError::Cancelled),
+                    None,
+                    decided.outcome("stopped"),
+                ),
+                Err(e) => {
+                    let note = decided.outcome("error").error(&e, content);
+                    (false, format!("Ошибка: {e}"), None, note)
+                }
             },
         };
-        self.finish(call, ok, &text, data, started);
+        self.finish(call, ok, &text, data, started, &note, logged_args);
         truncate(&text, MAX_TOOL_RESULT)
     }
 
+    /// Tells the chat that a call has ended and writes its record.
+    #[allow(clippy::too_many_arguments)]
     fn finish(
         &self,
         call: &ToolCall,
@@ -1025,7 +1348,21 @@ impl Agent {
         output: &str,
         data: Option<Value>,
         started: Instant,
+        note: &CallNote,
+        logged_args: Option<&str>,
     ) {
+        let line = call_line(
+            &call.name,
+            note,
+            started.elapsed().as_millis(),
+            logged_args,
+            crate::journal::turn(),
+        );
+        if note.expected() {
+            log::info!(target: "tool", "{line}");
+        } else {
+            log::warn!(target: "tool", "{line}");
+        }
         self.bus.publish(Event::ToolFinished {
             id: call.id.clone(),
             name: call.name.clone(),
@@ -1074,7 +1411,7 @@ fn unmark_args(name: &str, mut args: Value) -> Value {
         }
     }
     if cut {
-        log::info!("voice marks cut from the arguments of {name}");
+        log::debug!("voice marks cut from the arguments: tool={name}");
     }
     args
 }
@@ -1101,6 +1438,196 @@ pub fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_record_of_a_turn_has_its_size_and_never_its_text() {
+        let stats = TurnStats { steps: 3, tools: 2 };
+        let done = Ok(("тайный ответ".to_string(), None));
+        assert_eq!(
+            turn_line(&done, stats, 1500, None, false),
+            (
+                log::Level::Info,
+                "turn finished: outcome=ok ms=1500 steps=3 tools=2 reply_chars=12".to_string()
+            )
+        );
+        // The number of the turn ties the record to those of its requests
+        // and tool calls; the reply joins it only while texts are written.
+        assert_eq!(
+            turn_line(&done, stats, 1500, Some(7), true).1,
+            "turn finished: turn=7 outcome=ok ms=1500 steps=3 tools=2 reply_chars=12 reply=тайный ответ"
+        );
+        let blind = Ok(("Открой окно «Вход в банк»".to_string(), None));
+        let (_, line) = turn_line(&blind, stats, 1, Some(7), true);
+        assert!(!line.contains("банк"), "{line}");
+        assert_eq!(
+            turn_line(&Err(AgentError::Cancelled), stats, 7, Some(8), true),
+            (
+                log::Level::Info,
+                "turn finished: turn=8 outcome=stopped ms=7 steps=3 tools=2".to_string()
+            )
+        );
+        let refused = Err(AgentError::Llm(LlmError::Http {
+            status: 401,
+            body: "invalid api key".into(),
+        }));
+        assert_eq!(
+            turn_line(&refused, stats, 90, None, false),
+            (
+                log::Level::Error,
+                "turn finished: outcome=error kind=http ms=90 steps=3 tools=2 http=401 error=invalid api key"
+                    .to_string()
+            )
+        );
+        // What the model sent stays out while texts are off; what the
+        // parser said about it is written.
+        let broken = Err(AgentError::Llm(LlmError::BadJson {
+            why: "expected value at line 1 column 1".into(),
+            data: "привет".into(),
+        }));
+        let (level, line) = turn_line(&broken, stats, 1, None, false);
+        assert_eq!(level, log::Level::Error);
+        assert!(line.contains("kind=bad_json"), "{line}");
+        assert!(
+            line.ends_with("error=expected value at line 1 column 1 data=<hidden 6 chars>"),
+            "{line}"
+        );
+        // What the provider says about its own refusal is written, in the
+        // answer as in the status.
+        let overloaded = Err(AgentError::Llm(LlmError::Provider(
+            "{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}".into(),
+        )));
+        let (_, line) = turn_line(&overloaded, stats, 1, Some(3), false);
+        assert!(
+            line.starts_with("turn finished: turn=3 outcome=error kind=provider_error "),
+            "{line}"
+        );
+        assert!(line.ends_with("\"message\":\"Overloaded\"}"), "{line}");
+        let empty = Err(AgentError::Llm(LlmError::Protocol("пустой ответ".into())));
+        let (_, line) = turn_line(&empty, stats, 1, None, false);
+        assert!(
+            line.ends_with("kind=protocol ms=1 steps=3 tools=2 error=пустой ответ"),
+            "{line}"
+        );
+        let (_, line) = turn_line(&Err(AgentError::TooManySteps), stats, 1, None, false);
+        assert!(line.contains("kind=too_many_steps"), "{line}");
+        let (_, line) = turn_line(&Err(AgentError::Looping), stats, 1, None, false);
+        assert!(line.contains("kind=looping"), "{line}");
+    }
+
+    #[test]
+    fn the_record_of_a_tool_call_names_risk_decision_time_and_outcome() {
+        let ok = CallNote::new("ok")
+            .risk(RiskLevel::Medium)
+            .decision("asked_yes");
+        assert!(ok.expected());
+        assert_eq!(
+            call_line("av_convert", &ok, 5321, None, None),
+            "tool call finished: tool=av_convert risk=medium decision=asked_yes ms=5321 outcome=ok"
+        );
+        assert_eq!(
+            call_started_line("av_convert", &ok, Some(4)),
+            "tool call started: turn=4 tool=av_convert risk=medium decision=asked_yes"
+        );
+        // Arguments join the record only when the caller gives them: while
+        // texts are written.
+        assert_eq!(
+            call_line("echo", &ok, 1, Some("{\"text\":\"x\"}"), Some(4)),
+            "tool call finished: turn=4 tool=echo risk=medium decision=asked_yes ms=1 outcome=ok args={\"text\":\"x\"}"
+        );
+        let failed = CallNote::new("error")
+            .risk(RiskLevel::Low)
+            .decision("rule")
+            .error(&ToolError::Failed("диск полон".into()), true);
+        assert!(!failed.expected());
+        assert_eq!(
+            call_line("note_create", &failed, 12, None, None),
+            "tool call finished: tool=note_create risk=low decision=rule ms=12 outcome=error error=диск полон"
+        );
+        // A call that never reached its assessment has no risk and no decision.
+        let unknown = CallNote::new("unknown_tool");
+        let name = "x".repeat(200);
+        let line = call_line(&name, &unknown, 0, None, None);
+        assert_eq!(
+            line,
+            format!(
+                "tool call finished: tool={} risk=- decision=- ms=0 outcome=unknown_tool",
+                "x".repeat(64)
+            )
+        );
+        for outcome in ["denied", "stopped"] {
+            assert!(CallNote::new(outcome).expected(), "{outcome}");
+        }
+        for outcome in ["error", "bad_arguments", "not_ready", "unknown_tool"] {
+            assert!(!CallNote::new(outcome).expected(), "{outcome}");
+        }
+    }
+
+    #[test]
+    fn the_error_of_a_tool_is_not_written_while_texts_are_off() {
+        // What `ui_*` tools say when the window is not found: the titles
+        // of every open window.
+        let windows = ToolError::Failed(
+            "нет окна «отчёт». Открытые окна: «Письмо Ане — Почта» (mail), «Зарплата.xlsx» (excel)"
+                .into(),
+        );
+        let off = CallNote::new("error")
+            .risk(RiskLevel::Medium)
+            .decision("rule")
+            .error(&windows, false);
+        let line = call_line("ui_click", &off, 3, None, Some(2));
+        assert_eq!(
+            line,
+            "tool call finished: turn=2 tool=ui_click risk=medium decision=rule ms=3 outcome=error error=<hidden 85 chars>"
+        );
+        for part in ["Письмо", "Зарплата", "отчёт", "mail"] {
+            assert!(!line.contains(part), "{line}");
+        }
+        // The kind of the error is the outcome, and that is always written.
+        let bad = CallNote::new("bad_arguments")
+            .error(&ToolError::BadArguments("нет поля `path`".into()), false);
+        assert_eq!(
+            call_line("file_read", &bad, 0, None, None),
+            "tool call finished: tool=file_read risk=- decision=- ms=0 outcome=bad_arguments error=<hidden 35 chars>"
+        );
+        // With texts on the text is there.
+        let on = CallNote::new("error").error(&windows, true);
+        assert!(on.error.as_deref().is_some_and(|e| e.contains("Зарплата")));
+    }
+
+    #[test]
+    fn a_call_the_blind_zone_refused_leaves_neither_its_error_nor_its_arguments() {
+        for content in [false, true] {
+            let refused = CallNote::new("error")
+                .risk(RiskLevel::Medium)
+                .decision("rule")
+                .error(
+                    &ToolError::Failed(crate::policy::blind::BLIND_REFUSAL.to_string()),
+                    content,
+                );
+            assert_eq!(refused.outcome, "blind_zone");
+            assert_eq!(refused.error, None);
+            assert!(!refused.expected());
+            // What was to be typed into that window is in the arguments.
+            let args = content.then_some("{\"text\":\"zq-typed-into-the-window\"}");
+            let line = call_line("ui_type", &refused, 5, args, None);
+            assert!(!line.contains("zq-typed"), "{line}");
+            assert!(!line.contains("error="), "{line}");
+            assert!(line.contains("outcome=blind_zone"), "{line}");
+            assert_eq!(line.contains("args=<blind zone>"), content, "{line}");
+        }
+        // A text that only has a word of the blind zone in it is an error
+        // like any other, and its text is never written.
+        for content in [false, true] {
+            let titled = CallNote::new("error").error(
+                &ToolError::Failed("окно «Вход в банк — Chrome» не найдено".into()),
+                content,
+            );
+            assert_eq!(titled.outcome, "error");
+            let error = titled.error.unwrap();
+            assert!(error.starts_with("<hidden"), "{error}");
+            assert!(!error.contains("банк"), "{error}");
+        }
+    }
 
     #[test]
     fn a_reply_going_round_in_circles_is_caught() {
@@ -1704,6 +2231,89 @@ Actually, I'll call generate_image.
         assert!(cues.is_empty());
         let mut f = TagFilter::default();
         assert_eq!(f.push("[Sparkle] Привет").0, "[Sparkle] Привет");
+    }
+
+    #[test]
+    fn the_whole_tag_is_cut_at_the_start_and_noticed_once() {
+        for (reply, cues) in [
+            ("[aloud] Жили-были дед да баба.", vec![]),
+            ("[joy] [aloud] Жили-были дед да баба.", vec![Emotion::Joy]),
+            ("[aloud][wink]\nЖили-были дед да баба.", vec![Emotion::Wink]),
+            ("[Вслух] Жили-были дед да баба.", vec![]),
+        ] {
+            let mut f = TagFilter::default();
+            let (out, found) = f.push(reply);
+            assert_eq!(out, "Жили-были дед да баба.", "{reply}");
+            assert_eq!(found, cues, "{reply}");
+            assert!(f.take_whole(), "{reply}");
+            assert!(!f.take_whole(), "{reply}");
+        }
+        // With voice marks on, a direction stays for the mark filter, and the
+        // tag is cut on either side of it: the voice never gets `[aloud]`.
+        for (reply, kept) in [
+            ("[aloud] Жили-были.", "Жили-были."),
+            ("[joy] [aloud] Жили-были.", "[joy] Жили-были."),
+            ("[aloud] [softly] Жили-были.", "[softly] Жили-были."),
+        ] {
+            let mut f = TagFilter::keeping_directions();
+            assert_eq!(f.push(reply).0, kept, "{reply}");
+            assert!(f.take_whole(), "{reply}");
+        }
+        let mut f = TagFilter::keeping_directions();
+        assert_eq!(
+            f.push("[softly] Жили-были. [aloud] Вот.").0,
+            "[softly] Жили-были. [aloud] Вот."
+        );
+        assert!(!f.take_whole());
+        // Split across chunks.
+        let mut f = TagFilter::default();
+        assert_eq!(f.push("[alo").0, "");
+        assert!(!f.take_whole());
+        assert_eq!(f.push("ud] Раз.").0, "Раз.");
+        assert!(f.take_whole());
+        // Only at the very start: later it is text like any other.
+        let mut f = TagFilter::default();
+        assert_eq!(f.push("Скажу [aloud] потом.").0, "Скажу [aloud] потом.");
+        assert!(!f.take_whole());
+        // No tag, no request.
+        let mut f = TagFilter::default();
+        f.push("[joy] Привет!");
+        assert!(!f.take_whole());
+    }
+
+    #[tokio::test]
+    async fn the_whole_tag_reaches_the_speaker_before_the_text() {
+        let p = FakeProvider::new(vec![Some(vec![
+            text("[alo"),
+            text("ud] Жили"),
+            text("-были."),
+        ])]);
+        let (a, mut rx, _) = agent(p);
+        assert_eq!(
+            a.handle("расскажи сказку", CancellationToken::new()).await,
+            Ok("Жили-были.".into())
+        );
+        let ev = drain(&mut rx);
+        let whole = ev.iter().position(|e| *e == Event::SayWhole).unwrap();
+        let first = ev
+            .iter()
+            .position(|e| matches!(e, Event::AssistantDelta { .. }))
+            .unwrap();
+        assert!(whole < first, "{ev:?}");
+        assert_eq!(ev.iter().filter(|e| **e == Event::SayWhole).count(), 1);
+
+        // A reply without the tag asks for nothing.
+        let p = FakeProvider::new(vec![Some(vec![text("[joy] Привет")])]);
+        let (a, mut rx, _) = agent(p);
+        a.handle("x", CancellationToken::new()).await.unwrap();
+        assert!(!drain(&mut rx).contains(&Event::SayWhole));
+    }
+
+    #[test]
+    fn the_prompt_tells_her_how_to_be_read_whole() {
+        let p = system_prompt(&AssistantConfig::default());
+        assert!(p.contains("[aloud]"), "{p}");
+        assert!(p.contains("рассказывай полностью, а не описывай"), "{p}");
     }
 
     #[test]

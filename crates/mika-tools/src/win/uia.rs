@@ -18,13 +18,32 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::UI::Accessibility::*;
 
-use crate::sys::{Rect, Ui, UiNode};
+use crate::sys::{Rect, TabInfo, Ui, UiNode};
 use crate::ui::MAX_NODES;
 
 const MAX_DEPTH: u8 = 14;
 /// Elements visited in one window, listed or not.
 const MAX_VISITED: usize = 4000;
+/// Elements visited in search of the tabs of a window. Its own interface is
+/// small once the pages are left out.
+const TAB_MAX_VISITED: usize = 2000;
+const TAB_MAX_DEPTH: u8 = 14;
+/// Tabs kept from one window.
+const MAX_TABS: usize = 500;
+/// Children read from one element in search of tabs: a tab strip holds all
+/// its tabs as children.
+const TAB_MAX_CHILDREN: usize = 600;
+/// How long a tab is given to become the open one after it was chosen.
+const TAB_SETTLE: Duration = Duration::from_millis(60);
+const TAB_SETTLE_TRIES: u32 = 5;
+/// `STATE_SYSTEM_SELECTED` of the older accessibility interface.
+const LEGACY_SELECTED: u32 = 0x2;
+/// `STATE_SYSTEM_SELECTABLE`: the element can be selected at all.
+const LEGACY_SELECTABLE: u32 = 0x20_0000;
 const CALL_TIMEOUT: Duration = Duration::from_secs(8);
+/// The tabs of a window are read in well under a second. A window that takes
+/// longer does not answer, and several windows may be asked in one call.
+const TAB_TIMEOUT: Duration = Duration::from_secs(4);
 /// The question about the password field is asked on a key press of the user:
 /// it must not hold the action up for long. It usually takes milliseconds; the
 /// first one also starts its worker.
@@ -41,9 +60,14 @@ enum Cmd {
     SetText(u64, u32, String, Reply<bool>),
     Focus(u64, u32, Reply<()>),
     FocusedPassword(Reply<Option<bool>>),
+    /// The tabs and whether some were left out.
+    Tabs(u64, Reply<(Vec<TabInfo>, bool)>),
+    SelectTab(u64, usize, Reply<()>),
 }
 
 pub struct UiaUi {
+    /// The window whose last list of tabs was cut short.
+    tabs_cut: Mutex<Option<u64>>,
     worker: Mutex<Option<mpsc::Sender<Cmd>>>,
     /// A worker of its own for the question about the password field: it is
     /// asked on the user's key press with a short wait, and must neither stand
@@ -54,6 +78,7 @@ pub struct UiaUi {
 impl UiaUi {
     pub fn new() -> Self {
         Self {
+            tabs_cut: Mutex::new(None),
             worker: Mutex::new(None),
             probe: Mutex::new(None),
         }
@@ -80,13 +105,23 @@ impl UiaUi {
 
     /// Sends one command and waits for its answer. `None` means no answer in time.
     fn call<T>(&self, make: impl FnOnce(Reply<T>) -> Cmd) -> Option<Result<T, String>> {
+        self.call_within(CALL_TIMEOUT, make)
+    }
+
+    /// The same with its own wait. A worker that did not answer in time is
+    /// left behind, and the next call starts a new one.
+    fn call_within<T>(
+        &self,
+        wait: Duration,
+        make: impl FnOnce(Reply<T>) -> Cmd,
+    ) -> Option<Result<T, String>> {
         let (tx, rx) = mpsc::channel();
         if self.sender().send(make(tx)).is_err() {
             // The worker died; the next call starts a new one.
             *self.worker.lock() = None;
             return Some(Err("служба чтения окон остановилась, повтори".into()));
         }
-        match rx.recv_timeout(CALL_TIMEOUT) {
+        match rx.recv_timeout(wait) {
             Ok(r) => Some(r),
             Err(_) => {
                 *self.worker.lock() = None;
@@ -97,6 +132,7 @@ impl UiaUi {
 }
 
 const NO_ANSWER: &str = "окно не ответило за 8 секунд";
+const TABS_NO_ANSWER: &str = "окно не ответило за 4 секунды";
 
 impl Ui for UiaUi {
     fn tree(&self, window: u64) -> Result<Vec<UiNode>, String> {
@@ -125,6 +161,30 @@ impl Ui for UiaUi {
             .unwrap_or_else(|| Err(NO_ANSWER.into()))
     }
 
+    fn tabs(&self, window: u64) -> Result<Vec<TabInfo>, String> {
+        let answer = self
+            .call_within(TAB_TIMEOUT, |r| Cmd::Tabs(window, r))
+            .unwrap_or_else(|| Err(TABS_NO_ANSWER.into()));
+        let mut cut_window = self.tabs_cut.lock();
+        if *cut_window == Some(window) {
+            *cut_window = None;
+        }
+        let (tabs, cut) = answer?;
+        if cut {
+            *cut_window = Some(window);
+        }
+        Ok(tabs)
+    }
+
+    fn tabs_cut(&self, window: u64) -> bool {
+        *self.tabs_cut.lock() == Some(window)
+    }
+
+    fn select_tab(&self, window: u64, index: usize) -> Result<(), String> {
+        self.call(|r| Cmd::SelectTab(window, index, r))
+            .unwrap_or_else(|| Err(NO_ANSWER.into()))
+    }
+
     fn focused_password(&self) -> Option<bool> {
         let (tx, rx) = mpsc::channel();
         let sent = Self::sender_of(&self.probe, "ui-automation-focus")
@@ -150,6 +210,18 @@ struct Snapshot {
     elements: Vec<IUIAutomationElement>,
 }
 
+/// Tabs of the window whose tabs were listed last, in the listed order. Kept
+/// apart from `Snapshot`: listing tabs must not move the element numbers the
+/// model got from `ui_read`.
+struct TabSnapshot {
+    window: u64,
+    elements: Vec<IUIAutomationElement>,
+    /// The program tells which tab is open (`open_tab_is_told`).
+    told: bool,
+}
+
+const STALE_TABS: &str = "список вкладок устарел";
+
 fn hwnd(id: u64) -> HWND {
     HWND(id as usize as *mut core::ffi::c_void)
 }
@@ -170,6 +242,7 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
         CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).map_err(err)
     };
     let mut snapshot: Option<Snapshot> = None;
+    let mut tab_snapshot: Option<TabSnapshot> = None;
     while let Ok(cmd) = rx.recv() {
         let uia = match &automation {
             Ok(a) => a,
@@ -182,6 +255,8 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
                     Cmd::SetText(_, _, _, r) => drop(r.send(Err(msg))),
                     Cmd::Focus(_, _, r) => drop(r.send(Err(msg))),
                     Cmd::FocusedPassword(r) => drop(r.send(Err(msg))),
+                    Cmd::Tabs(_, r) => drop(r.send(Err(msg))),
+                    Cmd::SelectTab(_, _, r) => drop(r.send(Err(msg))),
                 }
                 continue;
             }
@@ -217,6 +292,27 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
                     focused_password(uia)
                 });
                 let _ = r.send(Ok(known));
+            }
+            Cmd::Tabs(window, r) => {
+                // A failed reading leaves no tabs to choose from.
+                tab_snapshot = None;
+                let out = read_tabs(uia, window).map(|read| {
+                    tab_snapshot = Some(TabSnapshot {
+                        window,
+                        elements: read.elements,
+                        told: open_tab_is_told(&read.tabs),
+                    });
+                    (read.tabs, read.cut)
+                });
+                let _ = r.send(out);
+            }
+            Cmd::SelectTab(window, index, r) => {
+                let tab = tab_snapshot
+                    .as_ref()
+                    .filter(|s| s.window == window)
+                    .and_then(|s| s.elements.get(index).map(|e| (e.clone(), s.told)))
+                    .ok_or_else(|| STALE_TABS.to_string());
+                let _ = r.send(tab.and_then(|(e, told)| select_tab(&e, told)));
             }
         }
     }
@@ -440,6 +536,230 @@ fn read_tree(
     }
 }
 
+/// Children of an element in the control view, in their order, and whether
+/// some were left out.
+///
+/// # Safety
+/// `el` must be a live element of the thread that owns `walker`.
+unsafe fn children_of(
+    walker: &IUIAutomationTreeWalker,
+    el: &IUIAutomationElement,
+) -> (Vec<IUIAutomationElement>, bool) {
+    let mut children = Vec::new();
+    // SAFETY: plain COM calls; the caller keeps the element on its thread.
+    let mut next = unsafe { walker.GetFirstChildElement(el) }.ok();
+    while let Some(child) = next {
+        if children.len() >= TAB_MAX_CHILDREN {
+            return (children, true);
+        }
+        // SAFETY: as above.
+        next = unsafe { walker.GetNextSiblingElement(&child) }.ok();
+        children.push(child);
+    }
+    (children, false)
+}
+
+/// What the state of the older accessibility interface tells about a tab:
+/// open, closed, or nothing. A missing "selected" bit means "closed" only for
+/// an element that can be selected at all; many programs set neither bit.
+fn legacy_selected(state: u32) -> Option<bool> {
+    if state & LEGACY_SELECTED != 0 {
+        Some(true)
+    } else if state & LEGACY_SELECTABLE != 0 {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Whether the tab is the open one; `None` when the program does not tell.
+fn tab_selected(e: &IUIAutomationElement) -> Option<bool> {
+    // SAFETY: plain COM property reads; a missing pattern is an error we ignore.
+    unsafe {
+        if let Ok(p) =
+            e.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId)
+        {
+            if let Ok(selected) = p.CurrentIsSelected() {
+                return Some(selected.as_bool());
+            }
+        }
+        // Programs seen through the older interface tell it as a state bit.
+        if let Ok(p) = e.GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
+            UIA_LegacyIAccessiblePatternId,
+        ) {
+            if let Ok(state) = p.CurrentState() {
+                return legacy_selected(state);
+            }
+        }
+    }
+    None
+}
+
+/// What one reading of a window's tabs gives.
+struct TabsRead {
+    tabs: Vec<TabInfo>,
+    elements: Vec<IUIAutomationElement>,
+    /// Some tabs may be missing: a limit was reached.
+    cut: bool,
+}
+
+/// Tabs of the window's own interface with their elements, in the order of
+/// the tab strip. A tab is known by its control type alone, whatever
+/// patterns it has. Documents are not entered: a web page has tabs of its own
+/// and thousands of elements, and it is not the window's interface.
+fn read_tabs(uia: &IUIAutomation, window: u64) -> Result<TabsRead, String> {
+    // SAFETY: plain COM calls; every element is owned by this thread.
+    unsafe {
+        let root = uia
+            .ElementFromHandle(hwnd(window))
+            .map_err(|_| "окно закрыто или недоступно".to_string())?;
+        let walker = uia.ControlViewWalker().map_err(err)?;
+        let mut read = TabsRead {
+            tabs: Vec::new(),
+            elements: Vec::new(),
+            cut: false,
+        };
+        let mut visited = 0usize;
+        // Depth-first without recursion, so tabs come in their order on screen.
+        let mut stack: Vec<(IUIAutomationElement, u8)> = vec![(root, 0)];
+        while let Some((el, depth)) = stack.pop() {
+            visited += 1;
+            if visited > TAB_MAX_VISITED || read.tabs.len() >= MAX_TABS {
+                read.cut = true;
+                break;
+            }
+            let kind = el.CurrentControlType().unwrap_or(UIA_CustomControlTypeId);
+            if kind == UIA_DocumentControlTypeId && depth > 0 {
+                continue;
+            }
+            if kind == UIA_TabItemControlTypeId {
+                let name = el
+                    .CurrentName()
+                    .map(|b: BSTR| b.to_string())
+                    .unwrap_or_default();
+                // A tab without a name keeps its place: the caller skips it.
+                read.tabs.push(TabInfo {
+                    name: name.trim().replace(['\r', '\n'], " "),
+                    selected: tab_selected(&el),
+                });
+                read.elements.push(el);
+                // Inside a tab are its close button and its icon.
+                continue;
+            }
+            if depth >= TAB_MAX_DEPTH {
+                continue;
+            }
+            let (children, cut) = children_of(&walker, &el);
+            read.cut |= cut;
+            for child in children.into_iter().rev() {
+                stack.push((child, depth + 1));
+            }
+        }
+        Ok(read)
+    }
+}
+
+/// Whether the program tells which tab is open: exactly one says "I am".
+/// None means it does not tell; several mean the mark is something else (in
+/// Chromium, the tabs picked with Ctrl), and it is not trusted either.
+fn open_tab_is_told(tabs: &[TabInfo]) -> bool {
+    tabs.iter().filter(|t| t.selected == Some(true)).count() == 1
+}
+
+/// Tries the ways to open a tab in order until one is accepted and the tab
+/// is seen open. `accepted`: runs a way, true when the program took it.
+/// `opened`: the tab is the open one now, or nobody can tell.
+fn open_by(
+    ways: usize,
+    accepted: &mut dyn FnMut(usize) -> bool,
+    opened: &mut dyn FnMut() -> bool,
+) -> Result<(), String> {
+    let mut any = false;
+    for way in 0..ways {
+        if accepted(way) {
+            any = true;
+            if opened() {
+                return Ok(());
+            }
+        }
+    }
+    Err(if any {
+        "программа приняла выбор вкладки, но вкладка не открылась".into()
+    } else {
+        "программа не даёт выбрать вкладку".into()
+    })
+}
+
+/// A way to open a tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabWay {
+    /// `SelectionItemPattern.Select`.
+    Select,
+    /// `InvokePattern.Invoke`: a press.
+    Invoke,
+    /// The default action of the older accessibility interface.
+    Default,
+}
+
+/// The ways in the order they are tried. A tab that already carries the
+/// "selected" mark and still has to be opened (the mark is not trusted, see
+/// `open_tab_is_told`) is pressed first: selecting what is selected does
+/// nothing.
+fn tab_ways(marked_selected: bool) -> [TabWay; 3] {
+    if marked_selected {
+        [TabWay::Invoke, TabWay::Default, TabWay::Select]
+    } else {
+        [TabWay::Select, TabWay::Invoke, TabWay::Default]
+    }
+}
+
+/// Opens the tab: by selection, else by a press, else by the default action
+/// of the older interface. A way that the program accepts and that leaves the
+/// tab closed does not count: the next one is tried. `told`: the program
+/// tells which tab is open; when it does not, the first accepted way is
+/// taken at its word.
+fn select_tab(e: &IUIAutomationElement, told: bool) -> Result<(), String> {
+    let ways = tab_ways(tab_selected(e) == Some(true));
+    let mut accepted = |way: usize| {
+        // SAFETY: plain COM calls on a live element; a missing pattern is an error.
+        unsafe {
+            match ways[way] {
+                TabWay::Select => e
+                    .GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(
+                        UIA_SelectionItemPatternId,
+                    )
+                    .and_then(|p| p.Select())
+                    .is_ok(),
+                TabWay::Invoke => e
+                    .GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId)
+                    .and_then(|p| p.Invoke())
+                    .is_ok(),
+                TabWay::Default => e
+                    .GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
+                        UIA_LegacyIAccessiblePatternId,
+                    )
+                    .and_then(|p| p.DoDefaultAction())
+                    .is_ok(),
+            }
+        }
+    };
+    let mut opened = || {
+        if !told {
+            return true;
+        }
+        for attempt in 0..TAB_SETTLE_TRIES {
+            if attempt > 0 {
+                std::thread::sleep(TAB_SETTLE);
+            }
+            if tab_selected(e) != Some(false) {
+                return true;
+            }
+        }
+        false
+    };
+    open_by(ways.len(), &mut accepted, &mut opened)
+}
+
 /// Presses the element through its pattern. A pattern that refuses (a menu
 /// that closed under it: «An event was unable to invoke any of the
 /// subscribers») gives `None`, and the caller clicks with the mouse instead.
@@ -498,5 +818,160 @@ fn set_text(e: &IUIAutomationElement, text: &str) -> Result<bool, String> {
         }
         // Some editors expose the pattern and still refuse the value: type instead.
         Ok(p.SetValue(&BSTR::from(text)).is_ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tab_is_chosen_only_from_the_tabs_that_were_just_listed() {
+        // Nothing on the desktop is touched: the handle is no window.
+        let ui = UiaUi::new();
+        assert!(ui.tabs(0).is_err(), "no window, no tabs");
+        let stale = ui.select_tab(0, 0).unwrap_err();
+        // A session without UI Automation says so instead.
+        assert!(
+            stale == STALE_TABS || stale.starts_with("UI Automation"),
+            "{stale}"
+        );
+        assert!(!ui.tabs_cut(0));
+    }
+
+    #[test]
+    fn the_old_interface_tells_the_open_tab_only_when_it_can() {
+        assert_eq!(legacy_selected(LEGACY_SELECTED), Some(true));
+        assert_eq!(
+            legacy_selected(LEGACY_SELECTED | LEGACY_SELECTABLE),
+            Some(true)
+        );
+        assert_eq!(legacy_selected(LEGACY_SELECTABLE), Some(false));
+        // Neither bit: the program does not tell, the tab is not "closed".
+        assert_eq!(legacy_selected(0), None);
+        assert_eq!(legacy_selected(0x10_0004), None);
+    }
+
+    fn told(marks: &[Option<bool>]) -> bool {
+        let tabs: Vec<TabInfo> = marks
+            .iter()
+            .map(|selected| TabInfo {
+                name: "tab".into(),
+                selected: *selected,
+            })
+            .collect();
+        open_tab_is_told(&tabs)
+    }
+
+    #[test]
+    fn the_open_tab_is_told_by_exactly_one_mark() {
+        assert!(told(&[Some(false), Some(true), Some(false)]));
+        assert!(told(&[None, Some(true)]));
+        // Nobody is marked.
+        assert!(!told(&[Some(false), Some(false)]));
+        assert!(!told(&[None, None]));
+        assert!(!told(&[]));
+        // Several are: the mark is not "open" (tabs picked with Ctrl).
+        assert!(!told(&[Some(true), Some(true), Some(false)]));
+    }
+
+    /// Runs `open_by` over a script: which ways the program accepts and after
+    /// which way the tab is seen open. Returns the ways that were run.
+    fn opening(accepts: [bool; 3], opens_after: Option<usize>) -> (Result<(), String>, Vec<usize>) {
+        let ran = std::cell::RefCell::new(Vec::new());
+        let mut accepted = |way: usize| {
+            ran.borrow_mut().push(way);
+            accepts[way]
+        };
+        let mut opened = || opens_after.is_some_and(|way| ran.borrow().last() >= Some(&way));
+        let out = open_by(3, &mut accepted, &mut opened);
+        (out, ran.into_inner())
+    }
+
+    #[test]
+    fn the_first_way_that_opens_the_tab_ends_the_tries() {
+        assert_eq!(opening([true, true, true], Some(0)), (Ok(()), vec![0]));
+        // The first is refused, the second opens it.
+        assert_eq!(opening([false, true, true], Some(1)), (Ok(()), vec![0, 1]));
+        // The first is accepted and opens nothing: the next one is tried.
+        assert_eq!(opening([true, true, false], Some(1)), (Ok(()), vec![0, 1]));
+    }
+
+    #[test]
+    fn a_tab_that_never_opens_is_an_error_that_tells_why() {
+        let (out, ran) = opening([true, false, true], None);
+        assert_eq!(ran, vec![0, 1, 2]);
+        assert_eq!(
+            out.unwrap_err(),
+            "программа приняла выбор вкладки, но вкладка не открылась"
+        );
+        let (out, ran) = opening([false, false, false], Some(0));
+        assert_eq!(ran, vec![0, 1, 2]);
+        assert_eq!(out.unwrap_err(), "программа не даёт выбрать вкладку");
+    }
+
+    #[test]
+    fn a_tab_that_is_marked_selected_is_pressed_before_it_is_selected() {
+        assert_eq!(
+            tab_ways(false),
+            [TabWay::Select, TabWay::Invoke, TabWay::Default]
+        );
+        assert_eq!(
+            tab_ways(true),
+            [TabWay::Invoke, TabWay::Default, TabWay::Select]
+        );
+    }
+
+    /// The first window of a known browser whose title is not of the blind zone.
+    fn a_browser_window() -> Option<u64> {
+        use crate::sys::Windows;
+        super::super::wnd::WinWindows
+            .list()
+            .into_iter()
+            .find(|w| {
+                crate::apps::BROWSERS.contains(&w.process.to_lowercase().as_str())
+                    && !mika_core::policy::blind::is_blind_title(&w.title)
+            })
+            .map(|w| w.id)
+    }
+
+    #[test]
+    #[ignore = "reads the tab strip of a browser window of the live desktop"]
+    fn a_live_browser_window_shows_its_tabs_and_one_of_them_is_open() {
+        let Some(window) = a_browser_window() else {
+            eprintln!("no browser window is open");
+            return;
+        };
+        let ui = UiaUi::new();
+        let tabs = ui.tabs(window).expect("the tabs are read");
+        let open = tabs.iter().filter(|t| t.selected == Some(true)).count();
+        let unnamed = tabs.iter().filter(|t| t.name.is_empty()).count();
+        let untold = tabs.iter().filter(|t| t.selected.is_none()).count();
+        // Counts only: the names are the user's pages.
+        eprintln!(
+            "tabs: {}, open: {open}, without a name: {unnamed}, state not told: {untold}, cut: {}",
+            tabs.len(),
+            ui.tabs_cut(window)
+        );
+        assert!(!tabs.is_empty(), "the browser shows no tabs");
+        assert_eq!(open, 1, "exactly one tab is the open one");
+    }
+
+    #[test]
+    #[ignore = "chooses the already open tab of a browser window of the live desktop"]
+    fn choosing_the_open_tab_of_a_live_browser_window_is_accepted() {
+        let Some(window) = a_browser_window() else {
+            eprintln!("no browser window is open");
+            return;
+        };
+        let ui = UiaUi::new();
+        let tabs = ui.tabs(window).expect("the tabs are read");
+        let Some(open) = tabs.iter().position(|t| t.selected == Some(true)) else {
+            panic!("no tab is marked open among {}", tabs.len());
+        };
+        // The page in front stays the same: the open tab is chosen again.
+        ui.select_tab(window, open).expect("the choice is accepted");
+        let after = ui.tabs(window).expect("the tabs are read again");
+        assert_eq!(after.get(open).and_then(|t| t.selected), Some(true));
     }
 }

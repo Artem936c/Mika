@@ -41,7 +41,7 @@ use self::plan::{
 };
 use super::args::{concat_line, join_list_args, number};
 use super::encoders::{pick_h264, H264};
-use super::job::{copy_timeout, run_ffmpeg};
+use super::job::{copy_timeout, run_ffmpeg, run_line};
 use super::output::{remove_later, PartFile};
 use super::time::show_time;
 use super::{bad, files_card, AvEnv, FfmpegPaths};
@@ -427,6 +427,17 @@ enum Hold {
     Gone,
 }
 
+/// Leaves the mark that a blind-zone window was seen while the piece was
+/// written: a piece with the mark is never kept as it is, also after a crash.
+fn mark_blind(work: &Path, index: usize) {
+    if let Err(e) = std::fs::write(blind_mark(work, index), b"") {
+        log::warn!(
+            target: "jobs",
+            "the blind-zone mark of a recorded piece was not written: piece={index} error={e}"
+        );
+    }
+}
+
 /// Why a running piece is told to finish.
 enum Quit {
     /// The recording ends.
@@ -434,8 +445,38 @@ enum Quit {
     /// A blind-zone window came to the front: the tail of the piece is cut.
     Blind,
     /// The recorded window is not in front, has moved, or the microphone
-    /// was switched off: the next piece starts when it may.
-    Next,
+    /// was switched off: the next piece starts when it may. Holds which of
+    /// them it was, for the journal.
+    Next(&'static str),
+}
+
+/// Why a recording ended, as the journal names it.
+fn stop_code(stop: &Stop) -> &'static str {
+    match stop {
+        Stop::User => "user",
+        Stop::Limit => "limit",
+        Stop::Disk => "disk_low",
+        Stop::ScreenOff => "screen_off",
+        Stop::WindowGone => "window_gone",
+        Stop::PausedTooLong => "paused_too_long",
+        Stop::Broke(_) => "broke",
+    }
+}
+
+/// Writes why a recording waits, once per reason, and keeps since when.
+fn note_wait(waits: &mut Option<(&'static str, Instant)>, reason: &'static str) {
+    if waits.is_none_or(|(now, _)| now != reason) {
+        log::info!(target: "jobs", "recording waits: reason={reason}");
+        let since = waits.map_or_else(Instant::now, |(_, since)| since);
+        *waits = Some((reason, since));
+    }
+}
+
+fn source_tag(source: SoundSource) -> &'static str {
+    match source {
+        SoundSource::System => "sys",
+        SoundSource::Microphone => "mic",
+    }
 }
 
 /// A sound take that runs beside a piece.
@@ -547,16 +588,17 @@ impl Recorder {
     ) -> Option<Quit> {
         match self.region_now(seen) {
             Err(Hold::Blind) => return Some(Quit::Blind),
-            Err(Hold::Behind | Hold::Gone) => return Some(Quit::Next),
+            Err(Hold::Behind) => return Some(Quit::Next("window_behind")),
+            Err(Hold::Gone) => return Some(Quit::Next("window_gone")),
             // The window moved or changed its size: a new piece takes its new place.
-            Ok(now) if now != region => return Some(Quit::Next),
+            Ok(now) if now != region => return Some(Quit::Next("window_moved")),
             Ok(_) => {}
         }
         if !self.screen_on.load(Ordering::Relaxed) {
             return Some(Quit::Stop(Stop::ScreenOff));
         }
         if mic_runs && !(self.av.rec.mic_allowed)() {
-            return Some(Quit::Next);
+            return Some(Quit::Next("microphone_off"));
         }
         if low_disk.load(Ordering::Relaxed) {
             return Some(Quit::Stop(Stop::Disk));
@@ -613,7 +655,9 @@ impl Recorder {
                     source,
                 }),
                 Err(why) => {
-                    log::warn!("sound take did not start: {why}");
+                    log::warn!(
+                        "sound take did not start, the piece is recorded without it: piece={index} source={tag} error={why}"
+                    );
                     got.sound_note.get_or_insert(format!(
                         "{} записать не удалось: {why}",
                         sound_name(source)
@@ -675,7 +719,7 @@ impl Recorder {
                     if blind_at.is_none() && self.blind_in(&seen, region) {
                         blind_at = Some(written.load(Ordering::Relaxed) as f64 / 1e6);
                         // From now on the piece is not kept as it is.
-                        let _ = std::fs::write(blind_mark(&self.work, index), b"");
+                        mark_blind(&self.work, index);
                         if why.is_none() {
                             why = Some(Quit::Blind);
                             quit.cancel();
@@ -688,7 +732,7 @@ impl Recorder {
                         why = self.look(&seen, region, mic_runs, &low_disk);
                         if matches!(why, Some(Quit::Blind)) {
                             blind_at = Some(written.load(Ordering::Relaxed) as f64 / 1e6);
-                            let _ = std::fs::write(blind_mark(&self.work, index), b"");
+                            mark_blind(&self.work, index);
                         }
                         if why.is_some() {
                             quit.cancel();
@@ -707,6 +751,25 @@ impl Recorder {
                 }
             }
         };
+        // What ended the piece; a window of the blind zone is named only as such.
+        let (level, line) = run_line(
+            &format!("capture job={}", ctx.handle.id()),
+            ((origin.elapsed().as_secs_f64() - launched) * 1000.0) as u128,
+            &out,
+            why.is_some(),
+        );
+        log::log!(
+            target: "jobs",
+            level,
+            "{line} piece={index} recorded_s={:.1} ended_by={}",
+            written.load(Ordering::Relaxed) as f64 / 1e6,
+            match &why {
+                Some(Quit::Stop(stop)) => stop_code(stop),
+                Some(Quit::Blind) => "blind_zone",
+                Some(Quit::Next(reason)) => reason,
+                None => "ffmpeg",
+            }
+        );
 
         let mut sounds = Vec::new();
         for running in takes {
@@ -719,11 +782,33 @@ impl Recorder {
             let stopped = tokio::task::spawn_blocking(move || take.stop())
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()));
+            let tag = source_tag(source);
             match stopped {
-                Ok(stats) if stats.seconds > 0.0 => sounds.push((wav, at)),
-                Ok(_) => {}
+                Ok(stats) => {
+                    // Every take leaves its record: "the video has no
+                    // sound" is asked about a take that wrote nothing or
+                    // wrote silence, and neither is an error.
+                    let empty = stats.seconds <= 0.0;
+                    log::log!(
+                        target: "jobs",
+                        if empty || stats.silent {
+                            log::Level::Warn
+                        } else {
+                            log::Level::Info
+                        },
+                        "sound take ended: piece={index} source={tag} seconds={:.1} silent={} kept={}",
+                        stats.seconds,
+                        stats.silent,
+                        !empty
+                    );
+                    if !empty {
+                        sounds.push((wav, at));
+                    }
+                }
                 Err(why) => {
-                    log::warn!("sound take did not end well: {why}");
+                    log::warn!(
+                        "sound take did not end well, its sound is left out: piece={index} source={tag} error={why}"
+                    );
                     got.sound_note.get_or_insert(format!(
                         "{} записать не удалось: {why}",
                         sound_name(source)
@@ -739,6 +824,13 @@ impl Recorder {
                 .av
                 .probe(&self.paths, &video, &CancellationToken::new())
                 .await
+                .map_err(|e| {
+                    log::warn!(
+                        target: "jobs",
+                        "the length of a recorded piece cannot be read, the piece is left out: piece={index} error={}",
+                        mika_core::journal::guarded_error(&e)
+                    )
+                })
                 .ok()
                 .map(|i| i.duration())
                 .unwrap_or(0.0);
@@ -772,7 +864,7 @@ impl Recorder {
 
         match why {
             Some(Quit::Stop(stop)) => Some(stop),
-            Some(Quit::Blind | Quit::Next) => None,
+            Some(Quit::Blind | Quit::Next(_)) => None,
             // FFmpeg ended by itself: at the limit, or something broke. A
             // piece that broke is never started again.
             None => Some(match out {
@@ -791,6 +883,25 @@ impl Recorder {
         let began = Instant::now();
         let mut got = Gathered::default();
         let mut index = 0;
+        // What is recorded, never which window: its title is not written.
+        log::info!(
+            target: "jobs",
+            "recording started: job={} source={} frame={}x{} sound={} microphone={} encoder={} limit_s={:.0}",
+            ctx.handle.id(),
+            match &self.plan.source {
+                Source::Screen { .. } => "screen",
+                Source::Window { .. } => "window",
+            },
+            frame.0,
+            frame.1,
+            self.plan.sound,
+            self.plan.microphone,
+            self.h264.name(),
+            self.plan.limit_s
+        );
+        // Why the recording waits now, written when it changes, not at
+        // every look: a hole in the video has its reason in the journal.
+        let mut waits: Option<(&'static str, Instant)> = None;
         let stop = 'rec: loop {
             // Wait until recording may run.
             let region = loop {
@@ -806,14 +917,27 @@ impl Recorder {
                 match self.region_now(&self.see()) {
                     Ok(region) => break region,
                     Err(Hold::Gone) => break 'rec Stop::WindowGone,
-                    Err(Hold::Blind) => ctx.handle.set_note(NOTE_BLIND),
-                    Err(Hold::Behind) => ctx.handle.set_note(NOTE_BEHIND),
+                    Err(Hold::Blind) => {
+                        note_wait(&mut waits, "blind_zone");
+                        ctx.handle.set_note(NOTE_BLIND);
+                    }
+                    Err(Hold::Behind) => {
+                        note_wait(&mut waits, "window_behind");
+                        ctx.handle.set_note(NOTE_BEHIND);
+                    }
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(POLL) => {}
                     _ = ctx.cancel.cancelled() => {}
                 }
             };
+            if let Some((_, since)) = waits.take() {
+                log::info!(
+                    target: "jobs",
+                    "recording goes on: waited_ms={}",
+                    since.elapsed().as_millis()
+                );
+            }
             if self.plan.limit_s - got.recorded < 1.0 {
                 break 'rec Stop::Limit;
             }
@@ -822,6 +946,21 @@ impl Recorder {
             }
             index += 1;
         };
+        // Why it ended, whatever the job says next: with a piece recorded
+        // the job ends as done, and the reason would be in the chat only.
+        log::log!(
+            target: "jobs",
+            match &stop {
+                Stop::User | Stop::Limit => log::Level::Info,
+                _ => log::Level::Warn,
+            },
+            "recording ended: job={} reason={} pieces={} recorded_s={:.1} pauses={}",
+            ctx.handle.id(),
+            stop_code(&stop),
+            got.pieces.len(),
+            got.recorded,
+            got.pauses
+        );
         // A stop is not an abort: what was recorded becomes a file.
         ctx.handle.set_note(NOTE_SAVING);
         self.save(got, stop, &ctx.handle).await
@@ -881,6 +1020,7 @@ impl Recorder {
         if let [one] = got.pieces.as_slice() {
             let argv = mux_args(&one.video, one.keep, &one.sounds, part.path());
             run_ffmpeg(
+                "record_mux",
                 runner,
                 &self.paths,
                 &argv,
@@ -899,6 +1039,7 @@ impl Recorder {
                 let out = self.work.join(format!("part-{i}.mkv"));
                 let argv = mux_args(&piece.video, piece.keep, &piece.sounds, &out);
                 run_ffmpeg(
+                    "record_mux",
                     runner,
                     &self.paths,
                     &argv,
@@ -919,6 +1060,7 @@ impl Recorder {
                 .map_err(|e| broke(failed(format!("не удалось записать список кусков: {e}"))))?;
             let argv = join_list_args(&list_path, "mp4", part.path());
             run_ffmpeg(
+                "record_join",
                 runner,
                 &self.paths,
                 &argv,

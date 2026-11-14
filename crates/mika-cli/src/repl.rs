@@ -31,9 +31,9 @@ impl Renderer {
             self.in_reply = false;
             return out;
         }
-        // Only the speaker needs to know where a step of a reply begins;
-        // progress of a tool is for the chat's bar.
-        if let Event::StepStarted | Event::ToolProgress { .. } = event {
+        // Only the speaker needs to know where a step of a reply begins and
+        // whether it is said whole; progress of a tool is for the chat's bar.
+        if let Event::StepStarted | Event::SayWhole | Event::ToolProgress { .. } = event {
             return String::new();
         }
         let line = match event {
@@ -113,6 +113,7 @@ impl Renderer {
             Event::AssistantDelta { .. }
             | Event::AssistantText { .. }
             | Event::StepStarted
+            | Event::SayWhole
             | Event::ToolProgress { .. } => {
                 unreachable!()
             }

@@ -170,12 +170,36 @@ impl Live {
         let key = self.key(SPEECH_SECRET_KEY);
         let hide = |text: String| redact(&text, key.as_ref());
         let (file_name, mime) = file;
+        let base = self.base(&voice.speech_base_url);
+        let asked = std::time::Instant::now();
+        // What was said is the user's: the record has the size of the sound
+        // and of the answer, never the words.
+        let note = |outcome: Result<(u16, usize), &str>| {
+            let sizes = format!(
+                "sound_s={:.1} bytes={}{}",
+                crate::metering::sound_seconds(wav),
+                wav.len(),
+                match outcome {
+                    Ok((status, chars)) => format!(" http={status} answer_chars={chars}"),
+                    Err(_) => String::new(),
+                }
+            );
+            let (level, line) = crate::trace::call_line(
+                "recognition",
+                &base,
+                &model,
+                asked.elapsed().as_millis(),
+                &sizes,
+                outcome.map(|_| ()),
+            );
+            log::log!(target: "voice", level, "{line}");
+        };
         let file = reqwest::multipart::Part::bytes(wav.to_vec())
             .file_name(file_name.to_string())
             .mime_str(mime)
             .map_err(|e| e.to_string())?;
         let mut form = reqwest::multipart::Form::new()
-            .text("model", model)
+            .text("model", model.clone())
             .part("file", file);
         let language = voice.stt_language.trim().to_string();
         if !language.is_empty() {
@@ -186,10 +210,7 @@ impl Live {
         }
         let mut req = self
             .http()
-            .post(format!(
-                "{}/audio/transcriptions",
-                self.base(&voice.speech_base_url)
-            ))
+            .post(format!("{base}/audio/transcriptions"))
             .timeout(SPEECH_TIMEOUT)
             .multipart(form);
         if let Some(k) = &key {
@@ -198,13 +219,16 @@ impl Live {
         let resp = req
             .send()
             .await
-            .map_err(|e| hide(format!("нет связи с распознаванием: {}", e.without_url())))?;
+            .map_err(|e| hide(format!("нет связи с распознаванием: {}", e.without_url())))
+            .inspect_err(|why| note(Err(why)))?;
         let status = resp.status().as_u16();
         let body = resp
             .text()
             .await
-            .map_err(|e| hide(e.without_url().to_string()))?;
+            .map_err(|e| hide(e.without_url().to_string()))
+            .inspect_err(|why| note(Err(why)))?;
         if (200..300).contains(&status) {
+            note(Ok((status, body.chars().count())));
             // Every recognition request passes here: it is counted once (decision 0028).
             crate::metering::record_transcription(
                 &self.base(&voice.speech_base_url),
@@ -222,7 +246,10 @@ impl Live {
                 },
             ));
         }
-        Ok((status, hide(body)))
+        let body = hide(body);
+        // A refusal: the body is the provider's error, not what was said.
+        note(Err(&format!("http {status}: {}", error_message(&body))));
+        Ok((status, body))
     }
 }
 
@@ -236,7 +263,7 @@ impl SpeechToText for Live {
                 error_message(&body)
             ));
         }
-        parse_transcription(&body)
+        parse_transcription(&body).inspect_err(|why| not_understood(status, why))
     }
 
     async fn transcribe_segments(&self, wav: &[u8]) -> Result<Option<Vec<SpeechSegment>>, String> {
@@ -259,8 +286,20 @@ impl SpeechToText for Live {
                 error_message(&body)
             ));
         }
-        parse_segments(&body)
+        parse_segments(&body).inspect_err(|why| not_understood(status, why))
     }
+}
+
+/// The provider answered well, and the answer cannot be read: no text in
+/// it, or not JSON. The record of the request itself says `outcome=ok`, so
+/// without this one a failed recognition would have no reason. The reason
+/// is the parser's or the app's own words, never what was said.
+fn not_understood(status: u16, why: &str) {
+    log::warn!(
+        target: "voice",
+        "recognition answer not understood: http={status} error={}",
+        mika_core::journal::error_text(&why)
+    );
 }
 
 /// Why recognition failed.
@@ -350,7 +389,10 @@ impl Live {
                 if e.starts_with("синтез речи ответил 4")
                     && !e.starts_with("синтез речи ответил 429") =>
             {
-                log::warn!("speech provider refused the format {format}, asking without it: {e}");
+                log::warn!(
+                    "speech provider refused the format, asking without it: format={format} error={}",
+                    mika_core::journal::error_text(&e)
+                );
                 let sound = self.synthesize_with(text, instructions).await;
                 if sound.is_ok() {
                     let mut refused = NO_FORMAT.lock();
@@ -382,7 +424,10 @@ impl Live {
         }
         match self.speak_once(text, instructions, format).await {
             Err(e) if e.starts_with("синтез речи ответил 4") => {
-                log::warn!("speech provider refused instructions, asking without them: {e}");
+                log::warn!(
+                    "speech provider refused instructions, asking without them: error={}",
+                    mika_core::journal::error_text(&e)
+                );
                 let sound = self.speak_once(text, "", format).await;
                 // Too many requests is not a refusal of the field.
                 if sound.is_ok() && !e.starts_with("синтез речи ответил 429") {
@@ -431,11 +476,39 @@ impl Live {
             text,
         };
         let cache = self.speech_cache().filter(|_| voice.tts_cache);
+        let chars = text.chars().count();
         if let Some(sound) = cache.and_then(|c| c.get(&sound_key)) {
+            log::debug!(
+                target: "voice",
+                "synthesis from the cache: chars={chars} bytes={}",
+                sound.len()
+            );
             return Ok(sound);
         }
         let key = self.key(SPEECH_SECRET_KEY);
         let hide = |text: String| redact(&text, key.as_ref());
+        let asked = std::time::Instant::now();
+        // What is said is the model's text: the record has its size only.
+        let note = |outcome: Result<usize, &str>| {
+            let sizes = format!(
+                "engine=provider chars={chars} styled={} format={}{}",
+                !instructions.is_empty(),
+                format.unwrap_or("-"),
+                match outcome {
+                    Ok(bytes) => format!(" bytes={bytes}"),
+                    Err(_) => String::new(),
+                }
+            );
+            let (level, line) = crate::trace::call_line(
+                "synthesis",
+                &base,
+                &model,
+                asked.elapsed().as_millis(),
+                &sizes,
+                outcome.map(|_| ()),
+            );
+            log::log!(target: "voice", level, "{line}");
+        };
         let mut body = json!({ "model": model, "input": text });
         if !name.is_empty() {
             body["voice"] = json!(name);
@@ -457,7 +530,8 @@ impl Live {
         let resp = req
             .send()
             .await
-            .map_err(|e| hide(format!("нет связи с синтезом речи: {}", e.without_url())))?;
+            .map_err(|e| hide(format!("нет связи с синтезом речи: {}", e.without_url())))
+            .inspect_err(|why| note(Err(why)))?;
         let status = resp.status();
         let content_type = resp
             .headers()
@@ -474,17 +548,22 @@ impl Live {
         let bytes = resp
             .bytes()
             .await
-            .map_err(|e| hide(e.without_url().to_string()))?;
+            .map_err(|e| hide(e.without_url().to_string()))
+            .inspect_err(|why| note(Err(why)))?;
         if !status.is_success() {
-            return Err(hide(format!(
+            let why = hide(format!(
                 "синтез речи ответил {}: {}",
                 status.as_u16(),
                 error_message(&String::from_utf8_lossy(&bytes))
-            )));
+            ));
+            note(Err(&why));
+            return Err(why);
         }
         if bytes.is_empty() {
+            note(Err("empty sound"));
             return Err("синтез речи вернул пустой звук".into());
         }
+        note(Ok(bytes.len()));
         // A phrase the provider spoke is counted; one from the cache never gets here.
         self.meter_speech(&base, &model, text, generation, key.clone());
         let sound = playable(&bytes, &content_type);

@@ -182,7 +182,7 @@ fn pause(stop: &AtomicBool, secs: u64) -> bool {
 pub fn load_vosk(library: &Path, model_dir: &Path, name: &str) -> Result<Arc<Model>, String> {
     let started = Instant::now();
     let model = VoskLib::load(library).and_then(|lib| Model::load(lib, model_dir))?;
-    log::info!("vosk model loaded in {:?}", started.elapsed());
+    log::info!("vosk model loaded: ms={}", started.elapsed().as_millis());
     // Words outside the vocabulary are dropped from the grammar silently.
     if let Some(unknown) = name.split_whitespace().find(|w| !model.knows(w)) {
         return Err(format!(
@@ -198,7 +198,7 @@ fn vosk_loop(library: &Path, model_dir: &Path, setup: &WakeSetup, stop: &AtomicB
     let model = match load_vosk(library, model_dir, &name) {
         Ok(m) => m,
         Err(e) => {
-            log::warn!("vosk is unavailable: {e}");
+            log::error!("wake phrase does not work: engine=vosk error={e}");
             (setup.on_status)(Err(e));
             return;
         }
@@ -206,10 +206,15 @@ fn vosk_loop(library: &Path, model_dir: &Path, setup: &WakeSetup, stop: &AtomicB
     let mut last_error = String::new();
     while !stop.load(Ordering::Relaxed) {
         match vosk_session(&model, &name, setup, stop) {
-            Ok(()) => break,
+            Ok(()) => {
+                log::info!("wake phrase stopped listening: engine=vosk");
+                break;
+            }
             Err(e) => {
                 if e != last_error {
-                    log::warn!("wake phrase is unavailable: {e}");
+                    log::warn!(
+                        "wake phrase is unavailable, trying again every 30 s: engine=vosk error={e}"
+                    );
                     (setup.on_status)(Err(e.clone()));
                     last_error = e;
                 }
@@ -286,7 +291,7 @@ fn vosk_session(
     let (tx, rx) = mpsc::channel();
     let (stream, rate) = setup.mic.open(tx).map_err(|e| e.to_string())?;
     let mut listener = Listener::new(model, name, rate)?;
-    log::info!("wake phrase (vosk) is listening for «{name}»");
+    log::info!("wake phrase is listening: engine=vosk rate={rate}");
     (setup.on_status)(Ok(()));
     let result = loop {
         if stop.load(Ordering::Relaxed) {
@@ -319,16 +324,31 @@ fn listen_loop(
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
     let mut last_error = String::new();
+    // The recognizer of Windows ends its session now and then and is started
+    // again: only the first start is a milestone.
+    let mut sessions: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
+        if sessions == 0 {
+            log::info!(
+                "wake phrase starts listening: engine=windows language={language} phrases={}",
+                phrases.len()
+            );
+        }
+        sessions += 1;
         match session(language, phrases, on_wake, stop) {
-            Ok(Ended::Stopped) => break,
+            Ok(Ended::Stopped) => {
+                log::info!("wake phrase stopped listening: engine=windows sessions={sessions}");
+                break;
+            }
             Ok(Ended::Completed) => {
                 last_error.clear();
                 std::thread::sleep(Duration::from_millis(500));
             }
             Err(e) => {
                 if e != last_error {
-                    log::warn!("wake phrase is unavailable: {e}");
+                    log::warn!(
+                        "wake phrase is unavailable, trying again every 30 s: engine=windows error={e}"
+                    );
                     on_status(Err(e.clone()));
                     last_error = e;
                 }
@@ -433,7 +453,7 @@ fn session(
         }))
         .map_err(err)?;
     session.StartAsync().and_then(|a| a.join()).map_err(err)?;
-    log::info!("wake phrase is listening for {phrases:?}");
+    log::debug!("wake phrase session started: engine=windows");
     loop {
         if stop.load(Ordering::Relaxed) {
             let _ = session.CancelAsync().and_then(|a| a.join());
@@ -447,7 +467,10 @@ fn session(
                 return Ok(Ended::Completed);
             }
             Ok(status) => {
-                log::info!("wake phrase session ended with code {}", status.0);
+                log::debug!(
+                    "wake phrase session ended, it starts again: engine=windows code={}",
+                    status.0
+                );
                 return Ok(Ended::Completed);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}

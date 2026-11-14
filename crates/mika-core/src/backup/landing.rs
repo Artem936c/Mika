@@ -48,6 +48,9 @@ pub enum SwitchedOff {
     Docs {
         count: usize,
     },
+    /// Texts and arguments in the journal (`log.content`): a choice made on
+    /// a PC while a failure is looked for, never brought by a file.
+    JournalContent,
     /// Scenarios by event that came from the backup: each one lands switched
     /// off. Listed by a restore, not by `land_config`: they are rows of the
     /// database, not settings.
@@ -138,6 +141,9 @@ pub fn land_config(incoming: Config, here: &Config) -> Landing {
             count: docs_folders.len(),
         });
     }
+    if config.log.content {
+        switched_off.push(SwitchedOff::JournalContent);
+    }
 
     config.privacy.microphone_enabled = false;
     config.privacy.screen_enabled = false;
@@ -157,6 +163,9 @@ pub fn land_config(incoming: Config, here: &Config) -> Landing {
     for server in &mut config.mcp.servers {
         server.enabled = false;
     }
+    // Texts and arguments in the journal are a choice made on a PC, for a
+    // reason and for a while: a file never turns them on.
+    config.log.content = false;
 
     // A file never turns these on: the user did that on this PC or did not.
     config.tools.web_enabled &= here.tools.web_enabled;
@@ -327,6 +336,35 @@ mod tests {
         }
         assert!(landed.mcp.servers.iter().all(|s| !s.enabled));
         assert!(landed.docs.folders.is_empty());
+    }
+
+    #[test]
+    fn texts_in_the_journal_land_off_and_its_other_settings_travel() {
+        use crate::journal::Level;
+        let mut file = Config::default();
+        file.log.content = true;
+        file.log.level = Level::Debug;
+        file.log.keep_days = 30;
+        file.log.keep_files = 3;
+        // Off here: off, and the list says so.
+        let landing = land_config(file.clone(), &Config::default());
+        assert!(!landing.config.log.content);
+        assert_eq!(landing.config.log.level, Level::Debug);
+        assert_eq!(
+            (landing.config.log.keep_days, landing.config.log.keep_files),
+            (30, 3)
+        );
+        assert_eq!(landing.switched_off, vec![SwitchedOff::JournalContent]);
+        // On here: off all the same.
+        let mut here = Config::default();
+        here.log.content = true;
+        let landing = land_config(file, &here);
+        assert!(!landing.config.log.content);
+        assert_eq!(landing.switched_off, vec![SwitchedOff::JournalContent]);
+        // Off in the file: off, and nothing to list.
+        let landing = land_config(Config::default(), &here);
+        assert!(!landing.config.log.content);
+        assert!(landing.switched_off.is_empty());
     }
 
     #[test]
@@ -615,6 +653,7 @@ mod tests {
             SwitchedOff::Events,
             SwitchedOff::Mcp { count: 2 },
             SwitchedOff::Docs { count: 1 },
+            SwitchedOff::JournalContent,
             SwitchedOff::Scenarios { count: 3 },
         ])
         .unwrap();
@@ -633,6 +672,7 @@ mod tests {
                 { "id": "events" },
                 { "id": "mcp", "count": 2 },
                 { "id": "docs", "count": 1 },
+                { "id": "journal_content" },
                 { "id": "scenarios", "count": 3 },
             ])
         );

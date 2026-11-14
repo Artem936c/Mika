@@ -96,6 +96,46 @@ fn is_down(state: i16) -> bool {
     state < 0
 }
 
+/// Whether the user holds Ctrl, Alt, Shift or Win now.
+pub(super) fn modifiers_held() -> bool {
+    MODIFIER_KEYS.iter().any(|vk| {
+        // SAFETY: plain call that reads the state of one key.
+        is_down(unsafe { GetAsyncKeyState(i32::from(*vk)) })
+    })
+}
+
+/// A virtual key that no keyboard has and no program reacts to: 0xE8 is
+/// "unassigned" in the Windows table of virtual-key codes.
+const UNASSIGNED_KEY: u16 = 0xE8;
+
+/// The one event of `nudge`: the release of the unassigned key.
+fn nudge_input() -> INPUT {
+    key(UNASSIGNED_KEY, true)
+}
+
+/// Sends one input event that changes nothing, so that this process is the
+/// one the last input came from. False when Windows did not take the event.
+///
+/// Whether that gives the right to change the foreground window is not
+/// promised anywhere: the documentation names "the process received the last
+/// input event" and a press of Alt by the user. Programs are known to get
+/// the right after any input they send themselves, and that is what this
+/// relies on; it was not measured here (the ignored test
+/// `the_input_way_alone_brings_a_window_forward` in `wnd.rs` measures it).
+/// If it gives nothing, the way costs one look-around and the next one is tried.
+///
+/// Why this event is safe. It is the release of a key that was never pressed
+/// and that stands for nothing: no character is typed, no shortcut and no
+/// global hotkey starts on a release, nothing is left held. The usual trick, a
+/// press of Alt, is not used: a lone Alt opens the menu bar of the program in
+/// front, and Alt with a key the user is typing would become a shortcut.
+/// The event is sent under the same mark as all her input (`own_input`), so
+/// the watcher of events does not take it for the user being at the computer.
+pub(super) fn nudge() -> bool {
+    let _own = super::sensors::own_input();
+    send(&[nudge_input()]).is_ok()
+}
+
 /// The sequence for one chord: every key down in order, then up in reverse.
 pub fn chord_inputs(keys: &[u16]) -> Vec<(u16, bool)> {
     keys.iter()
@@ -186,10 +226,7 @@ impl Input for SendInputDevice {
     }
 
     fn modifiers_down(&self) -> bool {
-        MODIFIER_KEYS.iter().any(|vk| {
-            // SAFETY: plain call that reads the state of one key.
-            is_down(unsafe { GetAsyncKeyState(i32::from(*vk)) })
-        })
+        modifiers_held()
     }
 }
 
@@ -219,6 +256,19 @@ mod tests {
         assert!(!is_down(1) && !is_down(0));
         // VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN.
         assert_eq!(MODIFIER_KEYS, [0x10, 0x11, 0x12, 0x5B, 0x5C]);
+    }
+
+    #[test]
+    fn the_nudge_is_one_release_of_a_key_that_stands_for_nothing() {
+        // Built only, never sent: a test does not type into the live desktop.
+        let input = nudge_input();
+        assert_eq!(input.r#type, INPUT_KEYBOARD);
+        // SAFETY: the union was filled as a keyboard event just above.
+        let ki = unsafe { input.Anonymous.ki };
+        assert_eq!(ki.wVk, VIRTUAL_KEY(0xE8));
+        assert_eq!(ki.dwFlags, KEYEVENTF_KEYUP, "a release, never a press");
+        assert_eq!(ki.wScan, 0);
+        assert!(!MODIFIER_KEYS.contains(&UNASSIGNED_KEY));
     }
 
     #[test]

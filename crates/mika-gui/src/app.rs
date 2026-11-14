@@ -146,6 +146,52 @@ impl HeldAlerts {
 /// How one MCP server did at the last start: its tool count or the error.
 pub type McpReport = Vec<(String, Result<usize, String>)>;
 
+/// The settings as they were last written, to tell what a save changed.
+static SAVED: Mutex<Option<Config>> = Mutex::new(None);
+
+/// The record of a save: the names of the sections that changed, never
+/// their values. A save that changed nothing is detail.
+fn save_line(
+    before: Option<&Config>,
+    now: &Config,
+    saved: &Result<(), String>,
+) -> (log::Level, String) {
+    let sections = match before {
+        Some(before) => {
+            let changed = now.changed_sections(before);
+            if changed.is_empty() {
+                "none".to_string()
+            } else {
+                changed.join(",")
+            }
+        }
+        None => "unknown".to_string(),
+    };
+    match saved {
+        Ok(()) if sections == "none" => (
+            log::Level::Debug,
+            "settings saved: sections=none".to_string(),
+        ),
+        Ok(()) => (log::Level::Info, format!("settings saved: sections={sections}")),
+        Err(e) => (
+            log::Level::Error,
+            format!(
+                "settings not saved, they are in force until the app closes: sections={sections} error={e}"
+            ),
+        ),
+    }
+}
+
+/// Writes the record of a save and remembers what is in the file now.
+fn note_save(now: &Config, saved: &Result<(), String>) {
+    let mut before = SAVED.lock();
+    let (level, line) = save_line(before.as_ref(), now, saved);
+    log::log!(target: "app", level, "{line}");
+    if saved.is_ok() {
+        *before = Some(now.clone());
+    }
+}
+
 /// Longest wait at exit for the background jobs: a stopped recording still
 /// puts its file together.
 const MEDIA_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(185);
@@ -339,8 +385,14 @@ impl Ctx {
     pub fn build(bus: EventBus, state: StateHandle) -> Result<Ctx, String> {
         let fresh = crate::lang::is_first_start(&config_path(), &database_path());
         let (config, err) = Config::load_or_default(&config_path());
-        if let Some(e) = err {
-            log::error!("{e}");
+        match &err {
+            // The message only: the whole error quotes a line of the settings.
+            Some(mika_core::config::ConfigError::Parse { source, .. }) => log::error!(
+                "settings cannot be read, defaults are in force and the broken file is kept as config.broken.toml: {}",
+                source.message()
+            ),
+            Some(e) => log::error!("settings cannot be read, defaults are in force: {e}"),
+            None => {}
         }
         // Before the voice is picked and the system prompt is written.
         let config = {
@@ -351,7 +403,7 @@ impl Ctx {
         let secrets: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore::new());
         let db = Arc::new(Db::open(&database_path()).map_err(|e| e.to_string())?);
         let history = db.load_messages(CONVERSATION).unwrap_or_else(|e| {
-            log::error!("cannot load history: {e}");
+            log::error!("cannot load the conversation, it starts empty: {e}");
             Vec::new()
         });
         // The adapters report every paid call here: installed before any of them is built.
@@ -387,9 +439,10 @@ impl Ctx {
         {
             config.assistant.onboarded = true;
             if let Err(e) = config.save(&config_path()) {
-                log::warn!("cannot save config: {e}");
+                log::warn!("cannot save settings: {e}");
             }
         }
+        *SAVED.lock() = Some(config.clone());
         let system_mic = Arc::new(mika_audio::SystemMicrophone::new(
             &config.voice.input_device,
         ));
@@ -631,6 +684,11 @@ impl Ctx {
             move |text| {
                 if mika_core::costs::unattended_allowed() {
                     session.submit_task(&text);
+                } else {
+                    log::info!(
+                        target: "jobs",
+                        "scheduled task not started: the budget is reached"
+                    );
                 }
             },
         ));
@@ -697,11 +755,8 @@ impl Ctx {
         if self.config.lock().updates.check_at_start {
             let this = self.clone();
             tauri::async_runtime::spawn(async move {
-                match this.check_update().await {
-                    Ok(Some(m)) => log::info!("version {} is available", m.version),
-                    Ok(None) => {}
-                    Err(e) => log::warn!("update check failed: {e}"),
-                }
+                // What came of it is written by the check itself.
+                let _ = this.check_update().await;
             });
         }
         let timings = self.bus.clone();
@@ -868,6 +923,8 @@ impl Ctx {
                 "on"
             }
         };
+        // Why the bridge does not run is asked for more often than why it does.
+        log::info!(target: "telegram", "bridge set up: status={status}");
         *self.telegram_status.lock() = status.to_string();
     }
 
@@ -1052,7 +1109,7 @@ impl Ctx {
         if mika_audio::wake::heard_kind(heard, &name) == Some(mika_audio::wake::HeardKind::Stop) {
             let word = mika_audio::wake::stop_word(heard).unwrap_or_default();
             if speaking && !mika_audio::wake::is_echo(word, &self.speaking.lock()) {
-                log::info!("stop word heard while speaking: {word}");
+                log::info!(target: "voice", "stop word heard while speaking, she stops");
                 self.end_voice_dialog();
                 // A reply still being written would keep adding sentences.
                 if self.state.get() == AssistantState::Speaking {
@@ -1065,10 +1122,15 @@ impl Ctx {
         if self.state.get() == AssistantState::Speaking
             && mika_audio::wake::is_echo(&name, &self.speaking.lock())
         {
-            log::info!("wake phrase ignored: she said her own name");
+            log::info!(target: "voice", "wake phrase ignored: she said her own name");
             return;
         }
-        log::info!("wake phrase heard: {heard}");
+        // What was heard is the user's speech: written only while texts are.
+        log::info!(
+            target: "voice",
+            "wake phrase heard: heard={}",
+            mika_core::journal::content(heard)
+        );
         if let Some(app) = self.app.get() {
             crate::window::summon(app);
         }
@@ -1106,9 +1168,11 @@ impl Ctx {
             )
         };
         if !allowed {
+            log::info!(target: "voice", "voice question refused: reason=microphone_off");
             return Err(crate::strings::tr("error.mic_off"));
         }
         if !has_model {
+            log::info!(target: "voice", "voice question refused: reason=no_recognition_model");
             return Err(crate::strings::tr("error.stt_off"));
         }
         let control = {
@@ -1157,7 +1221,7 @@ impl Ctx {
         let text = self.live.transcribe(&wav).await;
         if text.is_ok() {
             let ms = asked.elapsed().as_millis() as u64;
-            log::info!("speech recognised in {ms} ms");
+            log::debug!(target: "voice", "spoken phrase recognised: ms={ms}");
             self.bus.publish(mika_core::Event::Timing {
                 stage: "stt".into(),
                 ms,
@@ -1362,8 +1426,10 @@ impl Ctx {
                 Ok(_) => answered += 1,
                 Err(e) => {
                     log::warn!(
-                        "price list of {} not read: {e}",
-                        mika_core::costs::provider_host(&address)
+                        target: "costs",
+                        "price list not read: host={} error={}",
+                        mika_core::costs::provider_host(&address),
+                        mika_core::journal::error_text(&e)
                     );
                     failure.get_or_insert(e);
                 }
@@ -1440,11 +1506,12 @@ impl Ctx {
     }
 
     pub fn save_config(&self) -> Result<(), String> {
-        let saved = self
-            .config
-            .lock()
-            .save(&config_path())
-            .map_err(|e| e.to_string());
+        let (now, saved) = {
+            let config = self.config.lock();
+            let saved = config.save(&config_path()).map_err(|e| e.to_string());
+            (config.clone(), saved)
+        };
+        note_save(&now, &saved);
         // The hotkeys of dictation and of the screen question exist only while
         // their own switch and «Микрофон» or «Экран» are on, whoever changed them.
         if let Some(app) = self.app.get() {
@@ -1605,6 +1672,25 @@ fn dictation_refusal(e: &mika_tools::direct::DirectError) -> String {
     crate::strings::tr(&format!("dictation.err_{}", e.code())).replace("{why}", e.why())
 }
 
+/// The record of a direct action that did not go through. A refusal that is
+/// expected (a blind-zone window, a password field, her own window) is an
+/// ordinary record with its code. A failure has a reason: the capture or the
+/// typing did not work, and the user was shown why. That reason is the
+/// system's or a tool's text; of it the journal keeps what quotes nothing
+/// (`journal::complaint`), and all of it while texts are written.
+fn direct_refusal_line(what: &str, e: &mika_tools::direct::DirectError) -> (log::Level, String) {
+    match e {
+        mika_tools::direct::DirectError::Failed(why) => (
+            log::Level::Warn,
+            format!(
+                "{what}: reason=failed error={}",
+                mika_core::journal::complaint(why)
+            ),
+        ),
+        other => (log::Level::Info, format!("{what}: reason={}", other.code())),
+    }
+}
+
 fn dictation_failed(why: &str) -> String {
     crate::strings::tr("dictation.err_failed").replace("{why}", why)
 }
@@ -1735,7 +1821,12 @@ impl Ctx {
     ) -> Result<(), Option<String>> {
         use mika_tools::direct::DictationEnd;
         let started = std::time::Instant::now();
-        let stop = |key: &str| Err(Some(crate::strings::tr(key)));
+        // The user is shown a line; the journal gets the reason, so that
+        // "the hotkey does nothing" has a record after `hotkey fired`.
+        let stop = |key: &str, reason: &str| {
+            log::info!(target: "voice", "dictation refused: reason={reason}");
+            Err(Some(crate::strings::tr(key)))
+        };
 
         let (allowed, has_model) = {
             let c = self.config.lock();
@@ -1745,15 +1836,15 @@ impl Ctx {
             )
         };
         if !allowed {
-            return stop("error.mic_off");
+            return stop("error.mic_off", "microphone_off");
         }
         if !has_model {
-            return stop("error.stt_off");
+            return stop("error.stt_off", "no_recognition_model");
         }
         // Also what keeps a tool of a running turn from starting a dictation
         // by "pressing" its hotkey.
         if self.occupied() {
-            return stop("dictation.err_busy");
+            return stop("dictation.err_busy", "busy");
         }
 
         // Runs after the first look at the window: nothing is recorded where
@@ -1808,7 +1899,13 @@ impl Ctx {
         };
         let recognise = |wav: Vec<u8>| async move {
             self.live.transcribe(&wav).await.map_err(|why| {
-                log::info!("dictation stopped: recognition failed");
+                // What the provider or the reader of its answer said, never
+                // what was dictated.
+                log::warn!(
+                    target: "voice",
+                    "dictation stopped: reason=recognition_failed error={}",
+                    mika_core::journal::error_text(&why)
+                );
                 Some(dictation_failed(&why))
             })
         };
@@ -1821,11 +1918,12 @@ impl Ctx {
         let (window, chars) = match typed {
             Ok(done) => done,
             Err(DictationEnd::Refused(e)) => {
-                log::info!("dictation stopped: {}", e.code());
+                let (level, line) = direct_refusal_line("dictation stopped", &e);
+                log::log!(target: "voice", level, "{line}");
                 return Err(Some(dictation_refusal(&e)));
             }
             Err(DictationEnd::Stopped(line)) => return Err(line),
-            Err(DictationEnd::NoSpeech) => return stop("dictation.err_no_speech"),
+            Err(DictationEnd::NoSpeech) => return stop("dictation.err_no_speech", "no_speech"),
         };
         self.audit.record(
             "dictation",
@@ -1834,8 +1932,10 @@ impl Ctx {
             "direct",
             "hotkey",
         );
+        // The program, never the title of its window or what was typed.
         log::info!(
-            "dictation: {chars} characters typed into {} in {} ms",
+            target: "voice",
+            "dictation typed: chars={chars} program={} ms={}",
             window.process,
             started.elapsed().as_millis()
         );
@@ -1846,16 +1946,19 @@ impl Ctx {
     /// Nothing leaves the computer here. The error is a ready line for the user.
     pub async fn screen_ask_capture(self: &Arc<Self>) -> Result<ScreenAskView, String> {
         if !self.config.lock().screen_ask.enabled {
+            log::info!(target: "hotkeys", "screen question: refused: reason=off");
             return Err(crate::strings::tr("screen_ask.err_off"));
         }
         // While she answers or listens no picture is taken: the question
         // could not be sent now, and a tool of the running turn that "pressed"
         // the hotkey must start nothing (decision 0030).
         if self.occupied() {
+            log::info!(target: "hotkeys", "screen question: refused: reason=busy");
             return Err(crate::strings::tr("screen_ask.err_busy"));
         }
         let front = self.direct.capture_front().await.map_err(|e| {
-            log::info!("screen question: no picture ({})", e.code());
+            let (level, line) = direct_refusal_line("screen question: no picture", &e);
+            log::log!(target: "hotkeys", level, "{line}");
             screen_ask_refusal(&e)
         })?;
         let kept = ScreenAskShot {
@@ -1864,8 +1967,10 @@ impl Ctx {
             at: std::time::Instant::now(),
         };
         let (view, at) = (kept.view(), kept.at);
+        // The program, never the title of its window.
         log::info!(
-            "screen question: took a {}x{} picture of a window of {}",
+            target: "hotkeys",
+            "screen question: picture taken: width={} height={} program={}",
             view.width,
             view.height,
             view.app
@@ -1914,11 +2019,13 @@ impl Ctx {
     fn screen_ask_ready(&self) -> Result<(), String> {
         use crate::strings::tr;
         if self.session.confirms.pending().is_some() {
+            log::info!(target: "hotkeys", "screen question: refused: reason=question_open");
             return Err(mika_core::session::answer_hint());
         }
         // A question goes out only between replies. This also keeps a tool of
         // a running turn from sending the picture through the card.
         if self.occupied() {
+            log::info!(target: "hotkeys", "screen question: refused: reason=busy");
             return Err(tr("screen_ask.err_busy"));
         }
         let waits = live_shot(&self.screen_ask.kept).is_some();
@@ -1926,6 +2033,7 @@ impl Ctx {
         let Some(key) = screen_ask_block(action_on, screen_on, !waits) else {
             return Ok(());
         };
+        log::info!(target: "hotkeys", "screen question: refused: reason={key}");
         let line = tr(key);
         if waits {
             // Switched off since the picture was taken: it is dropped, not
@@ -1964,7 +2072,8 @@ impl Ctx {
         let (shown, asked) = mika_tools::direct::screen_question(&kept.window, question);
         self.end_voice_dialog();
         log::info!(
-            "screen question: a {}x{} picture of a window of {}, question of {} characters",
+            target: "hotkeys",
+            "screen question: asked: width={} height={} program={} question_chars={}",
             kept.shot.width,
             kept.shot.height,
             kept.window.process,
@@ -1984,7 +2093,7 @@ impl Ctx {
                 let gone =
                     kept.expired() || ctx.screen_ask.dropped.load(Ordering::SeqCst) != asked_at;
                 if let Some(key) = screen_ask_block(action_on, screen_on, gone) {
-                    log::info!("screen question: not sent ({key})");
+                    log::info!(target: "hotkeys", "screen question: not sent: reason={key}");
                     return Err(tr(key));
                 }
                 // The row is written when the picture really leaves: a turn
@@ -2051,6 +2160,80 @@ impl Ctx {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_direct_action_that_failed_leaves_its_reason_and_a_refusal_its_code() {
+        use super::direct_refusal_line;
+        use mika_tools::direct::DirectError;
+        // An expected refusal: an ordinary record.
+        assert_eq!(
+            direct_refusal_line("dictation stopped", &DirectError::Password),
+            (
+                log::Level::Info,
+                "dictation stopped: reason=password".to_string()
+            )
+        );
+        assert_eq!(
+            direct_refusal_line("screen question: no picture", &DirectError::Blind).1,
+            "screen question: no picture: reason=blind"
+        );
+        // A failure the user was shown: a warning with what the system said.
+        // Texts are off in tests: what the reason quotes is not written.
+        let failed =
+            DirectError::Failed("не удалось снять окно: Отказано в доступе. (os error 5)".into());
+        assert_eq!(
+            direct_refusal_line("screen question: no picture", &failed),
+            (
+                log::Level::Warn,
+                "screen question: no picture: reason=failed error=<hidden 21 chars>: Отказано в доступе. (os error 5)"
+                    .to_string()
+            )
+        );
+        let titled = DirectError::Failed("нет окна «Письмо Ане — Почта»".into());
+        let (_, line) = direct_refusal_line("dictation stopped", &titled);
+        assert!(!line.contains("Письмо"), "{line}");
+        assert!(
+            line.starts_with("dictation stopped: reason=failed error=<hidden "),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_save_is_recorded_by_the_names_of_its_sections() {
+        use super::save_line;
+        use mika_core::config::Config;
+        let before = Config::default();
+        let mut now = before.clone();
+        now.assistant.name = "Тайное имя".into();
+        now.privacy.microphone_enabled = true;
+        assert_eq!(
+            save_line(Some(&before), &now, &Ok(())),
+            (
+                log::Level::Info,
+                "settings saved: sections=assistant,privacy".to_string()
+            )
+        );
+        // Nothing changed: detail.
+        assert_eq!(
+            save_line(Some(&now), &now, &Ok(())),
+            (
+                log::Level::Debug,
+                "settings saved: sections=none".to_string()
+            )
+        );
+        // The first save of a run has nothing to compare with.
+        assert_eq!(
+            save_line(None, &now, &Ok(())).1,
+            "settings saved: sections=unknown"
+        );
+        let (level, line) = save_line(Some(&before), &now, &Err("диск полон".into()));
+        assert_eq!(level, log::Level::Error);
+        assert_eq!(
+            line,
+            "settings not saved, they are in force until the app closes: sections=assistant,privacy error=диск полон"
+        );
+        assert!(!line.contains("Тайное"));
+    }
+
     #[test]
     fn recognizer_locale_from_language() {
         assert_eq!(super::speech_locale("ru"), "ru-RU");

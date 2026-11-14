@@ -248,6 +248,7 @@ describe('offLabel', () => {
       'briefing',
       'evening',
       'events',
+      'journal_content',
       'mcp',
       'docs',
       'scenarios',

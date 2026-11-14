@@ -18,4 +18,5 @@ windows.workspace = true
 windows-collections.workspace = true
 
 [dev-dependencies]
+mika-core = { workspace = true, features = ["testing"] }
 tempfile.workspace = true

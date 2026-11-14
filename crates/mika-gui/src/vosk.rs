@@ -92,7 +92,21 @@ pub async fn install(progress: impl Fn(u8)) -> Result<(), String> {
     if BUSY.swap(true, Ordering::Relaxed) {
         return Err(crate::strings::tr("error.vosk_busy"));
     }
+    let began = std::time::Instant::now();
+    log::info!("vosk download started");
     let result = install_parts(&progress).await;
+    match &result {
+        Ok(()) => log::info!(
+            "vosk downloaded and unpacked: ms={} bytes={}",
+            began.elapsed().as_millis(),
+            size()
+        ),
+        Err(e) => log::error!(
+            "vosk not downloaded, the name is heard by Windows: ms={} error={}",
+            began.elapsed().as_millis(),
+            mika_core::journal::error_text(e)
+        ),
+    }
     BUSY.store(false, Ordering::Relaxed);
     let _ = std::fs::remove_dir_all(mika_core::paths::vosk_dir().join(".download"));
     result
@@ -200,9 +214,15 @@ pub fn remove() -> Result<(), String> {
         return Err(crate::strings::tr("error.vosk_busy"));
     }
     match std::fs::remove_dir_all(mika_core::paths::vosk_dir()) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            log::info!("vosk removed");
+            Ok(())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.to_string()),
+        Err(e) => {
+            log::warn!("vosk not removed: {e}");
+            Err(e.to_string())
+        }
     }
 }
 

@@ -84,12 +84,31 @@ pub struct Service {
     /// The look at the watched windows that has not ended yet.
     windows_look: Option<JoinHandle<()>>,
     look_wait: Duration,
+    /// The scenarios could not be read at the last look: said once.
+    unread: bool,
 }
+
+/// The sensors that gave no answer at their last look. A sensor is asked
+/// every few seconds: the journal hears when it stops answering and when it
+/// answers again, not at every look.
+static SILENT_SENSORS: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
 
 /// What a sensor answered; a failure leaves that part of the look unknown.
 fn answer<T>(part: &str, result: Result<T, String>) -> Option<T> {
-    if result.is_err() {
-        log::debug!("the {part} sensor gave no answer");
+    let mut silent = SILENT_SENSORS.lock();
+    let was_silent = silent.iter().any(|p| p == part);
+    match &result {
+        Err(e) if !was_silent => {
+            silent.push(part.to_string());
+            log::warn!(
+                "a sensor gave no answer, scenarios and watches that need it wait: sensor={part} error={e}"
+            );
+        }
+        Ok(_) if was_silent => {
+            silent.retain(|p| p != part);
+            log::info!("a sensor answers again: sensor={part}");
+        }
+        _ => {}
     }
     result.ok()
 }
@@ -124,8 +143,8 @@ pub(crate) fn is_network(path: &std::path::Path) -> bool {
 
 /// Checks the watches against what was seen and tells about each that ended.
 fn tell_watches(waits: &Waits, on_tell: &Handler, world: &World, at: i64) {
-    for (id, text) in waits.check_all(world, at) {
-        log::info!("watch {id} ended");
+    // The store writes the record of each watch that ended.
+    for (_, text) in waits.check_all(world, at) {
         on_tell(&text, REMARK_WATCH);
     }
 }
@@ -150,6 +169,7 @@ impl Service {
             paths_look: None,
             windows_look: None,
             look_wait: LOOK_WAIT,
+            unread: false,
         }
     }
 
@@ -163,11 +183,21 @@ impl Service {
         }
         match self.deps.triggers.enabled() {
             Ok(list) => {
+                if self.unread {
+                    log::info!("scenarios are read again: enabled={}", list.len());
+                    self.unread = false;
+                } else {
+                    log::debug!("scenarios read: enabled={}", list.len());
+                }
                 self.triggers = list;
                 self.revision = Some(revision);
             }
-            Err(_) => {
-                log::warn!("scenarios cannot be read; trying again at the next look");
+            Err(e) => {
+                // Tried again at every look: said when it starts to fail.
+                if !self.unread {
+                    log::error!("scenarios cannot be read, none runs: {e}");
+                    self.unread = true;
+                }
                 self.triggers.clear();
                 self.revision = None;
             }
@@ -197,8 +227,7 @@ impl Service {
         // Reading windows was switched off: the watches of windows end now,
         // without one more read.
         if !(self.deps.windows_on)() {
-            for (id, text) in self.deps.waits.stop_windows() {
-                log::info!("watch {id} ended: window reading is off");
+            for (_, text) in self.deps.waits.stop_windows() {
                 (self.deps.on_tell)(&text, REMARK_WATCH);
             }
         }
@@ -345,8 +374,8 @@ impl Service {
 
     /// Switches a scenario off and says why in the chat.
     fn switch_off(&self, t: &Trigger, why: &str) {
-        if self.deps.triggers.set_enabled(t.id, false).is_err() {
-            log::warn!("scenario {} cannot be switched off", t.id);
+        if let Err(e) = self.deps.triggers.set_enabled(t.id, false) {
+            log::warn!("scenario cannot be switched off: id={} error={e}", t.id);
         }
         (self.deps.on_tell)(
             &format!("Сценарий «{}» выключен: {why}", t.name),
@@ -368,8 +397,11 @@ impl Service {
         let t = match self.deps.triggers.get(seen.id) {
             Ok(Some(t)) if t.enabled => t,
             Ok(_) => return,
-            Err(_) => {
-                log::warn!("scenario {} does not run: it cannot be read", seen.id);
+            Err(e) => {
+                log::warn!(
+                    "scenario skipped: id={} reason=cannot_be_read error={e}",
+                    seen.id
+                );
                 return;
             }
         };
@@ -381,7 +413,10 @@ impl Service {
             TriggerAction::Command(name) => match self.deps.commands.find(name) {
                 Some(command) if text_mark(&command.prompt) == t.pin => Some(command.prompt),
                 Some(_) => {
-                    log::info!("scenario {} is switched off: its command changed", t.id);
+                    log::warn!(
+                        "scenario skipped and switched off: id={} reason=command_changed",
+                        t.id
+                    );
                     self.switch_off(
                         &t,
                         &format!(
@@ -391,7 +426,10 @@ impl Service {
                     return;
                 }
                 None => {
-                    log::info!("scenario {} is switched off: its command is gone", t.id);
+                    log::warn!(
+                        "scenario skipped and switched off: id={} reason=command_gone",
+                        t.id
+                    );
                     self.switch_off(&t, &format!("команды «{name}» больше нет."));
                     return;
                 }
@@ -403,16 +441,16 @@ impl Service {
         // the pause and is not counted in the day. The user is told by the
         // cost tracker, once per period, not here.
         if !(self.deps.paid_allowed)() {
-            log::debug!("scenario {} is skipped: the budget is reached", t.id);
+            log::info!("scenario skipped: id={} reason=budget_reached", t.id);
             return;
         }
         // The runs of the last hour are kept in the database: a restart, a
         // deleted scenario or a second program of hers do not give them back.
         match self.deps.triggers.runs_since(at - 3600) {
             Ok(runs) => self.engine.restore_hour(&runs),
-            Err(_) => {
+            Err(e) => {
                 log::warn!(
-                    "scenario {} does not run: the runs of the hour cannot be read",
+                    "scenario skipped: id={} reason=hour_runs_unread error={e}",
                     t.id
                 );
                 return;
@@ -422,16 +460,27 @@ impl Service {
             Admit::Go => {
                 // A run that cannot be counted is not made: its pause and its
                 // day limit would not hold.
-                if self.deps.triggers.mark_fired(t.id, at, today).is_err() {
-                    log::warn!("scenario {} does not run: the run cannot be counted", t.id);
+                if let Err(e) = self.deps.triggers.mark_fired(t.id, at, today) {
+                    log::warn!(
+                        "scenario skipped: id={} reason=run_not_counted error={e}",
+                        t.id
+                    );
                     return;
                 }
                 let (shown, full) = task_text(&t, happened, prompt.as_deref());
-                log::info!("scenario {} runs: {}", t.id, t.event.as_str());
+                log::info!(
+                    "scenario runs: id={} event={} runs_today={}",
+                    t.id,
+                    t.event.as_str(),
+                    t.fired_today(today) + 1
+                );
                 (self.deps.on_task)(&shown, &full);
             }
             Admit::HourLimit => {
-                log::debug!("scenario {} is skipped: the hour limit", t.id);
+                log::info!(
+                    "scenario skipped: id={} reason=hour_limit max_per_hour={max_per_hour}",
+                    t.id
+                );
                 if self
                     .hour_note
                     .is_none_or(|told| at - told >= HOUR_NOTE_EVERY)
@@ -446,8 +495,16 @@ impl Service {
                     );
                 }
             }
-            Admit::Cooldown => log::debug!("scenario {} is skipped: its pause", t.id),
-            Admit::DayLimit => log::debug!("scenario {} is skipped: its day limit", t.id),
+            Admit::Cooldown => log::info!(
+                "scenario skipped: id={} reason=cooldown cooldown_s={}",
+                t.id,
+                t.cooldown_s
+            ),
+            Admit::DayLimit => log::info!(
+                "scenario skipped: id={} reason=day_limit max_per_day={}",
+                t.id,
+                t.max_per_day
+            ),
         }
     }
 }

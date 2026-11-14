@@ -529,7 +529,10 @@ fn worker(
                     engine = Some(e);
                 }
                 Err(err) => {
-                    log::warn!("voice is unavailable: {}", err.message());
+                    log::error!(
+                        "the voice of Windows did not start, nothing is said: {}",
+                        err.message()
+                    );
                     continue;
                 }
             }
@@ -557,7 +560,14 @@ fn worker(
                 let ready = || {
                     if s.first {
                         let ms = s.asked.elapsed().as_millis() as u64;
-                        log::info!("first sound after {ms} ms");
+                        log::info!(
+                            "first sound of the answer: ms={ms} engine={}",
+                            if s.remote.is_some() {
+                                "provider"
+                            } else {
+                                "windows"
+                            }
+                        );
                         if let Some(report) = observer.lock().clone() {
                             report(ms);
                         }
@@ -576,16 +586,28 @@ fn worker(
                 if stopped() {
                     continue;
                 }
+                // What is said is the model's text: its size only.
+                let chars = s.text.chars().count();
+                let began = std::time::Instant::now();
                 let result = match remote_result {
-                    Some(Ok(())) => Ok(()),
+                    Some(Ok(())) => Ok("provider"),
                     Some(Err(why)) => {
-                        log::warn!("remote speech failed, using the Windows voice: {why}");
-                        e.play(&s.text, s.tone, stopped, ready)
+                        log::warn!(
+                            "the voice of the provider failed, the phrase is said by Windows: chars={chars} error={}",
+                            mika_core::journal::error_text(&why)
+                        );
+                        e.play(&s.text, s.tone, stopped, ready).map(|()| "windows")
                     }
-                    None => e.play(&s.text, s.tone, stopped, ready),
+                    None => e.play(&s.text, s.tone, stopped, ready).map(|()| "windows"),
                 };
-                if let Err(err) = result {
-                    log::warn!("speech failed: {}", err.message());
+                match result {
+                    Ok(engine) => log::debug!(
+                        "phrase said: engine={engine} chars={chars} ms={}",
+                        began.elapsed().as_millis()
+                    ),
+                    Err(err) => {
+                        log::error!("phrase not said: chars={chars} error={}", err.message())
+                    }
                 }
             }
         }

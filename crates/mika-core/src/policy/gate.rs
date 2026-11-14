@@ -1,7 +1,7 @@
 //! The gate every tool call passes: rule, question, audit.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -42,35 +42,48 @@ impl PolicyGate {
 #[async_trait]
 impl Gate for PolicyGate {
     async fn check(&self, tool: &str, _args: &Value, a: &Assessment) -> GateDecision {
+        let risk = a.level.as_str();
         let rule = self.rules.find(tool, &a.scope).unwrap_or_else(|e| {
-            log::error!("cannot read rules: {e}");
+            log::error!("cannot read rules, the action is asked about: tool={tool} error={e}");
             None
         });
         match rule {
             Some(RuleDecision::Deny) => {
+                log::info!("action denied by a rule: tool={tool} risk={risk}");
                 self.log(tool, a, "deny", DecidedBy::Rule);
                 return GateDecision::Denied("запрещено правилом пользователя".into());
             }
             // High risk always asks, even if a rule slipped in.
             Some(RuleDecision::Allow) if a.level != RiskLevel::High => {
+                // The record of the call itself says `decision=rule`.
+                log::debug!("action allowed by a rule: tool={tool} risk={risk}");
                 self.log(tool, a, "allow", DecidedBy::Rule);
-                return GateDecision::Approved(Approval::new());
+                return GateDecision::Approved(Approval::given("rule"));
             }
             _ => {}
         }
 
+        let asked = Instant::now();
         let (answer, by) = self.confirms.ask(tool, a, self.timeout).await;
+        log::info!(
+            "question answered: tool={tool} risk={risk} answer={} by={} waited_ms={}",
+            answer_name(answer),
+            by.as_str(),
+            asked.elapsed().as_millis()
+        );
         match answer {
             Answer::Once => {
                 self.log(tool, a, "allow_once", by);
-                GateDecision::Approved(Approval::new())
+                GateDecision::Approved(Approval::given("asked_yes"))
             }
             Answer::Always => {
                 if let Err(e) = self.rules.add(tool, &a.scope, RuleDecision::Allow, a.level) {
-                    log::error!("cannot save rule: {e}");
+                    log::error!(
+                        "cannot save the rule, the action runs this once: tool={tool} error={e}"
+                    );
                 }
                 self.log(tool, a, "allow_always", by);
-                GateDecision::Approved(Approval::new())
+                GateDecision::Approved(Approval::given("asked_always"))
             }
             Answer::Deny => {
                 self.log(tool, a, "deny", by);
@@ -81,6 +94,16 @@ impl Gate for PolicyGate {
                 GateDecision::Denied("нет ответа 60 секунд, действие отклонено".into())
             }
         }
+    }
+}
+
+/// The answer to a question as the journal names it.
+fn answer_name(answer: Answer) -> &'static str {
+    match answer {
+        Answer::Once => "once",
+        Answer::Always => "always",
+        Answer::Deny => "deny",
+        Answer::Timeout => "timeout",
     }
 }
 
@@ -209,6 +232,32 @@ mod tests {
             _ => panic!("expected deny"),
         }
         assert_eq!(f.audit.recent(1)[0].decision, "timeout");
+    }
+
+    #[tokio::test]
+    async fn an_approval_remembers_how_it_was_given() {
+        let f = fixture(CONFIRM_TIMEOUT);
+        let how = |d: GateDecision| match d {
+            GateDecision::Approved(a) => a.how(),
+            GateDecision::Denied(_) => "denied",
+        };
+        assert_eq!(
+            how(check_answering(&f, RiskLevel::Medium, Some(Answer::Once)).await),
+            "asked_yes"
+        );
+        assert_eq!(
+            how(check_answering(&f, RiskLevel::Medium, Some(Answer::Always)).await),
+            "asked_always"
+        );
+        // The rule just made answers from now on.
+        assert_eq!(
+            how(check_answering(&f, RiskLevel::Medium, None).await),
+            "rule"
+        );
+        assert_eq!(
+            how(check_answering(&f, RiskLevel::High, Some(Answer::Deny)).await),
+            "denied"
+        );
     }
 
     #[tokio::test]

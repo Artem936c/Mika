@@ -93,8 +93,40 @@ fn client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
+/// A version as a record names it: what a manifest holds is text from the
+/// network.
+fn logged_version(version: &str) -> String {
+    version
+        .trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
+        .take(32)
+        .collect()
+}
+
 /// The manifest when it offers a version newer than this one.
 pub async fn check(manifest_url: &str) -> Result<Option<Manifest>, String> {
+    let found = look(manifest_url).await;
+    match &found {
+        Ok(Some(m)) => log::info!(
+            "update check: current={} found={}",
+            env!("CARGO_PKG_VERSION"),
+            logged_version(&m.version)
+        ),
+        Ok(None) => log::info!(
+            "update check: current={} found=none",
+            env!("CARGO_PKG_VERSION")
+        ),
+        Err(e) => log::warn!(
+            "update check failed: error={}",
+            mika_core::journal::error_text(e)
+        ),
+    }
+    found
+}
+
+/// `check` without its record.
+async fn look(manifest_url: &str) -> Result<Option<Manifest>, String> {
     let url = manifest_url.trim();
     if !url.starts_with("https://") {
         return Err("адрес файла обновлений должен начинаться с https://".into());
@@ -117,6 +149,26 @@ pub async fn check(manifest_url: &str) -> Result<Option<Manifest>, String> {
 
 /// Downloads the installer and checks its SHA-256. Returns its path.
 pub async fn download(m: &Manifest) -> Result<PathBuf, String> {
+    let began = std::time::Instant::now();
+    let version = logged_version(&m.version);
+    log::info!("update download started: version={version}");
+    let got = fetch(m).await;
+    let ms = began.elapsed().as_millis();
+    match &got {
+        Ok(installer) => {
+            let bytes = std::fs::metadata(installer).map(|f| f.len()).unwrap_or(0);
+            log::info!("update downloaded and checked: version={version} bytes={bytes} ms={ms}");
+        }
+        Err(e) => log::error!(
+            "update not downloaded, nothing is installed: version={version} ms={ms} error={}",
+            mika_core::journal::error_text(e)
+        ),
+    }
+    got
+}
+
+/// `download` without its records.
+async fn fetch(m: &Manifest) -> Result<PathBuf, String> {
     let bytes = client()?
         .get(&m.url)
         .send()
@@ -147,12 +199,27 @@ pub fn run_installer(installer: &std::path::Path) -> Result<(), String> {
         installer.display(),
         exe.display()
     );
-    crate::platform::run_after_exit(&then).map_err(|e| format!("установщик не запустился: {e}"))
+    crate::platform::run_after_exit(&then)
+        .map(|()| log::info!("the installer starts once the app has closed"))
+        .map_err(|e| {
+            log::error!("the installer was not started: {e}");
+            format!("установщик не запустился: {e}")
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_version_from_the_network_is_cut_to_what_a_version_is_made_of() {
+        assert_eq!(logged_version(" 0.5.0-pre.1 "), "0.5.0-pre.1");
+        assert_eq!(
+            logged_version("1.0\tINFO\napp\tfake record"),
+            "1.0INFOappfakerecord"
+        );
+        assert_eq!(logged_version(&"9".repeat(100)).len(), 32);
+    }
 
     #[test]
     fn versions_compare_like_semver() {

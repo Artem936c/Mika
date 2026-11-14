@@ -28,7 +28,52 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Tool output passed to the model, characters.
 const MAX_OUTPUT: usize = 16_000;
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, Failure>>>>>;
+
+/// Why a request got no result. The journal treats the three differently:
+/// what this client says about the connection is written as it is; what the
+/// server says is its own text and may quote the arguments of the call (a
+/// path it refused, the query it was given), so it is written only while
+/// texts are allowed.
+#[derive(Debug, Clone, PartialEq)]
+enum Failure {
+    /// Said by this client: no connection, no answer in time, the server
+    /// closed.
+    Own(String),
+    /// The message of a JSON-RPC error.
+    Server(String),
+    /// A refusal over HTTP: the status, and the line with the start of the
+    /// body.
+    Http(u16, String),
+}
+
+impl Failure {
+    /// The fields of a record about the failure, by the content switch.
+    fn fields(&self, content: bool) -> String {
+        use mika_core::journal;
+        match self {
+            Failure::Own(text) => {
+                format!("error_kind=transport error={}", journal::error_text(text))
+            }
+            Failure::Server(text) => format!(
+                "error_kind=server error={}",
+                journal::guarded_error_if(content, text)
+            ),
+            Failure::Http(status, text) => format!(
+                "error_kind=http http={status} error={}",
+                journal::guarded_error_if(content, text)
+            ),
+        }
+    }
+}
+
+impl From<Failure> for String {
+    fn from(failure: Failure) -> String {
+        match failure {
+            Failure::Own(text) | Failure::Server(text) | Failure::Http(_, text) => text,
+        }
+    }
+}
 type Writer = Box<dyn AsyncWrite + Send + Unpin>;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -59,12 +104,14 @@ struct HttpTransport {
 }
 
 /// The result or the error of a JSON-RPC answer.
-fn answer(msg: &Value) -> Result<Value, String> {
+fn answer(msg: &Value) -> Result<Value, Failure> {
     match msg.get("error") {
-        Some(e) => Err(e["message"]
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| e.to_string())),
+        Some(e) => Err(Failure::Server(
+            e["message"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| e.to_string()),
+        )),
         None => Ok(msg["result"].clone()),
     }
 }
@@ -146,7 +193,16 @@ impl McpClient {
                     let _ = tx.send(answer(&msg));
                 }
             }
-            log::warn!("MCP server {name} closed its output");
+            // The client holds the other handle to the waiting calls: when it
+            // is gone, the server was stopped on purpose.
+            if Arc::strong_count(&waiting) == 1 {
+                log::info!("server stopped: server={name}");
+            } else {
+                log::warn!(
+                    "server closed its output, it crashed or exited: server={name} waiting_calls={}",
+                    waiting.lock().len()
+                );
+            }
             // Wake everything that still waits: the server is gone.
             waiting.lock().clear();
         });
@@ -195,9 +251,10 @@ impl McpClient {
         t: &HttpTransport,
         msg: &Value,
         want: Option<u64>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, Failure> {
         use futures::StreamExt;
-        let fail = |what: String| format!("сервер «{}»: {what}", self.server);
+        let line = |what: String| format!("сервер «{}»: {what}", self.server);
+        let fail = |what: String| Failure::Own(line(what));
         let mut req = t
             .client
             .post(&t.url)
@@ -225,11 +282,14 @@ impl McpClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(fail(hide(format!(
-                "ответ {}: {}",
+            return Err(Failure::Http(
                 status.as_u16(),
-                cut(body.trim(), 200)
-            ))));
+                line(hide(format!(
+                    "ответ {}: {}",
+                    status.as_u16(),
+                    cut(body.trim(), 200)
+                ))),
+            ));
         }
         let Some(want) = want else {
             return Ok(Value::Null);
@@ -267,7 +327,11 @@ impl McpClient {
 
     async fn send(&self, msg: &Value) -> Result<(), String> {
         if let Some(t) = &self.http {
-            return self.http_post(t, msg, None).await.map(|_| ());
+            return self
+                .http_post(t, msg, None)
+                .await
+                .map(|_| ())
+                .map_err(String::from);
         }
         let mut line = msg.to_string();
         line.push('\n');
@@ -283,18 +347,18 @@ impl McpClient {
         method: &str,
         params: Value,
         timeout: Duration,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, Failure> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if let Some(t) = &self.http {
             let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
             return tokio::time::timeout(timeout, self.http_post(t, &msg, Some(id)))
                 .await
                 .unwrap_or_else(|_| {
-                    Err(format!(
+                    Err(Failure::Own(format!(
                         "сервер «{}» не ответил за {} секунд",
                         self.server,
                         timeout.as_secs()
-                    ))
+                    )))
                 });
         }
         let (tx, rx) = oneshot::channel();
@@ -304,18 +368,18 @@ impl McpClient {
             .await;
         if let Err(e) = sent {
             self.pending.lock().remove(&id);
-            return Err(e);
+            return Err(Failure::Own(e));
         }
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(format!("сервер «{}» закрылся", self.server)),
+            Ok(Err(_)) => Err(Failure::Own(format!("сервер «{}» закрылся", self.server))),
             Err(_) => {
                 self.pending.lock().remove(&id);
-                Err(format!(
+                Err(Failure::Own(format!(
                     "сервер «{}» не ответил за {} секунд",
                     self.server,
                     timeout.as_secs()
-                ))
+                )))
             }
         }
     }
@@ -369,13 +433,25 @@ impl McpClient {
 
     /// Text of the tool result. A result marked `isError` comes back as `Err`.
     pub async fn call_tool(&self, name: &str, args: &Value) -> Result<String, String> {
+        let asked = std::time::Instant::now();
         let v = self
             .request(
                 "tools/call",
                 json!({ "name": name, "arguments": args }),
                 CALL_TIMEOUT,
             )
-            .await?;
+            .await
+            .inspect_err(|failure| {
+                // No result: the connection failed, or the server refused
+                // the call in its own words. Those words are written only
+                // while texts are, like the error a tool reports below.
+                log::warn!(
+                    "call failed: server={} tool={name} ms={} {}",
+                    self.server,
+                    asked.elapsed().as_millis(),
+                    failure.fields(mika_core::journal::content_allowed())
+                );
+            })?;
         let mut parts = Vec::new();
         for item in v["content"].as_array().into_iter().flatten() {
             match item["type"].as_str() {
@@ -390,13 +466,26 @@ impl McpClient {
             }
         }
         let text = parts.join("\n");
+        let ms = asked.elapsed().as_millis();
         if v["isError"].as_bool() == Some(true) {
+            // What the tool says about its failure is its output: the record
+            // has it only while texts are allowed.
+            log::warn!(
+                "call answered with an error: server={} tool={name} ms={ms} error_kind=tool error={}",
+                self.server,
+                mika_core::journal::guarded_error(&text)
+            );
             return Err(if text.is_empty() {
                 "инструмент сообщил об ошибке".into()
             } else {
                 text
             });
         }
+        log::debug!(
+            "call answered: server={} tool={name} ms={ms} chars={}",
+            self.server,
+            text.chars().count()
+        );
         Ok(text)
     }
 }
@@ -499,6 +588,12 @@ pub async fn connect_all_with(
     let mut report = Vec::new();
     for cfg in servers.iter().filter(|s| s.enabled) {
         let token = token_of(&cfg.name);
+        let asked = std::time::Instant::now();
+        let transport = if cfg.url.trim().is_empty() {
+            "process"
+        } else {
+            "http"
+        };
         let result = async {
             let client = McpClient::start_with(cfg, token).await?;
             let list = client.list_tools().await?;
@@ -507,13 +602,24 @@ pub async fn connect_all_with(
         .await;
         match result {
             Ok((client, list)) => {
+                log::info!(
+                    "server started: server={} transport={transport} tools={} ms={}",
+                    cfg.name,
+                    list.len(),
+                    asked.elapsed().as_millis()
+                );
                 report.push((cfg.name.clone(), Ok(list.len())));
                 for info in list {
                     tools.push(Arc::new(McpTool::new(client.clone(), info)));
                 }
             }
             Err(e) => {
-                log::warn!("MCP server {} failed: {e}", cfg.name);
+                log::error!(
+                    "server did not start, its tools are missing: server={} transport={transport} ms={} error={}",
+                    cfg.name,
+                    asked.elapsed().as_millis(),
+                    mika_core::journal::error_text(&e)
+                );
                 report.push((cfg.name.clone(), Err(e)));
             }
         }
@@ -525,6 +631,50 @@ pub async fn connect_all_with(
 mod tests {
     use super::*;
     use tokio::io::{duplex, AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[test]
+    fn what_a_server_says_about_a_failed_call_is_written_only_while_texts_are() {
+        let said = "Access denied - path outside allowed directories: D:/docs/план.txt";
+        // The client's own words about the connection are always written.
+        let own = Failure::Own("сервер «files» не ответил за 120 секунд".into());
+        for content in [false, true] {
+            assert_eq!(
+                own.fields(content),
+                "error_kind=transport error=сервер «files» не ответил за 120 секунд"
+            );
+        }
+        // The server's words may quote the arguments of the call.
+        let server = Failure::Server(said.into());
+        let off = server.fields(false);
+        assert_eq!(off, "error_kind=server error=<hidden 66 chars>");
+        assert_eq!(
+            server.fields(true),
+            format!("error_kind=server error={said}")
+        );
+        // A refusal over HTTP keeps its status in both modes.
+        let http = Failure::Http(500, format!("сервер «files»: ответ 500: {said}"));
+        let off = http.fields(false);
+        assert!(
+            off.starts_with("error_kind=http http=500 error=<hidden "),
+            "{off}"
+        );
+        assert!(!off.contains("план"), "{off}");
+        assert!(http.fields(true).ends_with(said));
+        // The caller gets the text whatever its kind.
+        assert_eq!(String::from(server), said);
+    }
+
+    #[test]
+    fn the_error_of_a_json_rpc_answer_is_the_servers_own() {
+        let refused =
+            json!({ "id": 1, "error": { "code": -32000, "message": "no such file: a.txt" } });
+        assert_eq!(
+            answer(&refused),
+            Err(Failure::Server("no such file: a.txt".into()))
+        );
+        let done = json!({ "id": 1, "result": { "ok": true } });
+        assert_eq!(answer(&done), Ok(json!({ "ok": true })));
+    }
 
     /// A tiny MCP server over an in-memory pipe. Returns the client and what the server received.
     fn fake_server() -> (Arc<McpClient>, Arc<Mutex<Vec<Value>>>) {

@@ -159,15 +159,34 @@ impl Embedder for Live {
             return Err("модель эмбеддингов не задана".into());
         }
         let base = self.base(&base);
-        let v = self
+        let asked = std::time::Instant::now();
+        let answer = self
             .post(
                 format!("{base}/embeddings"),
                 self.key(EMBEDDING_SECRET_KEY),
                 json!({ "model": model, "input": texts }),
             )
-            .await?;
-        crate::metering::record_embedding(&base, &model, &v["usage"]);
-        parse_embeddings(&v, texts.len())
+            .await;
+        let vectors = answer.and_then(|v| {
+            crate::metering::record_embedding(&base, &model, &v["usage"]);
+            parse_embeddings(&v, texts.len())
+        });
+        let (level, line) = crate::trace::call_line(
+            "embeddings",
+            &base,
+            &model,
+            asked.elapsed().as_millis(),
+            &format!("inputs={}", texts.len()),
+            vectors.as_ref().map(|_| ()).map_err(String::as_str),
+        );
+        // Documents are indexed in many small batches: the good ones are detail.
+        let level = if level == log::Level::Info {
+            log::Level::Debug
+        } else {
+            level
+        };
+        log::log!(target: "llm", level, "{line}");
+        vectors
     }
 }
 
@@ -199,7 +218,18 @@ impl Live {
         if !cfg.vision_model.trim().is_empty() {
             cfg.model = cfg.vision_model.trim().to_string();
         }
-        let provider = build_provider(&cfg, self.secrets.as_ref()).map_err(|e| e.to_string())?;
+        let asked = std::time::Instant::now();
+        let provider = build_provider(&cfg, self.secrets.as_ref())
+            .inspect_err(|e| {
+                // No request is made, so no record of a request tells why.
+                log::warn!(
+                    target: "llm",
+                    "vision not asked: error_kind={} error={}",
+                    e.kind(),
+                    e.journal_text()
+                );
+            })
+            .map_err(|e| e.to_string())?;
         let mut user = ChatMessage::user(question);
         user.images = pngs.iter().map(|p| base64_engine().encode(p)).collect();
         let req = LlmRequest {
@@ -214,6 +244,15 @@ impl Live {
             }
         }
         if text.trim().is_empty() {
+            // The request itself ended well: its record says `outcome=ok`.
+            // This is the usual way a model that cannot see fails.
+            log::warn!(
+                target: "llm",
+                "vision gave no text: model={} pictures={} ms={}",
+                cfg.model,
+                pngs.len(),
+                asked.elapsed().as_millis()
+            );
             return Err(format!(
                 "модель {} ничего не ответила про картинку: возможно, она не умеет смотреть. Модель для зрения задаётся в настройках провайдера",
                 cfg.model
@@ -237,13 +276,25 @@ impl ImageGen for Live {
         }
         let key = self.key(IMAGE_SECRET_KEY);
         let base = self.base(&base);
-        let v = self
+        let asked = std::time::Instant::now();
+        let answer = self
             .post(
                 format!("{base}/images/generations"),
                 key.clone(),
                 json!({ "model": model, "prompt": prompt, "n": 1 }),
             )
-            .await?;
+            .await;
+        // What to draw is the user's text: only its size is written.
+        let (level, line) = crate::trace::call_line(
+            "picture",
+            &base,
+            &model,
+            asked.elapsed().as_millis(),
+            &format!("prompt_chars={}", prompt.chars().count()),
+            answer.as_ref().map(|_| ()).map_err(String::as_str),
+        );
+        log::log!(target: "llm", level, "{line}");
+        let v = answer?;
         // The provider answered: the picture is paid for, whatever comes of its download.
         crate::metering::record_image(&base, &model, &v["usage"]);
         let first = &v["data"][0];

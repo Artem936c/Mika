@@ -82,8 +82,19 @@ pub enum Placement {
     Restore,
 }
 
+/// `Windows::focus` off the async threads: a window that does not come
+/// forward at once is waited for, up to a second and a half.
+pub(crate) async fn focus(windows: &Arc<dyn Windows>, id: u64) -> Result<(), String> {
+    let windows = windows.clone();
+    tokio::task::spawn_blocking(move || windows.focus(id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 pub trait Windows: Send + Sync {
     fn list(&self) -> Vec<WindowInfo>;
+    /// Brings the window to the front and checks that it came. It may wait:
+    /// async code calls it through `focus` above.
     fn focus(&self, id: u64) -> Result<(), String>;
     /// Asks the window to close, like the close button.
     fn close(&self, id: u64) -> Result<(), String>;
@@ -149,6 +160,15 @@ pub struct UiNode {
     pub enabled: bool,
 }
 
+/// One tab of a window's own tab strip: a page of a browser, a file of an
+/// editor.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TabInfo {
+    pub name: String,
+    /// Whether it is the open one; `None` when the program does not tell.
+    pub selected: Option<bool>,
+}
+
 /// UI Automation: the tree of a window and actions on its elements.
 /// Element numbers come from the last `tree` call for that window.
 pub trait Ui: Send + Sync {
@@ -166,6 +186,20 @@ pub trait Ui: Send + Sync {
     /// treat the field as one it may not type into.
     fn focused_password(&self) -> Option<bool> {
         None
+    }
+    /// Tabs of the window's own interface, in their order; what a web page
+    /// draws inside is not looked at. Empty when the program shows none.
+    fn tabs(&self, _window: u64) -> Result<Vec<TabInfo>, String> {
+        Ok(Vec::new())
+    }
+    /// Whether the last `tabs` answer for the window left tabs out: there
+    /// were more of them than one reading takes.
+    fn tabs_cut(&self, _window: u64) -> bool {
+        false
+    }
+    /// Opens the tab with this index in the last `tabs` answer for the window.
+    fn select_tab(&self, _window: u64, _index: usize) -> Result<(), String> {
+        Err("переключение вкладок здесь недоступно".into())
     }
 }
 

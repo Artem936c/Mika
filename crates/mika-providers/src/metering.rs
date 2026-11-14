@@ -178,6 +178,11 @@ impl StreamMeter {
             self.tokens.get_or_insert_with(Tokens::default).output = output;
         }
     }
+
+    /// The tokens seen so far, for the record of the request.
+    pub fn tokens(&self) -> Option<Tokens> {
+        self.tokens
+    }
 }
 
 impl Drop for StreamMeter {
@@ -269,12 +274,24 @@ pub async fn run_price_refresher(live: Live, costs: Costs) {
             let now = unix_now();
             match live.unit_prices(&address).await {
                 Ok(prices) => {
-                    if let Err(e) = costs.set_list_prices(&address, prices, now) {
-                        log::warn!("price list of {} not kept: {e}", provider_host(&address));
+                    let models = prices.len();
+                    match costs.set_list_prices(&address, prices, now) {
+                        Ok(priced) => log::info!(
+                            "price list read: host={} models={models} calls_priced={priced}",
+                            provider_host(&address)
+                        ),
+                        Err(e) => log::warn!(
+                            "price list not kept: host={} error={e}",
+                            provider_host(&address)
+                        ),
                     }
                 }
                 Err(e) => {
-                    log::warn!("price list of {} not read: {e}", provider_host(&address));
+                    log::warn!(
+                        "price list not read: host={} error={}",
+                        provider_host(&address),
+                        mika_core::journal::error_text(&e)
+                    );
                     costs.note_price_failure(&address, now);
                 }
             }
@@ -374,8 +391,18 @@ impl Live {
         if let Some(k) = key.filter(|k| !k.is_empty()) {
             req = req.bearer_auth(k.expose());
         }
-        let resp = req.send().await.ok()?;
+        // A cost that cannot be asked for leaves the phrase counted without
+        // money: worth a line only when prices are being looked into.
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| log::debug!("cost of a generation not asked: {}", e.without_url()))
+            .ok()?;
         if !resp.status().is_success() {
+            log::debug!(
+                "cost of a generation not given: http={}",
+                resp.status().as_u16()
+            );
             return None;
         }
         generation_total(&resp.json::<Value>().await.ok()?)

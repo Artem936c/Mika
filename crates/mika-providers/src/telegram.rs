@@ -405,26 +405,35 @@ pub async fn handle_update_with(
         }
     };
     if owner == 0 || from != owner {
-        log::warn!("telegram message from a foreign account was refused");
+        // Who wrote is not the owner's data and is not kept.
+        log::warn!(
+            "message from a foreign account was refused: kind={} owner_set={}",
+            update_kind(&update),
+            owner != 0
+        );
         // Nothing of a foreign voice message is downloaded.
         if let Update::Text { .. } | Update::Voice { .. } = update {
-            let _ = api.send(from, FOREIGN_REPLY, &[]).await;
+            voice::tell(api, from, FOREIGN_REPLY).await;
         }
         return false;
     }
     match update {
         Update::Text { text, .. } => match text.trim() {
             "/start" | "/help" => {
-                let _ = api.send(owner, HELLO, &[]).await;
+                log::info!("incoming: kind=command command=help");
+                voice::tell(api, owner, HELLO).await;
             }
             "/stop" => {
+                log::info!("incoming: kind=command command=stop");
                 if let Some(v) = voice {
                     v.stopped();
                 }
                 session.stop();
-                let _ = api.send(owner, "Остановила.", &[]).await;
+                voice::tell(api, owner, "Остановила.").await;
             }
             other => {
+                // The text is the owner's: only its size is written.
+                log::info!("incoming: kind=text chars={}", other.chars().count());
                 if let Some(v) = voice {
                     v.typed();
                 }
@@ -436,8 +445,21 @@ pub async fn handle_update_with(
         Update::Button {
             callback_id, data, ..
         } => {
-            let _ = api.answer_button(&callback_id).await;
-            let reply = match parse_button(&data) {
+            if let Err(e) = api.answer_button(&callback_id).await {
+                // The button keeps spinning on the phone; the answer still counts.
+                log::debug!("button press not acknowledged: {e}");
+            }
+            let parsed = parse_button(&data);
+            log::info!(
+                "incoming: kind=button answer={}",
+                match parsed {
+                    Some((_, Answer::Once)) => "once",
+                    Some((_, Answer::Always)) => "always",
+                    Some((_, Answer::Deny)) => "deny",
+                    Some((_, Answer::Timeout)) | None => "unknown",
+                }
+            );
+            let reply = match parsed {
                 Some((id, answer)) => {
                     match session.confirms.answer(id, answer, DecidedBy::Telegram) {
                         Ok(()) => None,
@@ -452,7 +474,7 @@ pub async fn handle_update_with(
                 None => Some("Не поняла кнопку.".to_string()),
             };
             if let Some(text) = reply {
-                let _ = api.send(owner, &text, &[]).await;
+                voice::tell(api, owner, &text).await;
             }
         }
         Update::Voice {
@@ -476,6 +498,19 @@ pub async fn handle_update_with(
     true
 }
 
+/// The kind of an update as the journal names it.
+fn update_kind(update: &Update) -> &'static str {
+    match update {
+        Update::Text { .. } => "text",
+        Update::Button { .. } => "button",
+        Update::Voice { .. } => "voice",
+    }
+}
+
+/// How often a poll that keeps failing is written to the journal, in
+/// failures in a row: with ten seconds between tries, every five minutes.
+const POLL_NOTE_EVERY: u32 = 30;
+
 /// A typed message came while a question is open that Telegram was never
 /// sent: the question of a scenario, of a scheduled task or of a turn started
 /// at the computer. The message is not an answer to it. The owner gets the
@@ -490,8 +525,11 @@ async fn show_unseen(api: &dyn TelegramApi, session: &Arc<Session>, owner: i64, 
     let text = format!("{}\n\n{card}", tr("provider.tg_question_unseen"));
     match api.send(owner, &text, &buttons).await {
         // Only a card that really went out makes the next message an answer.
-        Ok(()) => session.question_shown(p.id, Origin::Telegram),
-        Err(err) => log::warn!("telegram send failed: {err}"),
+        Ok(()) => {
+            log::info!("question shown in Telegram on request: id={}", p.id);
+            session.question_shown(p.id, Origin::Telegram);
+        }
+        Err(err) => log::warn!("send failed: what=question id={} error={err}", p.id),
     }
 }
 
@@ -538,6 +576,19 @@ pub fn outgoing(event: &Event, origin: Origin) -> Option<(String, Vec<Button>)> 
         } => Some(confirm_message(*id, assessment, *allow_always)),
         Event::Error { message } => Some((format!("Не получилось: {message}"), Vec::new())),
         _ => None,
+    }
+}
+
+/// What goes to Telegram for a bus event, as the journal names it.
+fn outgoing_kind(event: &Event) -> &'static str {
+    match event {
+        Event::ReminderFired { .. } => "reminder",
+        Event::Remark { .. } => "watch",
+        Event::BgJobUpdated { .. } => "job",
+        Event::AssistantText { .. } => "reply",
+        Event::ConfirmRequested { .. } => "question",
+        Event::Error { .. } => "error",
+        _ => "other",
     }
 }
 
@@ -601,8 +652,16 @@ pub async fn run_bridge_with(
                             }
                         }
                         if let Some((text, buttons)) = outgoing(&e, origin) {
-                            if let Err(err) = api.send(owner, &text, &buttons).await {
-                                log::warn!("telegram send failed: {err}");
+                            let what = outgoing_kind(&e);
+                            match api.send(owner, &text, &buttons).await {
+                                // What was sent is hers and the owner's: its size only.
+                                Ok(()) => {
+                                    log::debug!("sent: what={what} chars={}", text.chars().count())
+                                }
+                                Err(err) => log::warn!(
+                                    "send failed: what={what} chars={} error={err}",
+                                    text.chars().count()
+                                ),
                             }
                         }
                         // The text went out just above, so the voice message
@@ -629,8 +688,11 @@ pub async fn run_bridge_with(
                             }
                         }
                     }
-                    Err(RecvError::Lagged(_)) => {
+                    Err(RecvError::Lagged(n)) => {
                         // Events were lost: which turn runs now is not known.
+                        log::warn!(
+                            "the bridge fell behind, something was not sent: lost_events={n}"
+                        );
                         if let Some(v) = &voice {
                             v.turn_ended();
                         }
@@ -705,7 +767,14 @@ pub async fn run_bridge_with(
         (queue, task)
     });
 
+    log::info!(
+        "bridge started: owner_set={} voice={}",
+        owner != 0,
+        voice.is_some()
+    );
     let mut offset = 0;
+    // Polls in a row that failed.
+    let mut failed: u32 = 0;
     loop {
         let polled = tokio::select! {
             _ = cancel.cancelled() => break,
@@ -713,6 +782,10 @@ pub async fn run_bridge_with(
         };
         match polled {
             Ok((updates, next)) => {
+                if failed > 0 {
+                    log::info!("poll works again: failed_polls={failed}");
+                    failed = 0;
+                }
                 offset = next;
                 for u in updates {
                     let u = match (&hearer, u) {
@@ -742,7 +815,11 @@ pub async fn run_bridge_with(
                             match voice::refusal(&session, voice.as_ref(), &message, now) {
                                 Some(why) => voice::tell(api.as_ref(), owner, &why).await,
                                 None => {
-                                    let _ = queue.send((message, session.stop_token()));
+                                    if queue.send((message, session.stop_token())).is_err() {
+                                        log::warn!(
+                                            "voice message lost: the task that hears them has ended"
+                                        );
+                                    }
                                 }
                             }
                             continue;
@@ -753,7 +830,12 @@ pub async fn run_bridge_with(
                 }
             }
             Err(e) => {
-                log::warn!("telegram poll failed: {e}");
+                // A bot that cannot be reached is asked again every ten
+                // seconds: the journal hears of it at once and then rarely.
+                if failed.is_multiple_of(POLL_NOTE_EVERY) {
+                    log::warn!("poll failed, trying again: failed_polls={failed} error={e}");
+                }
+                failed += 1;
                 tokio::select! {
                     _ = cancel.cancelled() => break,
                     _ = tokio::time::sleep(Duration::from_secs(10)) => {}
@@ -761,6 +843,7 @@ pub async fn run_bridge_with(
             }
         }
     }
+    log::info!("bridge stopped");
     sender.abort();
     if let Some(task) = watcher {
         task.abort();

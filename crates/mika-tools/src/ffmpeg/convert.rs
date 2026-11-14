@@ -244,6 +244,7 @@ impl AvConvertTool {
             copy_timeout(duration)
         };
         run_ffmpeg(
+            "av_convert",
             runner,
             &paths,
             &argv,
@@ -613,6 +614,7 @@ impl VideoCompressTool {
                 let video = h264.quality_args(plan.strong, w, h, v.fps.unwrap_or(30.0));
                 let argv = encode(video, None, part.path());
                 run_ffmpeg(
+                    "av_convert",
                     runner,
                     &paths,
                     &argv,
@@ -629,6 +631,7 @@ impl VideoCompressTool {
                 let log = work.path().join("mika2p");
                 let first = encode(h264.bitrate_args(kbps), Some((1, &log)), part.path());
                 run_ffmpeg(
+                    "av_convert",
                     runner,
                     &paths,
                     &first,
@@ -642,6 +645,7 @@ impl VideoCompressTool {
                 .await?;
                 let second = encode(h264.bitrate_args(kbps), Some((2, &log)), part.path());
                 run_ffmpeg(
+                    "av_convert",
                     runner,
                     &paths,
                     &second,
@@ -657,6 +661,7 @@ impl VideoCompressTool {
             Some(kbps) => {
                 let argv = encode(h264.bitrate_args(kbps), None, part.path());
                 run_ffmpeg(
+                    "av_convert",
                     runner,
                     &paths,
                     &argv,
@@ -676,6 +681,7 @@ impl VideoCompressTool {
                     let retry = PartFile::new(&job.output);
                     let argv = encode(h264.bitrate_args(again), None, retry.path());
                     run_ffmpeg(
+                        "av_convert",
                         runner,
                         &paths,
                         &argv,

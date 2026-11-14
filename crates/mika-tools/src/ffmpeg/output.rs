@@ -135,7 +135,11 @@ pub(crate) fn remove_later(path: PathBuf, folder: bool) {
                 Err(_) => std::thread::sleep(Duration::from_millis(200)),
             }
         }
-        log::warn!("cannot remove {}", path.display());
+        // The name of the file is the user's.
+        log::warn!(
+            "a half-written file or folder was not removed, something still holds it: folder={folder} path={}",
+            mika_core::journal::content(&path.display().to_string())
+        );
     });
 }
 

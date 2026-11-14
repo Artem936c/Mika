@@ -101,6 +101,25 @@ pub struct Fakes {
     pub browser_log: Mutex<Vec<String>>,
     /// `Input::modifiers_down` says "held" this many more times.
     pub modifiers_down: Mutex<u32>,
+    /// Tabs of a window by its id; a window that is not here shows none.
+    pub tabs: Mutex<HashMap<u64, Vec<TabInfo>>>,
+    /// The window of every `Ui::tabs` call.
+    pub tab_reads: Mutex<Vec<u64>>,
+    /// Every `Ui::select_tab` call: the window and the index.
+    pub tab_selects: Mutex<Vec<(u64, usize)>>,
+    /// The program takes the choice of a tab and opens nothing.
+    pub tab_stuck: Mutex<bool>,
+    /// Why `Ui::select_tab` fails.
+    pub tab_select_error: Mutex<Option<String>>,
+    /// Why `Ui::tabs` fails, and how long it takes to say so.
+    pub tab_read_error: Mutex<Option<(String, Duration)>>,
+    /// Windows whose tab list was cut: `Ui::tabs_cut` says so.
+    pub tabs_cut: Mutex<Vec<u64>>,
+    /// The title a window gets when this tab of it is chosen: (window, tab
+    /// index, new title). A browser window is titled by its open tab.
+    pub tab_titles: Mutex<Vec<(u64, usize, String)>>,
+    /// Why `Windows::focus` fails: the window does not come forward.
+    pub focus_error: Mutex<Option<String>>,
     /// What `Ui::focused_password` returns.
     pub focused_password: Mutex<bool>,
     /// `Ui::focused_password` cannot tell: it returns `None`.
@@ -282,6 +301,9 @@ impl Windows for Fake {
         self.0.windows.lock().clone()
     }
     fn focus(&self, id: u64) -> Result<(), String> {
+        if let Some(why) = self.0.focus_error.lock().clone() {
+            return Err(why);
+        }
         self.0.focused.lock().push(id);
         Ok(())
     }
@@ -353,6 +375,44 @@ impl Ui for Fake {
             return None;
         }
         Some(*self.0.focused_password.lock())
+    }
+    fn tabs(&self, window: u64) -> Result<Vec<TabInfo>, String> {
+        self.0.tab_reads.lock().push(window);
+        if let Some((why, after)) = self.0.tab_read_error.lock().clone() {
+            std::thread::sleep(after);
+            return Err(why);
+        }
+        Ok(self.0.tabs.lock().get(&window).cloned().unwrap_or_default())
+    }
+    fn tabs_cut(&self, window: u64) -> bool {
+        self.0.tabs_cut.lock().contains(&window)
+    }
+    fn select_tab(&self, window: u64, index: usize) -> Result<(), String> {
+        // Like the real one: only a tab of the window that was read last.
+        let read_last = self.0.tab_reads.lock().last() == Some(&window);
+        let mut all = self.0.tabs.lock();
+        let tabs = all
+            .get_mut(&window)
+            .filter(|tabs| read_last && index < tabs.len())
+            .ok_or("список вкладок устарел")?;
+        if let Some(why) = self.0.tab_select_error.lock().clone() {
+            return Err(why);
+        }
+        self.0.tab_selects.lock().push((window, index));
+        if !*self.0.tab_stuck.lock() {
+            for (i, tab) in tabs.iter_mut().enumerate() {
+                if tab.selected.is_some() {
+                    tab.selected = Some(i == index);
+                }
+            }
+            let titles = self.0.tab_titles.lock();
+            if let Some((_, _, title)) = titles.iter().find(|t| t.0 == window && t.1 == index) {
+                if let Some(w) = self.0.windows.lock().iter_mut().find(|w| w.id == window) {
+                    w.title = title.clone();
+                }
+            }
+        }
+        Ok(())
     }
 }
 

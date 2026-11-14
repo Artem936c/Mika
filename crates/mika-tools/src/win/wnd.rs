@@ -5,17 +5,24 @@ use windows::Win32::Graphics::Gdi::{
     MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
 use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindow, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, PostMessageW,
-    SetForegroundWindow, SetWindowPos, ShowWindow, GW_OWNER, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_CLOSE,
+    EnumWindows, GetAncestor, GetForegroundWindow, GetLastActivePopup, GetWindow, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsHungAppWindow, IsIconic,
+    IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SendMessageTimeoutW, SetForegroundWindow,
+    SetWindowPos, ShowWindow, ShowWindowAsync, SwitchToThisWindow, GA_ROOTOWNER, GW_OWNER,
+    HWND_TOP, SMTO_ABORTIFHUNG, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_CLOSE, WM_NULL,
 };
 
+use super::front::{
+    attach_plan, bring_forward, is_in_front, Desk, Peer, Rung, Sight, Tried, FRONT_POLL,
+};
 use crate::sys::{Placement, Rect, WindowInfo, Windows};
 
 fn title_of(h: HWND) -> String {
@@ -131,16 +138,22 @@ impl Windows for WinWindows {
     }
 
     fn focus(&self, id: u64) -> Result<(), String> {
-        let h = hwnd(id);
-        // SAFETY: plain calls on a window handle; a stale handle just fails.
-        unsafe {
-            if IsIconic(h).as_bool() {
-                let _ = ShowWindow(h, SW_RESTORE);
-            }
-            if SetForegroundWindow(h).as_bool() {
+        let window = hwnd(id);
+        let outcome = bring_forward(&mut WinDesk::new(window));
+        // The program only: a title may hold what the journal must not keep.
+        let process = process_name(window);
+        match outcome {
+            Ok(None) => {
+                log::debug!(target: "tool", "focus: {process} is in front already");
                 Ok(())
-            } else {
-                Err("Windows не дал переключить окно".into())
+            }
+            Ok(Some(rung)) => {
+                log::debug!(target: "tool", "focus: {process} came forward by {rung:?}");
+                Ok(())
+            }
+            Err(why) => {
+                log::warn!(target: "tool", "focus: {process} did not come forward: {why:?}");
+                Err(why.text().into())
             }
         }
     }
@@ -318,6 +331,237 @@ impl Windows for WinWindows {
             }
         }
         Ok(())
+    }
+}
+
+/// What the user gets when the window is activated: the dialog it owns and
+/// that was active last (a "Save as" over an editor), else the window itself.
+fn front_of(window: HWND) -> HWND {
+    // SAFETY: plain queries on a window handle; a stale handle gives a null one.
+    unsafe {
+        let popup = GetLastActivePopup(window);
+        if !popup.is_invalid() && popup != window && IsWindowVisible(popup).as_bool() {
+            popup
+        } else {
+            window
+        }
+    }
+}
+
+/// How long a window is given to answer an empty message before it is taken
+/// for one that does not answer.
+const ANSWER_WAIT_MS: u32 = 150;
+
+/// A minimized window is given this long to come back: 6 looks, 20 ms apart.
+const RESTORE_CHECKS: u32 = 6;
+const RESTORE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The thread of a window and whether the window answers now; `None` for a
+/// window that is gone.
+///
+/// `IsHungAppWindow` alone is not enough: it turns true only after five
+/// seconds of silence. So the window is also sent an empty message
+/// (`WM_NULL`: it does nothing and reads nothing) with a short wait.
+fn peer_of(window: HWND) -> Option<Peer> {
+    if window.is_invalid() {
+        return None;
+    }
+    // SAFETY: plain queries on a window handle; a stale handle gives thread 0.
+    unsafe {
+        let thread = GetWindowThreadProcessId(window, None);
+        if thread == 0 {
+            return None;
+        }
+        let answers = !IsHungAppWindow(window).as_bool()
+            && SendMessageTimeoutW(
+                window,
+                WM_NULL,
+                WPARAM(0),
+                LPARAM(0),
+                SMTO_ABORTIFHUNG,
+                ANSWER_WAIT_MS,
+                None,
+            )
+            .0 != 0;
+        Some(Peer { thread, answers })
+    }
+}
+
+/// Input queues attached to this thread. They are detached when this is
+/// dropped, on every way out.
+struct AttachedInput {
+    me: u32,
+    threads: Vec<u32>,
+}
+
+impl AttachedInput {
+    fn attach(&mut self, thread: u32) {
+        if self.threads.contains(&thread) {
+            return;
+        }
+        // SAFETY: plain call with two thread ids; it fails for a thread that
+        // is gone or has no message queue, and nothing is attached then.
+        if unsafe { AttachThreadInput(self.me, thread, true) }.as_bool() {
+            self.threads.push(thread);
+        }
+    }
+}
+
+impl Drop for AttachedInput {
+    fn drop(&mut self) {
+        for thread in self.threads.drain(..) {
+            // SAFETY: undoes the attach above; a thread that ended meanwhile
+            // makes the call fail, and its queue is gone with it.
+            let _ = unsafe { AttachThreadInput(self.me, thread, false) };
+        }
+    }
+}
+
+/// The real desktop for the ladder of `front.rs`.
+struct WinDesk {
+    window: HWND,
+    /// The window in front before anything was tried.
+    before: HWND,
+}
+
+impl WinDesk {
+    fn new(window: HWND) -> Self {
+        WinDesk {
+            window,
+            // SAFETY: plain query.
+            before: unsafe { GetForegroundWindow() },
+        }
+    }
+
+    fn set_foreground(&self) -> Tried {
+        // SAFETY: plain call on a window handle; a stale handle just fails.
+        if unsafe { SetForegroundWindow(front_of(self.window)) }.as_bool() {
+            Tried::Sent
+        } else {
+            Tried::Refused
+        }
+    }
+}
+
+impl Desk for WinDesk {
+    fn exists(&mut self) -> bool {
+        // SAFETY: plain query on a window handle.
+        unsafe { IsWindow(Some(self.window)) }.as_bool()
+    }
+
+    fn restore(&mut self) {
+        // SAFETY: plain calls on a window handle; a stale handle just fails.
+        unsafe {
+            if IsIconic(self.window).as_bool() {
+                // A window minimized from the maximized state comes back
+                // maximized. The request is posted, not sent: a window that
+                // does not answer must not hold this thread.
+                let _ = ShowWindowAsync(self.window, SW_RESTORE);
+                // A window that answers is back in a moment; one that does
+                // not is given no more than this.
+                for _ in 0..RESTORE_CHECKS {
+                    std::thread::sleep(RESTORE_POLL);
+                    if !IsIconic(self.window).as_bool() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn in_front(&mut self) -> bool {
+        // SAFETY: plain queries on window handles.
+        unsafe {
+            let front = GetForegroundWindow();
+            if front.is_invalid() {
+                return false;
+            }
+            let thread = GetWindowThreadProcessId(self.window, None);
+            is_in_front(Sight {
+                own: front == self.window
+                    || front == front_of(self.window)
+                    // A dialog of the window, whatever its depth.
+                    || GetAncestor(front, GA_ROOTOWNER) == self.window,
+                same_thread: thread != 0 && GetWindowThreadProcessId(front, None) == thread,
+                came: front != self.before,
+                blocked: !IsWindowEnabled(self.window).as_bool(),
+            })
+        }
+    }
+
+    fn input_allowed(&mut self) -> bool {
+        // The event goes to the window in front. It does nothing there, but a
+        // window of the blind zone gets no input from the assistant at all,
+        // and keys the user holds are left alone.
+        // SAFETY: plain query.
+        let front = unsafe { GetForegroundWindow() };
+        let blind =
+            !front.is_invalid() && mika_core::policy::blind::is_blind_title(&title_of(front));
+        !blind && !super::input::modifiers_held()
+    }
+
+    fn attempt(&mut self, rung: Rung) -> Tried {
+        match rung {
+            Rung::Plain => self.set_foreground(),
+            Rung::Attached => {
+                // A thread that shares the input queue of the foreground
+                // window counts as the foreground program, and may hand the
+                // foreground over. The price: Windows resets the key state of
+                // attached threads, so a key held meanwhile reads as released
+                // until it is pressed again. The attach lasts milliseconds.
+                // SAFETY: plain queries.
+                let (me, front) = unsafe { (GetCurrentThreadId(), GetForegroundWindow()) };
+                let target = front_of(self.window);
+                let Some(plan) = peer_of(target).and_then(|t| attach_plan(me, peer_of(front), t))
+                else {
+                    return Tried::Skipped;
+                };
+                let mut attached = AttachedInput {
+                    me,
+                    threads: Vec::new(),
+                };
+                for thread in &plan.threads {
+                    attached.attach(*thread);
+                }
+                if attached.threads.is_empty() {
+                    return Tried::Skipped;
+                }
+                if plan.raise {
+                    // Above the other windows, like `BringWindowToTop`, but
+                    // posted when the window's thread is not the attached one.
+                    // SAFETY: plain call on a window handle; a stale handle just fails.
+                    let _ = unsafe {
+                        SetWindowPos(
+                            target,
+                            Some(HWND_TOP),
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_ASYNCWINDOWPOS,
+                        )
+                    };
+                }
+                let tried = self.set_foreground();
+                drop(attached);
+                tried
+            }
+            Rung::AfterInput => {
+                if !super::input::nudge() {
+                    return Tried::Skipped;
+                }
+                self.set_foreground()
+            }
+            Rung::Switch => {
+                // SAFETY: plain call on a window handle; it returns nothing.
+                unsafe { SwitchToThisWindow(front_of(self.window), true) };
+                Tried::Sent
+            }
+        }
+    }
+
+    fn pause(&mut self) {
+        std::thread::sleep(FRONT_POLL);
     }
 }
 
@@ -564,6 +808,60 @@ mod tests {
                 "{seen:?} in {whole:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_handle_that_is_no_window_is_closed_and_never_in_front() {
+        // Nothing on the desktop is touched: the handle is no window.
+        let mut desk = WinDesk::new(hwnd(0));
+        assert!(!desk.exists());
+        assert!(!desk.in_front());
+        assert_eq!(front_of(hwnd(0)), hwnd(0));
+        // No thread to attach to: the attached way would be skipped.
+        assert_eq!(peer_of(hwnd(0)), None);
+        assert_eq!(WinWindows.focus(0), Err("окно закрыто".to_string()));
+    }
+
+    #[test]
+    #[ignore = "changes the foreground window of the live desktop and sends it one key release"]
+    fn the_input_way_alone_brings_a_window_forward() {
+        // Tells whether the event of `input::nudge` gives the right to change
+        // the foreground window: the documentation does not promise it.
+        let list = WinWindows.list();
+        let Some(first) = WinWindows.foreground() else {
+            return;
+        };
+        let Some(back) = list.iter().rev().find(|w| w.id != first.id) else {
+            return;
+        };
+        let mut desk = WinDesk::new(hwnd(back.id));
+        desk.restore();
+        assert!(desk.input_allowed(), "no keys held, no blind window");
+        assert_eq!(desk.attempt(Rung::AfterInput), Tried::Sent);
+        let came = (0..10).any(|_| {
+            desk.pause();
+            desk.in_front()
+        });
+        let _ = WinWindows.focus(first.id);
+        assert!(came, "the window did not come forward after the input");
+    }
+
+    #[test]
+    #[ignore = "changes the foreground window of the live desktop"]
+    fn a_window_from_the_back_comes_forward_and_the_first_one_returns() {
+        let list = WinWindows.list();
+        let Some(first) = WinWindows.foreground() else {
+            return;
+        };
+        let Some(back) = list.iter().rev().find(|w| w.id != first.id) else {
+            return;
+        };
+        WinWindows.focus(back.id).expect("the window comes forward");
+        let mut desk = WinDesk::new(hwnd(back.id));
+        assert!(desk.in_front());
+        WinWindows
+            .focus(first.id)
+            .expect("the first window returns");
     }
 
     #[test]

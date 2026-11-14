@@ -11,18 +11,32 @@ use crate::window::IslandRect;
 
 pub const EVENT_CHANNEL: &str = "mika://event";
 
+/// How often a failing emit is written to the journal, in failures in a row.
+const EMIT_NOTE_EVERY: u64 = 500;
+
 /// Forwards every bus event to the UI as JSON.
 pub fn spawn_bridge(app: AppHandle, bus: EventBus) {
     let mut rx = bus.subscribe();
     tauri::async_runtime::spawn(async move {
+        // Events come with every piece of a reply: a window that takes none
+        // is told at the first failure and then once in a while.
+        let mut failed: u64 = 0;
         loop {
             match rx.recv().await {
-                Ok(event) => {
-                    if let Err(e) = app.emit(EVENT_CHANNEL, &event) {
-                        log::warn!("emit failed: {e}");
+                Ok(event) => match app.emit(EVENT_CHANNEL, &event) {
+                    Ok(()) => failed = 0,
+                    Err(e) => {
+                        if failed.is_multiple_of(EMIT_NOTE_EVERY) {
+                            log::warn!(
+                                "the window does not take events, the chat may show nothing: failed_in_a_row={failed} error={e}"
+                            );
+                        }
+                        failed += 1;
                     }
+                },
+                Err(RecvError::Lagged(n)) => {
+                    log::warn!("the window fell behind, the chat lost something: lost_events={n}")
                 }
-                Err(RecvError::Lagged(n)) => log::warn!("UI bridge lagged by {n} events"),
                 Err(RecvError::Closed) => break,
             }
         }
@@ -504,7 +518,7 @@ pub fn wipe_all_data(app: AppHandle, ctx: CtxState<'_>) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     crate::platform::wipe_all_data(ctx.secrets.as_ref())?;
-    log::info!("all data wiped, exiting");
+    log::warn!(target: "app", "all data wiped on the user's request, exiting");
     app.exit(0);
     Ok(())
 }

@@ -1,51 +1,93 @@
-//! Process-level Windows glue: log file, single instance, autostart, wiping data.
+//! Process-level Windows glue: the journal, single instance, autostart, wiping data.
 
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::Arc;
 
-use mika_core::paths::{data_dir, logs_dir};
+use mika_core::config::Config;
+use mika_core::journal::{self, Journal};
+use mika_core::paths::{config_path, data_dir, logs_dir};
 use mika_core::secrets::SecretStore;
 
-const LOG_LIMIT: u64 = 5 * 1024 * 1024;
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const RUN_VALUE: &str = "Mika";
+const WINDOWS_KEY: &str = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion";
 
-/// Writes every log line to stderr and to `mika.log`.
-struct Tee(Option<File>);
-
-impl Write for Tee {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let _ = std::io::stderr().write_all(buf);
-        if let Some(f) = &mut self.0 {
-            let _ = f.write_all(buf);
+/// Opens the journal of the app in the logs folder and makes it the sink of
+/// the `log` macros (decision 0036). Its settings are the `[log]` section of
+/// `config.toml`, read here because the journal starts before everything
+/// else; a file that cannot be read gives the defaults, and `Ctx::build`
+/// reports the error. A panic leaves a record, and the run is marked as
+/// started. Every record also goes to stderr, which a console build shows.
+///
+/// Call it only in the single instance: two processes cannot write and
+/// rotate the files of one folder.
+pub fn init_logging() -> Option<Arc<Journal>> {
+    let config = Config::load(&config_path())
+        .map(|c| c.log)
+        .unwrap_or_default();
+    journal::install_panic_hook();
+    let installed = journal::install(journal::Options {
+        dir: Some(logs_dir()),
+        stderr: true,
+        config,
+        ..Default::default()
+    });
+    match installed {
+        Ok(journal) => {
+            journal.begin_run();
+            Some(journal)
         }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if let Some(f) = &mut self.0 {
-            f.flush()?;
+        Err(e) => {
+            eprintln!("the journal is not installed: {e}");
+            None
         }
-        Ok(())
     }
 }
 
-/// Opens `mika.log`; a file over 5 MB becomes `mika.old.log`.
-fn open_log(dir: &Path) -> Option<File> {
-    std::fs::create_dir_all(dir).ok()?;
-    let path = dir.join("mika.log");
-    if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_LIMIT) {
-        let _ = std::fs::rename(&path, dir.join("mika.old.log"));
+/// The run ends in an orderly way: the marker of the run is removed and what
+/// is buffered reaches the file. Records written later are still kept; call
+/// `mika_core::journal::flush` after the last of them.
+pub fn end_logging() {
+    if let Some(journal) = journal::global() {
+        journal.end_run();
     }
-    OpenOptions::new().create(true).append(true).open(path).ok()
 }
 
-pub fn init_logging() {
-    let file = open_log(&logs_dir());
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .target(env_logger::Target::Pipe(Box::new(Tee(file))))
-        .init();
+/// `Windows 11 Pro 24H2 (build 26100.2314)` from what the registry tells.
+/// Parts that are missing are left out.
+fn windows_text(product: &str, display: &str, build: &str, revision: Option<u32>) -> String {
+    let mut name = product.trim().to_string();
+    // The registry of Windows 11 still says "Windows 10": builds from 22000 on are 11.
+    if build.trim().parse::<u32>().is_ok_and(|b| b >= 22000) {
+        name = name.replacen("Windows 10", "Windows 11", 1);
+    }
+    if name.is_empty() {
+        name = "Windows".into();
+    }
+    if !display.trim().is_empty() {
+        name = format!("{name} {}", display.trim());
+    }
+    match (build.trim(), revision) {
+        ("", _) => name,
+        (build, Some(revision)) => format!("{name} (build {build}.{revision})"),
+        (build, None) => format!("{name} (build {build})"),
+    }
+}
+
+/// The edition and build of Windows, for the journal and the problem report.
+pub fn windows_build() -> String {
+    let key = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(WINDOWS_KEY, winreg::enums::KEY_READ);
+    let Ok(key) = key else {
+        return "Windows".into();
+    };
+    let text = |name: &str| key.get_value::<String, _>(name).unwrap_or_default();
+    windows_text(
+        &text("ProductName"),
+        &text("DisplayVersion"),
+        &text("CurrentBuild"),
+        key.get_value::<u32, _>("UBR").ok(),
+    )
 }
 
 /// Holds the named mutex for the life of the process.
@@ -210,6 +252,34 @@ mod tests {
         assert_ne!(a, main);
         assert_eq!(a, instance_name(Some(r"C:\TMP\A")));
         assert_ne!(a, instance_name(Some(r"C:\tmp\b")));
+    }
+
+    #[test]
+    fn windows_is_named_by_edition_release_and_build() {
+        assert_eq!(
+            windows_text("Windows 10 Pro", "24H2", "26100", Some(2314)),
+            "Windows 11 Pro 24H2 (build 26100.2314)"
+        );
+        assert_eq!(
+            windows_text("Windows 10 Home", "22H2", "19045", Some(5131)),
+            "Windows 10 Home 22H2 (build 19045.5131)"
+        );
+        assert_eq!(
+            windows_text("Windows Server 2025 Standard", "24H2", "26100", None),
+            "Windows Server 2025 Standard 24H2 (build 26100)"
+        );
+        // Whatever is missing is left out.
+        assert_eq!(windows_text("", "", "", Some(1)), "Windows");
+        assert_eq!(
+            windows_text(" ", "", "19045", None),
+            "Windows (build 19045)"
+        );
+        // This machine tells something, and on one line.
+        let here = windows_build();
+        assert!(
+            here.starts_with("Windows") && !here.contains('\n'),
+            "{here}"
+        );
     }
 
     #[test]

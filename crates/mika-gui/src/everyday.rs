@@ -125,7 +125,10 @@ impl Ctx {
                     Ok(Ok(v)) => v,
                     Ok(Err(e)) => {
                         if !warned {
-                            log::warn!("notifications are unavailable: {e}");
+                            log::warn!(
+                                target: "events",
+                                "notifications of Windows cannot be read, none is shown: {e}"
+                            );
                             warned = true;
                         }
                         continue;
@@ -144,7 +147,8 @@ impl Ctx {
     }
 
     fn on_notification(self: &Arc<Self>, t: &Toast, read_aloud: bool) {
-        log::info!("notification from {}", t.app);
+        // The program that sent it; its title and text are the user's mail.
+        log::debug!(target: "events", "notification: program={}", t.app);
         let at = chrono::Local::now().timestamp();
         let watched = (t.app == "Telegram")
             .then(|| self.tool_env().shared.watches.matching(&t.title, at))
@@ -152,7 +156,20 @@ impl Ctx {
         // A reply in a chat she keeps up is a paid turn of her own: with the
         // budget reached the message is only shown, like any other
         // notification (decision 0028).
-        if let Some(w) = watched.filter(|_| mika_core::costs::unattended_allowed()) {
+        let held = watched.is_some() && !mika_core::costs::unattended_allowed();
+        if held {
+            log::info!(
+                target: "events",
+                "watched chat reply skipped: reason=budget_reached program={}",
+                t.app
+            );
+        }
+        if let Some(w) = watched.filter(|_| !held) {
+            log::info!(
+                target: "events",
+                "a watched chat got a message, a reply is being written: program={}",
+                t.app
+            );
             self.publish_notification(t);
             let task = mika_tools::watch::reply_task(&w, &t.app, &t.text);
             self.session.submit_task(&task);
@@ -187,6 +204,8 @@ impl Ctx {
         let me = Arc::downgrade(self);
         tauri::async_runtime::spawn(async move {
             let mut waiting: Option<Instant> = None;
+            // The day a summary held by the budget was last written about.
+            let mut held_on: Option<chrono::NaiveDate> = None;
             loop {
                 tokio::time::sleep(BRIEFING_EVERY).await;
                 let Some(ctx) = me.upgrade() else { break };
@@ -217,6 +236,16 @@ impl Ctx {
                 // the budget frees on the same day; the user is told once per
                 // period by the tracker, not every half a minute.
                 if !mika_core::costs::unattended_allowed() {
+                    // Once a day, not at every look: "why was there no
+                    // summary today" has its record.
+                    if held_on != Some(now.date()) {
+                        held_on = Some(now.date());
+                        log::info!(
+                            target: "jobs",
+                            "summary held: kind={} reason=budget_reached",
+                            if due { "morning" } else { "evening" }
+                        );
+                    }
                     continue;
                 }
                 // The same test as the calendar reader's: on, with a link.
@@ -240,20 +269,17 @@ impl Ctx {
                 if evening_due {
                     ctx.config.lock().briefing.evening_last_date =
                         now.date().format("%Y-%m-%d").to_string();
-                    if let Err(e) = ctx.save_config() {
-                        log::warn!("cannot save config: {e}");
-                    }
-                    log::info!("evening summary");
+                    // A save that failed is written by `save_config`.
+                    let _ = ctx.save_config();
+                    log::info!(target: "jobs", "evening summary starts");
                     if let Err(why) = ctx.evening_summary().await {
-                        log::warn!("the day is not summed up: {why:?}");
+                        log::warn!(target: "jobs", "evening summary not made: reason={why:?}");
                     }
                     continue;
                 }
                 ctx.config.lock().briefing.last_date = now.date().format("%Y-%m-%d").to_string();
-                if let Err(e) = ctx.save_config() {
-                    log::warn!("cannot save config: {e}");
-                }
-                log::info!("morning summary");
+                let _ = ctx.save_config();
+                log::info!(target: "jobs", "morning summary starts");
                 ctx.session.submit_task(&briefing_task(&city, calendar));
             }
         });

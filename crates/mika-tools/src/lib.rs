@@ -17,6 +17,7 @@ pub mod files;
 pub mod focus;
 pub mod image;
 pub mod info;
+pub mod journal;
 pub mod media;
 pub mod memory;
 pub mod messenger;
@@ -102,6 +103,10 @@ const HINTS: &[(&str, &str)] = &[
     ("media_control", "пауза, следующий или предыдущий трек"),
     ("now_playing", "что сейчас играет"),
     ("open_app", "открыть программу"),
+    (
+        "focus_window",
+        "переключиться на окно, сделать его активным; открыть вкладку браузера по названию (аргумент tab)",
+    ),
     ("open_url", "открыть сайт в браузере"),
     ("find_files", "найти файл по имени"),
     ("search_text", "найти слово или фразу внутри файлов"),
@@ -221,6 +226,10 @@ const HINTS: &[(&str, &str)] = &[
         "как идёт фоновая работа с видео и звуком, что в очереди",
     ),
     ("bg_job_stop", "остановить фоновое задание"),
+    (
+        "journal_read",
+        "почему у самой помощницы что-то не сработало, зависло или сломалось, какие были ошибки",
+    ),
 ];
 
 /// Paragraph for the system prompt: requests and the registered tools that serve them.
@@ -274,6 +283,8 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
         }));
         reg.register(Arc::new(devices::RadioTool(env.radios.clone())));
         reg.register(Arc::new(devices::BrightnessTool(env.runner.clone())));
+        // The journal the app installed: what it did and what failed.
+        reg.register(Arc::new(journal::JournalReadTool(None)));
     }
 
     let ui_env = ui::UiEnv {
@@ -293,8 +304,16 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
             apps::OpenAppTool::with_start_menu(env.launcher.clone())
                 .waiting_for_window(env.windows.clone(), ui_env.own_process.clone()),
         ));
-        reg.register(Arc::new(apps::ListWindowsTool(env.windows.clone())));
-        reg.register(Arc::new(apps::FocusWindowTool(env.windows.clone())));
+        // Tabs are read like the rest of a window: only with the window tools on.
+        let tabs_ui = on("windows").then(|| env.ui.clone());
+        reg.register(Arc::new(apps::ListWindowsTool {
+            windows: env.windows.clone(),
+            ui: tabs_ui.clone(),
+        }));
+        reg.register(Arc::new(apps::FocusWindowTool {
+            windows: env.windows.clone(),
+            ui: tabs_ui,
+        }));
         reg.register(Arc::new(apps::CloseAppTool(env.windows.clone())));
         reg.register(Arc::new(ui::ArrangeWindowTool(ui_env.clone())));
         reg.register(Arc::new(messenger::MessengerSendTool(screen::ScreenEnv {
@@ -575,7 +594,7 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register_all(&mut reg, &env, &[]);
         let specs = reg.specs();
-        assert_eq!(specs.len(), 108);
+        assert_eq!(specs.len(), 109);
         for s in specs {
             assert_eq!(s.parameters["type"], "object", "{}", s.name);
             assert!(!s.description.is_empty());
@@ -621,6 +640,25 @@ mod tests {
         register_all(&mut reg, &env, &["windows".into(), "screen".into()]);
         assert!(reg.get("ui_click").is_none() && reg.get("screen_look").is_none());
         assert!(reg.get("arrange_window").is_some());
+    }
+
+    #[test]
+    fn the_journal_tool_is_a_system_tool_of_low_risk() {
+        use mika_core::tools::RiskLevel;
+
+        let (env, _) = testing::env();
+        let all = reg_with(&env, &[]);
+        let tool = all.get("journal_read").expect("journal_read is registered");
+        // Whatever it is asked, it only reads: the policy lets it through.
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"level": "debug", "minutes": 1440, "limit": 100}),
+        ] {
+            assert_eq!(tool.assess(&args).unwrap().level, RiskLevel::Low);
+        }
+        let without = reg_with(&env, &["system"]);
+        assert!(without.get("journal_read").is_none());
+        assert!(tool_hints(&all).unwrap().contains(": journal_read"));
     }
 
     #[test]

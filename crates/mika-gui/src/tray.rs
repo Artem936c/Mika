@@ -258,7 +258,7 @@ fn stop_recording(app: &AppHandle) {
         return;
     };
     if let Err(e) = ctx.jobs.stop(job.id) {
-        log::warn!("cannot stop the recording: {e}");
+        log::warn!(target: "jobs", "the recording was not stopped from the tray: id={} error={e}", job.id);
     }
 }
 

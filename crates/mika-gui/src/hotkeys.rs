@@ -115,7 +115,7 @@ fn unbind(app: &AppHandle, id: &str) {
             .global_shortcut()
             .unregister(combo.accelerator().as_str())
         {
-            log::warn!("hotkey `{id}`: cannot release {combo}: {e}");
+            log::warn!("hotkey not released: id={id} combo={combo} error={e}");
         }
         // Only now: while Windows still listens, the tools must not press it.
         let mut registry = registry().lock();
@@ -148,6 +148,7 @@ fn free(app: &AppHandle, combo: &Combo) -> bool {
 pub fn apply(app: &AppHandle, ctx: &Ctx, id: &'static str) {
     unbind(app, id);
     if registry().lock().paused {
+        log::debug!("hotkey not registered now: id={id} reason=settings_open");
         return;
     }
     // Read first: the settings lock is not held across the plugin either.
@@ -155,21 +156,28 @@ pub fn apply(app: &AppHandle, ctx: &Ctx, id: &'static str) {
         let config = ctx.config.lock();
         (enabled_in(&config, id), plan(&config, id))
     };
-    registry().lock().applied.insert(id, on);
+    let was = registry().lock().applied.insert(id, on);
     if !on {
+        // Written when it becomes so, not at every save of the settings:
+        // "the hotkey does nothing" then has a record that says why.
+        if was != Some(false) {
+            log::info!("hotkey off: id={id} reason=switch_off");
+        }
         return;
     }
     for combo in tries {
         match register(app, id, &combo) {
             Ok(()) => {
-                log::info!("hotkey `{id}`: {combo} registered");
+                log::info!("hotkey registered: id={id} combo={combo}");
                 bind(id, combo);
                 return;
             }
-            Err(e) => log::warn!("hotkey `{id}`: {combo} is taken: {e}"),
+            Err(e) => {
+                log::warn!("hotkey not registered, it is taken: id={id} combo={combo} error={e}")
+            }
         }
     }
-    log::warn!("hotkey `{id}`: no free combination, the action has no hotkey");
+    log::error!("hotkey not registered: id={id} no free combination, the action has no hotkey");
 }
 
 /// Registers the hotkey of every action, in the order of the list.
@@ -245,10 +253,11 @@ fn fire(app: &AppHandle, id: &'static str, pressed: bool) {
     let echo = pressed && mika_tools::direct::keys_pressed_recently();
     if !takes(pressed, def.on_release, echo) {
         if echo {
-            log::info!("hotkey `{id}` ignored: it came with her own key presses");
+            log::info!("hotkey ignored: id={id} it came with her own key presses");
         }
         return;
     }
+    log::info!("hotkey fired: id={id} pressed={pressed}");
     let ctx = || app.state::<Arc<Ctx>>().inner().clone();
     match id {
         "chat" => crate::tray::open_chat(app),
@@ -260,7 +269,7 @@ fn fire(app: &AppHandle, id: &'static str, pressed: bool) {
         "selection" => crate::selection::on_shortcut(app, ctx()),
         "dictation" => crate::hotkey_actions::on_dictation(app, &ctx(), pressed),
         "screen_ask" => crate::hotkey_actions::on_screen_ask(app, ctx()),
-        other => log::warn!("hotkey `{other}` has no action"),
+        other => log::warn!("hotkey has no action: id={other}"),
     }
 }
 
@@ -386,7 +395,7 @@ pub fn hotkeys_set(
         if enabled(&ctx, id) {
             unbind(&app, id);
             if let Err(e) = register(&app, id, &new) {
-                log::warn!("hotkey `{id}`: {new} is taken: {e}");
+                log::warn!("hotkey not registered, it is taken: id={id} combo={new} error={e}");
                 match old {
                     Some(old) if register(&app, id, &old).is_ok() => bind(id, old),
                     // The settings are unchanged: whatever they give.
@@ -394,7 +403,7 @@ pub fn hotkeys_set(
                 }
                 return Err(taken());
             }
-            log::info!("hotkey `{id}`: {new} registered");
+            log::info!("hotkey registered: id={id} combo={new}");
             bind(id, new.clone());
         } else if !free(&app, &new) {
             return Err(taken());

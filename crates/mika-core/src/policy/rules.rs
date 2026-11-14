@@ -114,6 +114,13 @@ impl RuleStore {
                 |r| r.get(0),
             )
         })?;
+        // What the rule covers is a command, a folder or a site: the user's.
+        log::info!(
+            "rule added: id={id} tool={tool} decision={} risk={} pattern={}",
+            decision.as_str(),
+            level.as_str(),
+            crate::journal::guarded(pattern)
+        );
         Ok(Rule {
             id,
             tool: tool.into(),
@@ -145,10 +152,14 @@ impl RuleStore {
     }
 
     pub fn remove(&self, id: i64) -> Result<bool, PolicyError> {
-        Ok(self
+        let removed = self
             .db
             .with(|c| c.execute("DELETE FROM rules WHERE id = ?1", [id]))?
-            > 0)
+            > 0;
+        if removed {
+            log::info!("rule removed: id={id}");
+        }
+        Ok(removed)
     }
 
     /// A matching deny wins over a matching allow.
@@ -206,7 +217,7 @@ impl AuditLog {
             )
         });
         if let Err(e) = res {
-            log::error!("cannot write audit log: {e}");
+            log::error!("cannot write the audit log: tool={tool} decision={decision} error={e}");
         }
     }
 
@@ -228,7 +239,10 @@ impl AuditLog {
                 })?;
                 rows.collect()
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                log::warn!("cannot read the audit log, it is shown empty: {e}");
+                Vec::new()
+            })
     }
 }
 

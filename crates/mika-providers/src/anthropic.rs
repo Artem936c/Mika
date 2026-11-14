@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 
 use crate::common::{client, send, sse_stream, Step};
 use crate::metering::{request_kind, StreamMeter};
+use crate::trace::RequestLog;
 
 pub const API_VERSION: &str = "2023-06-01";
 pub const MAX_TOKENS: u32 = 4096;
@@ -123,68 +124,101 @@ impl LlmProvider for AnthropicProvider {
         if let Some(k) = &self.key {
             http = http.header("x-api-key", k.expose());
         }
-        let resp = send(http, self.key.as_ref()).await?;
+        // Written once, when the request is over, however it ends.
+        let mut log = RequestLog::new(
+            "anthropic",
+            &self.base_url,
+            &self.model,
+            request_kind(&req),
+            &req,
+        );
+        let resp = match send(http, self.key.as_ref()).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                log.failed(&e);
+                return Err(e);
+            }
+        };
+        log.answered(resp.status().as_u16());
 
         let mut uses: BTreeMap<u64, PendingUse> = BTreeMap::new();
         // Counts the request once, when the stream is over or dropped (decision 0028).
         let mut meter = StreamMeter::new(request_kind(&req), &self.base_url, &self.model, false);
-        Ok(sse_stream(resp, self.key.clone(), move |ev, out| {
-            let v: Value = serde_json::from_str(&ev.data)
-                .map_err(|e| LlmError::Protocol(format!("{e}: {}", ev.data)))?;
-            let kind = v["type"].as_str().or(ev.event.as_deref()).unwrap_or("");
-            match kind {
-                "message_start" => meter.anthropic_start(&v["message"]["usage"]),
-                "message_delta" => meter.anthropic_delta(&v["usage"]),
-                "content_block_start" => {
-                    let block = &v["content_block"];
-                    if block["type"] == "tool_use" {
-                        uses.insert(
-                            v["index"].as_u64().unwrap_or(0),
-                            PendingUse {
-                                id: block["id"].as_str().unwrap_or_default().to_string(),
-                                name: block["name"].as_str().unwrap_or_default().to_string(),
-                                json: String::new(),
-                            },
-                        );
+        Ok(sse_stream(
+            resp,
+            self.key.clone(),
+            log,
+            move |ev, out, log| {
+                let v: Value = serde_json::from_str(&ev.data).map_err(|e| LlmError::BadJson {
+                    why: e.to_string(),
+                    data: ev.data.clone(),
+                })?;
+                let kind = v["type"].as_str().or(ev.event.as_deref()).unwrap_or("");
+                match kind {
+                    "message_start" => {
+                        meter.anthropic_start(&v["message"]["usage"]);
+                        log.tokens(meter.tokens());
                     }
-                }
-                "content_block_delta" => {
-                    let d = &v["delta"];
-                    match d["type"].as_str() {
-                        Some("text_delta") => {
-                            if let Some(t) = d["text"].as_str().filter(|t| !t.is_empty()) {
-                                out.push(LlmChunk::Text(t.to_string()));
-                            }
+                    "message_delta" => {
+                        meter.anthropic_delta(&v["usage"]);
+                        log.tokens(meter.tokens());
+                        if let Some(reason) = v["delta"]["stop_reason"].as_str() {
+                            log.stop(reason);
                         }
-                        Some("input_json_delta") => {
-                            if let Some(u) = uses.get_mut(&v["index"].as_u64().unwrap_or(0)) {
-                                u.json
-                                    .push_str(d["partial_json"].as_str().unwrap_or_default());
-                            }
+                    }
+                    "content_block_start" => {
+                        let block = &v["content_block"];
+                        if block["type"] == "tool_use" {
+                            uses.insert(
+                                v["index"].as_u64().unwrap_or(0),
+                                PendingUse {
+                                    id: block["id"].as_str().unwrap_or_default().to_string(),
+                                    name: block["name"].as_str().unwrap_or_default().to_string(),
+                                    json: String::new(),
+                                },
+                            );
                         }
-                        _ => {}
                     }
-                }
-                "content_block_stop" => {
-                    if let Some(u) = uses.remove(&v["index"].as_u64().unwrap_or(0)) {
-                        let arguments = if u.json.trim().is_empty() {
-                            json!({})
-                        } else {
-                            serde_json::from_str(&u.json).unwrap_or(Value::String(u.json))
-                        };
-                        out.push(LlmChunk::ToolCall(ToolCall {
-                            id: u.id,
-                            name: u.name,
-                            arguments,
-                        }));
+                    "content_block_delta" => {
+                        let d = &v["delta"];
+                        match d["type"].as_str() {
+                            Some("text_delta") => {
+                                if let Some(t) = d["text"].as_str().filter(|t| !t.is_empty()) {
+                                    out.push(LlmChunk::Text(t.to_string()));
+                                }
+                            }
+                            Some("input_json_delta") => {
+                                if let Some(u) = uses.get_mut(&v["index"].as_u64().unwrap_or(0)) {
+                                    u.json
+                                        .push_str(d["partial_json"].as_str().unwrap_or_default());
+                                }
+                            }
+                            _ => {}
+                        }
                     }
+                    "content_block_stop" => {
+                        if let Some(u) = uses.remove(&v["index"].as_u64().unwrap_or(0)) {
+                            let arguments = if u.json.trim().is_empty() {
+                                json!({})
+                            } else {
+                                serde_json::from_str(&u.json).unwrap_or(Value::String(u.json))
+                            };
+                            out.push(LlmChunk::ToolCall(ToolCall {
+                                id: u.id,
+                                name: u.name,
+                                arguments,
+                            }));
+                        }
+                    }
+                    "message_stop" => return Ok(Step::Finished),
+                    // The provider's own refusal, sent after the status 200:
+                    // overloaded, the request is too large.
+                    "error" => return Err(LlmError::Provider(v["error"].to_string())),
+                    _ => {}
                 }
-                "message_stop" => return Ok(Step::Finished),
-                "error" => return Err(LlmError::Protocol(v["error"].to_string())),
-                _ => {}
-            }
-            Ok(Step::Continue)
-        }))
+                Ok(Step::Continue)
+            },
+        ))
     }
 }
 

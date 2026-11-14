@@ -90,6 +90,50 @@ pub async fn install(progress: impl Fn(u8) + Send + Sync) -> Result<(), String> 
         return Err(tr("error.ffmpeg_busy"));
     }
     let _busy = Busy;
+    let began = std::time::Instant::now();
+    log::info!(target: "jobs", "ffmpeg download started");
+    let step = Step::default();
+    let result = fetch(progress, &step).await;
+    match &result {
+        Ok(()) => log::info!(
+            target: "jobs",
+            "ffmpeg downloaded and unpacked: ms={} bytes={}",
+            began.elapsed().as_millis(),
+            size()
+        ),
+        Err(e) => log::error!(
+            target: "jobs",
+            "ffmpeg not downloaded: step={} ms={} error={}",
+            step.name(),
+            began.elapsed().as_millis(),
+            mika_core::journal::error_text(e)
+        ),
+    }
+    result
+}
+
+/// How far `fetch` got: the same "access denied" means different things
+/// while downloading, unpacking and putting the files in place.
+#[derive(Default)]
+struct Step(std::sync::atomic::AtomicUsize);
+
+const STEPS: [&str; 5] = ["prepare", "download", "unpack", "pick_files", "replace"];
+
+impl Step {
+    fn set(&self, name: &str) {
+        if let Some(at) = STEPS.iter().position(|step| *step == name) {
+            self.0.store(at, Ordering::Relaxed);
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        STEPS[self.0.load(Ordering::Relaxed).min(STEPS.len() - 1)]
+    }
+}
+
+/// `install` without its records; the caller holds the busy mark.
+async fn fetch(progress: impl Fn(u8) + Send + Sync, step: &Step) -> Result<(), String> {
+    step.set("prepare");
     let work = work_dir();
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| e.to_string())?;
@@ -101,13 +145,16 @@ pub async fn install(progress: impl Fn(u8) + Send + Sync) -> Result<(), String> 
         .build()
         .map_err(|e| e.to_string())?;
     let zip = work.join("ffmpeg.zip");
+    step.set("download");
     download(&client, &refused, &zip, &progress).await?;
 
+    step.set("unpack");
     let out = work.join("out");
     std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
     unzip(&zip, &out).await?;
     let _ = std::fs::remove_file(&zip);
 
+    step.set("pick_files");
     let unpacked = out.join(INNER);
     let fresh = work.join("fresh");
     std::fs::create_dir_all(&fresh).map_err(|e| e.to_string())?;
@@ -121,19 +168,19 @@ pub async fn install(progress: impl Fn(u8) + Send + Sync) -> Result<(), String> 
         std::fs::rename(&source, fresh.join(to)).map_err(|e| e.to_string())?;
     }
 
+    step.set("replace");
     let target = mika_core::paths::ffmpeg_dir();
     match std::fs::remove_dir_all(&target) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            log::warn!("cannot replace the downloaded FFmpeg: {e}");
+            log::warn!(target: "jobs", "the downloaded ffmpeg cannot be replaced, it is in use: {e}");
             return Err(tr("error.ffmpeg_in_use"));
         }
     }
     std::fs::rename(&fresh, &target).map_err(|e| e.to_string())?;
     progress(100);
     if installed() {
-        log::info!("FFmpeg downloaded into {}", target.display());
         Ok(())
     } else {
         Err(tr("error.ffmpeg_incomplete"))
@@ -252,7 +299,7 @@ pub fn remove() -> Result<(), String> {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => {
-            log::warn!("cannot delete the downloaded FFmpeg: {e}");
+            log::warn!(target: "jobs", "the downloaded ffmpeg cannot be deleted, it is in use: {e}");
             Err(tr("error.ffmpeg_in_use"))
         }
     }

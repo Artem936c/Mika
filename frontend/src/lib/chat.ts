@@ -468,6 +468,7 @@ const TOOL_GROUPS: Record<string, MessageKey> = {
   screen_record_stop: 'tool.av',
   bg_jobs: 'tool.av',
   bg_job_stop: 'tool.av',
+  journal_read: 'tool.journal',
 };
 
 /** Short label of the tool group for the pill in the "thinking" island. */

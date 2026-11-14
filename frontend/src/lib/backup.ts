@@ -141,7 +141,8 @@ export type OffItem =
         | 'calendar'
         | 'briefing'
         | 'evening'
-        | 'events';
+        | 'events'
+        | 'journal_content';
     }
   | { id: 'mcp' | 'docs' | 'scenarios'; count: number };
 

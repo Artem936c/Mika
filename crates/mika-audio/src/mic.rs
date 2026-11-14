@@ -303,7 +303,13 @@ impl SystemMicrophone {
         let format = config.sample_format();
         let stream_config: cpal::StreamConfig = config.into();
 
-        let on_error = |e| log::warn!("microphone stream error: {e}");
+        // A broken stream may call this again and again: once is enough.
+        let told = std::sync::atomic::AtomicBool::new(false);
+        let on_error = move |e| {
+            if !told.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!("microphone stream error: {e}");
+            }
+        };
         let stream = match format {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 stream_config,
@@ -354,7 +360,14 @@ impl Microphone for SystemMicrophone {
 
     fn record(&self, control: &MicControl) -> Result<Vec<u8>, MicError> {
         let (tx, rx) = mpsc::channel::<Vec<f32>>();
-        let (stream, rate) = self.open(tx)?;
+        let (stream, rate) = self.open(tx).inspect_err(|e| {
+            log::warn!(
+                "microphone did not open: outcome={} error={e}",
+                outcome_name(e)
+            );
+        })?;
+        let opened = std::time::Instant::now();
+        log::info!("microphone opened: rate={rate}");
 
         let frame_len = (rate as u64 * FRAME_MS as u64 / 1000).max(1) as usize;
         let mut samples: Vec<f32> = Vec::new();
@@ -397,11 +410,31 @@ impl Microphone for SystemMicrophone {
             }
         };
         drop(stream);
+        // What was said is not kept here, only how long the microphone was open.
+        log::info!(
+            "microphone closed: ms={} sound_s={:.1} outcome={}",
+            opened.elapsed().as_millis(),
+            samples.len() as f64 / f64::from(rate.max(1)),
+            outcome.as_ref().map_or_else(outcome_name, |()| "phrase")
+        );
+        if let Err(e @ MicError::Failed(_)) = &outcome {
+            log::warn!("recording broke off: {e}");
+        }
         outcome?;
         Ok(encode_wav(
             &resample(&samples, rate, TARGET_RATE),
             TARGET_RATE,
         ))
+    }
+}
+
+/// How a recording ended without a phrase, as the journal names it.
+fn outcome_name(error: &MicError) -> &'static str {
+    match error {
+        MicError::NoDevice => "no_device",
+        MicError::NoSpeech => "no_speech",
+        MicError::Cancelled => "cancelled",
+        MicError::Failed(_) => "failed",
     }
 }
 

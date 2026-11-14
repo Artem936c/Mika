@@ -13,6 +13,7 @@ mod ffmpeg_get;
 mod file_dialog;
 mod hotkey_actions;
 mod hotkeys;
+mod journal;
 mod lang;
 mod platform;
 mod research;
@@ -46,14 +47,14 @@ fn spawn_notifier(app: tauri::AppHandle, bus: EventBus, ctx: Arc<app::Ctx>) {
                 Ok(Event::ReminderFired { text, .. }) => {
                     let title = ctx.config.lock().assistant.name.clone();
                     if let Err(e) = app.notification().builder().title(title).body(text).show() {
-                        log::warn!("notification failed: {e}");
+                        log::warn!("the Windows notification of a reminder was not shown: {e}");
                     }
                 }
                 // What she was asked to watch for: the user may be in another program by now.
                 Ok(Event::Remark { text, kind }) if kind == mika_core::triggers::REMARK_WATCH => {
                     let title = ctx.config.lock().assistant.name.clone();
                     if let Err(e) = app.notification().builder().title(title).body(text).show() {
-                        log::warn!("notification failed: {e}");
+                        log::warn!("the Windows notification of a watch was not shown: {e}");
                     }
                 }
                 Ok(Event::StateChanged { to, .. }) => {
@@ -108,22 +109,55 @@ fn track_window(app: tauri::AppHandle, window: &tauri::WebviewWindow, ctx: Arc<a
 }
 
 fn main() {
-    platform::init_logging();
+    // Before the journal: the copy that is already running owns its files.
     let Some(_instance) = platform::single_instance() else {
-        log::info!("Mika is already running");
+        eprintln!("Mika is already running");
         return;
     };
-    log::info!("Mika {} starting", env!("CARGO_PKG_VERSION"));
+    platform::init_logging();
+    log::info!(
+        target: "app",
+        "Mika {} starting on {}",
+        env!("CARGO_PKG_VERSION"),
+        platform::windows_build()
+    );
 
     let bus = EventBus::new(1024);
     let state = StateHandle::new(bus.clone());
     let ctx = match app::Ctx::build(bus.clone(), state.clone()) {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            log::error!("cannot start: {e}");
+            log::error!(target: "app", "cannot start: {e}");
+            // Said and written down: the next start has nothing to warn about.
+            platform::end_logging();
             std::process::exit(1);
         }
     };
+    {
+        // Names of what is on, not what the settings hold.
+        let config = ctx.config.lock();
+        // What the hotkey and voice features hang on is named too: without
+        // a recognition model dictation, the voice question and Telegram
+        // voice all refuse, and that is the first thing to look at.
+        let set = |value: &str| {
+            if value.trim().is_empty() {
+                "none"
+            } else {
+                "set"
+            }
+        };
+        log::info!(
+            target: "app",
+            "started: language={} provider={} tools={} recognition_model={} vision_model={} level={} switches_on={}",
+            mika_core::i18n::lang().code(),
+            config.llm.kind.as_str(),
+            ctx.session.agent.registry().len(),
+            set(&config.voice.stt_model),
+            set(&config.llm.vision_model),
+            config.log.level.name(),
+            config.switches_on().join(",")
+        );
+    }
     let rect = Arc::new(Mutex::new(IslandRect::default()));
     let watch_state = state.clone();
     let emotions = mika_core::emotion::EmotionDriver::new(bus.clone());
@@ -213,6 +247,13 @@ fn main() {
             settings::load_picture,
             settings::open_picture,
             settings::problem_report,
+            journal::journal_view,
+            journal::journal_read,
+            journal::journal_tail,
+            journal::set_journal,
+            journal::journal_export,
+            journal::journal_clear,
+            journal::journal_crash_seen,
             settings::get_voice_settings,
             settings::set_voice,
             settings::test_voice,
@@ -335,6 +376,11 @@ fn main() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                // From here on the run counts as ended cleanly. The end of a
+                // Windows session comes this way too, and Windows may stop the
+                // process while the jobs below are still being saved.
+                log::info!(target: "app", "exit");
+                platform::end_logging();
                 // Background jobs are stopped, a recording is saved and half-written
                 // files are removed before the process ends. This waits for them,
                 // so from here on nothing asks this thread to redraw the tray.
@@ -342,6 +388,8 @@ fn main() {
                 app.state::<Arc<crate::app::Ctx>>().shutdown_media();
                 // Programs quietened for her voice get their sound back.
                 app.state::<Arc<crate::app::Ctx>>().restore_media();
+                // What the shutdown itself wrote.
+                mika_core::journal::flush();
             }
         });
 }

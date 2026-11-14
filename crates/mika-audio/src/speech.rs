@@ -1051,6 +1051,9 @@ struct Turn {
     chars: usize,
     /// The reply grew long: nothing of it is read out.
     long: bool,
+    /// The model asked for this reply to be said whole (decision 0037): it
+    /// is read out by sentences, however long, and not retold.
+    whole: bool,
     /// A multi-step task runs: steps are not spoken, only the end.
     task: bool,
     /// How the task of this turn ended, `Some(ok)`, once it has.
@@ -1081,8 +1084,10 @@ impl Turn {
 /// Reads replies, questions about actions and reminders aloud until the bus closes.
 ///
 /// With retelling on, a short reply is said whole once it ends, and a long one
-/// is replaced by a short retelling. During a multi-step task nothing of the
-/// steps is said: only the final reply, or why the task broke off.
+/// is replaced by a short retelling, unless the model asked for it to be said
+/// whole (`Event::SayWhole`): a joke or a poem is the thing asked for, and a
+/// retelling of it is not. During a multi-step task nothing of the steps is
+/// said: only the final reply, or why the task broke off.
 pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSwitch) {
     let mut events = bus.subscribe();
     let mut turn = Turn::default();
@@ -1128,7 +1133,10 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
     loop {
         let event = match events.recv().await {
             Ok(e) => e,
-            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Lagged(n)) => {
+                log::warn!("the speaker fell behind, part of a reply is not said: lost_events={n}");
+                continue;
+            }
             Err(RecvError::Closed) => break,
         };
         match &event {
@@ -1140,8 +1148,11 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
             } => confirming = false,
             _ => {}
         }
-        let brief = switch.brief();
+        // A reply the model wants said whole sounds as if retelling were off.
+        let brief = switch.brief() && !turn.whole;
         match event {
+            // Comes before the first piece of the reply it is about.
+            Event::SayWhole => turn.whole = true,
             // An answer to the question: her voice stops, the turn goes on.
             Event::UserText { .. } if confirming => stop(),
             // A new message interrupts whatever she was saying.
@@ -1171,6 +1182,12 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
                 turn = Turn::default();
                 streamed = false;
             }
+            // The turn is over. A reply stopped half-way leaves no request to
+            // say the next one whole: a finished one has reset the turn already.
+            Event::StateChanged {
+                to: AssistantState::Idle,
+                ..
+            } => turn.whole = false,
             Event::TaskUpdated { task } => {
                 if !task.finished && !turn.task {
                     // What was waiting to be said belongs to the steps now.
@@ -1635,6 +1652,98 @@ mod tests {
             busy_meanwhile,
             model_waited,
         }
+    }
+
+    /// A joke longer than `LONG_REPLY`, and its sentences as the voice gets them.
+    fn long_joke() -> (String, Vec<String>) {
+        let sentences: Vec<String> = (1..=8)
+            .map(|n| format!("Приходит программист номер {n} в бар и заказывает ровно {n} кружек."))
+            .collect();
+        let joke = sentences.join(" ");
+        assert!(joke.chars().count() > LONG_REPLY);
+        (joke, sentences)
+    }
+
+    #[tokio::test]
+    async fn a_long_reply_the_model_wants_whole_is_read_out_not_retold() {
+        let (joke, sentences) = long_joke();
+        // Streamed: the sentences sound as they come.
+        let v = run_with(
+            vec![
+                Event::UserText {
+                    text: "расскажи анекдот".into(),
+                },
+                Event::SayWhole,
+                delta(&format!("{joke} ")),
+                Event::AssistantText {
+                    text: joke.clone(),
+                    spoken: None,
+                },
+            ],
+            brief_switch(),
+        )
+        .await;
+        assert_eq!(*v.said.lock(), sentences);
+
+        // In one piece.
+        let v = run_with(
+            vec![
+                Event::SayWhole,
+                Event::AssistantText {
+                    text: joke.clone(),
+                    spoken: None,
+                },
+            ],
+            brief_switch(),
+        )
+        .await;
+        assert_eq!(*v.said.lock(), sentences);
+
+        // Without the request the same reply is retold, as before.
+        let v = run_with(
+            vec![Event::AssistantText {
+                text: joke.clone(),
+                spoken: None,
+            }],
+            brief_switch(),
+        )
+        .await;
+        assert_eq!(
+            *v.said.lock(),
+            [format!("Коротко: {} знаков.", joke.chars().count())]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_request_to_say_it_whole_ends_with_its_reply() {
+        let (joke, sentences) = long_joke();
+        let retold = format!("Коротко: {} знаков.", joke.chars().count());
+        let reply = || Event::AssistantText {
+            text: joke.clone(),
+            spoken: None,
+        };
+        // The next reply, and a reply to a new message, are retold again.
+        let v = run_with(vec![Event::SayWhole, reply(), reply()], brief_switch()).await;
+        let mut expected = sentences.clone();
+        expected.push(retold.clone());
+        assert_eq!(*v.said.lock(), expected);
+
+        let v = run_with(
+            vec![
+                Event::SayWhole,
+                Event::UserText {
+                    text: "стой".into(),
+                },
+                reply(),
+            ],
+            brief_switch(),
+        )
+        .await;
+        assert_eq!(*v.said.lock(), std::slice::from_ref(&retold));
+
+        // A reply stopped half-way: the turn ends without its text.
+        let v = run_with(vec![Event::SayWhole, idle(), reply()], brief_switch()).await;
+        assert_eq!(*v.said.lock(), [retold]);
     }
 
     #[tokio::test]

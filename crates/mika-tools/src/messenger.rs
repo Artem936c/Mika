@@ -214,7 +214,7 @@ impl MessengerSendTool {
                 ));
             }
         }
-        ui.windows.focus(w.id).map_err(failed)?;
+        crate::sys::focus(&ui.windows, w.id).await.map_err(failed)?;
         tokio::time::sleep(Duration::from_millis(300)).await;
         let mut loan = None;
         if let Some(f) = file {
@@ -358,7 +358,7 @@ impl Tool for MessengerSendTool {
             )));
         }
         let ui = &self.0.ui;
-        ui.windows.focus(w.id).map_err(failed)?;
+        crate::sys::focus(&ui.windows, w.id).await.map_err(failed)?;
         tokio::time::sleep(Duration::from_millis(400)).await;
         // Out of the chat search and the chat itself, then the search of all chats.
         self.keys(&[VK_ESCAPE], 250).await?;

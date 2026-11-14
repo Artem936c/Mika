@@ -104,6 +104,8 @@ describe('new events and cards', () => {
     expect(toolLabel('mcp_files_read')).toBe('tool.extension');
     expect(toolLabel('ui_click')).toBe('tool.ui');
     expect(toolLabel('reminder_set')).toBe('tool.reminder');
+    expect(toolLabel('journal_read')).toBe('tool.journal');
+    expect(isMessageKey(toolLabel('journal_read'))).toBe(true);
     expect(toolLabel('unknown_tool')).toBe('tool.other');
   });
 

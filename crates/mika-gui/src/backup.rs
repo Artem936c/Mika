@@ -328,6 +328,27 @@ fn same_file(previewed: &[u8; 32], now: &[u8; 32]) -> bool {
     previewed == now
 }
 
+/// Why a picked file is not used any more, as the journal names it.
+fn stale_code(state: &PendingState) -> &'static str {
+    match state {
+        PendingState::Changed => "file_changed",
+        PendingState::Fresh | PendingState::Expired => "expired",
+    }
+}
+
+/// The level of a record about a copy that was not made or not read. A
+/// password that is wrong, missing, too short or too long is the user's
+/// slip: he was told, and it is not a fault of the app.
+fn refusal_level(e: &BackupError) -> log::Level {
+    match e {
+        BackupError::WrongPassword
+        | BackupError::PasswordNeeded
+        | BackupError::PasswordShort(_)
+        | BackupError::PasswordLong(_) => log::Level::Info,
+        _ => log::Level::Warn,
+    }
+}
+
 fn stale_text(state: &PendingState) -> String {
     match state {
         PendingState::Changed => tr("error.backup_changed"),
@@ -337,6 +358,18 @@ fn stale_text(state: &PendingState) -> String {
 
 fn owner_of(window: &tauri::WebviewWindow) -> isize {
     window.hwnd().map(|h| h.0 as isize).unwrap_or(0)
+}
+
+/// Categories with their counts as a record names them: `history:120,notes:4`.
+fn counts_text(counts: &[(Category, u64)]) -> String {
+    if counts.is_empty() {
+        return "none".to_string();
+    }
+    counts
+        .iter()
+        .map(|(category, count)| format!("{}:{count}", category.id()))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -454,8 +487,15 @@ fn export_blocking(
         return Ok(None);
     };
     let here = Here::now(ctx);
-    let report = write_file(&here.stores(ctx), &here.info(), &path, password)
-        .map_err(|e| error_text(&e, true))?;
+    let began = Instant::now();
+    let report = write_file(&here.stores(ctx), &here.info(), &path, password).map_err(|e| {
+        let level = match refusal_level(&e) {
+            log::Level::Info => log::Level::Info,
+            _ => log::Level::Error,
+        };
+        log::log!(level, "copy not saved: {e}");
+        error_text(&e, true)
+    })?;
     let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     ctx.audit.record(
         "backup_export",
@@ -464,10 +504,14 @@ fn export_blocking(
         "allow_once",
         "button",
     );
+    // Where the file is and what it is called is the user's; how many keys
+    // went in is a number, never the keys.
     log::info!(
-        "backup saved: {bytes} bytes, encrypted: {}, keys: {}",
+        "copy saved: ms={} bytes={bytes} encrypted={} keys_inside={} categories={}",
+        began.elapsed().as_millis(),
         report.encrypted,
-        report.secrets
+        report.secrets,
+        counts_text(&report.counts)
     );
     let view = ExportView {
         path: path.display().to_string(),
@@ -515,7 +559,18 @@ pub async fn backup_import_pick(
         else {
             return Ok(None);
         };
-        let (_, header, stamp) = open_backup(&path).map_err(|e| error_text(&e, false))?;
+        // The first place where moving a copy to another PC fails: a file
+        // made by a newer version, cut on the way, or not a copy at all.
+        let (_, header, stamp) = open_backup(&path).map_err(|e| {
+            log::warn!("copy not opened: step=header error={e}");
+            error_text(&e, false)
+        })?;
+        log::info!(
+            "copy picked: bytes={} encrypted={} keys_inside={}",
+            stamp.len,
+            header.encrypted,
+            header.secrets
+        );
         let view = file_view(&path, &header, stamp.len);
         *PENDING.lock() = Some(Pending {
             path,
@@ -552,9 +607,13 @@ fn preview_blocking(ctx: &Ctx, password: Option<&str>) -> Result<PreviewView, St
     };
     let (mut body, digest) = reopen(&path, &stamp, opened).map_err(|state| {
         *PENDING.lock() = None;
+        log::warn!("copy not read: step=reopen reason={}", stale_code(&state));
         stale_text(&state)
     })?;
-    let access = backup::unlock(&header, password).map_err(|e| error_text(&e, false))?;
+    let access = backup::unlock(&header, password).map_err(|e| {
+        log::log!(refusal_level(&e), "copy not read: step=unlock error={e}");
+        error_text(&e, false)
+    })?;
     let here = Here::now(ctx);
     let preview = backup::preview(
         &mut body,
@@ -563,7 +622,10 @@ fn preview_blocking(ctx: &Ctx, password: Option<&str>) -> Result<PreviewView, St
         &here.stores(ctx),
         &Limits::default(),
     )
-    .map_err(|e| error_text(&e, false))?;
+    .map_err(|e| {
+        log::warn!("copy not read: step=body error={e}");
+        error_text(&e, false)
+    })?;
     {
         // Still the same pick? A cancel or a new pick in between wins.
         let mut slot = PENDING.lock();
@@ -646,9 +708,13 @@ fn restore_pending(
     pending: &Pending,
     selected: &BTreeSet<Category>,
 ) -> Result<RestoreView, Refusal> {
-    let gone = |state: PendingState| Refusal {
-        text: stale_text(&state),
-        keep: false,
+    let began = Instant::now();
+    let gone = |state: PendingState| {
+        log::warn!("restore not started: reason={}", stale_code(&state));
+        Refusal {
+            text: stale_text(&state),
+            keep: false,
+        }
     };
     // Only a file that went through the preview is restored.
     let (access, previewed) = pending
@@ -670,6 +736,7 @@ fn restore_pending(
         .map_err(BackupError::from)
         .and_then(|()| write_part(&here.stores(ctx), &here.info(), &part, None));
     if let Err(e) = kept {
+        log::error!("restore not started: the data of this PC could not be kept first: {e}");
         let _ = std::fs::remove_file(&part);
         let why = match &e {
             BackupError::Io(io) => io.to_string(),
@@ -691,6 +758,7 @@ fn restore_pending(
         &Limits::default(),
     )
     .map_err(|e| {
+        log::error!("restore failed, nothing was replaced: {e}");
         let _ = std::fs::remove_file(&part);
         Refusal {
             text: error_text(&e, false),
@@ -722,11 +790,18 @@ fn restore_pending(
         "button",
     );
     log::info!(
-        "backup restored: {} categories, keys written: {}, keys refused: {}",
-        report.restored.len(),
+        "copy restored: ms={} categories={} keys_written={} keys_refused={} switched_off={} scenarios_without_command={} restart_needed={}",
+        began.elapsed().as_millis(),
+        counts_text(&report.restored),
         report.keys_written,
-        report.keys_failed.len()
+        report.keys_failed.len(),
+        report.switched_off.len(),
+        report.scenarios_without_command,
+        report.restart_needed
     );
+    if let Some(e) = &config_error {
+        log::error!("the restored settings are in force but were not written to the file: {e}");
+    }
     Ok(RestoreView {
         restored: report
             .restored
@@ -786,6 +861,8 @@ fn install_config(ctx: &Arc<Ctx>, app: &AppHandle, new: Config) -> Result<(), St
     }
     // The deep search reads its settings from this live copy.
     *shared.research.write() = new.research.clone();
+    // The journal follows at once: texts and arguments land switched off.
+    mika_core::journal::apply(&new.log);
     ctx.cancel_listening();
     ctx.set_input_device(&new.voice.input_device);
     ctx.restart_wake();
@@ -833,6 +910,15 @@ mod tests {
     use super::*;
     use mika_core::secrets::{MemorySecretStore, Secret, SecretError, SecretStore};
     use mika_core::storage::Db;
+
+    #[test]
+    fn the_record_of_a_copy_names_categories_with_their_counts() {
+        assert_eq!(counts_text(&[]), "none");
+        assert_eq!(
+            counts_text(&[(Category::Settings, 1), (Category::History, 120)]),
+            "settings:1,history:120"
+        );
+    }
 
     const INFO: ExportInfo<'static> = ExportInfo {
         app_version: "0.3.3",

@@ -106,12 +106,58 @@ pub enum LlmError {
     Network(String),
     #[error("провайдер ответил {status}: {body}")]
     Http { status: u16, body: String },
+    /// The answer is not what the protocol promises. The text is the app's
+    /// own and quotes nothing of the answer: it is written to the journal
+    /// as it is.
     #[error("непонятный ответ провайдера: {0}")]
     Protocol(String),
+    /// A piece of the answer is not JSON. `why` is what the parser said,
+    /// `data` is the piece itself: what the model sent.
+    #[error("непонятный ответ провайдера: {why}: {data}")]
+    BadJson { why: String, data: String },
+    /// The provider itself reported an error inside its answer, after the
+    /// status 200: overloaded, no credits, the context is too long.
+    #[error("провайдер сообщил об ошибке: {0}")]
+    Provider(String),
     #[error("остановлено")]
     Cancelled,
     #[error("провайдер не настроен: {0}")]
     NotConfigured(String),
+}
+
+impl LlmError {
+    /// The kind of the error as the journal names it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            LlmError::Network(_) => "network",
+            LlmError::Http { .. } => "http",
+            LlmError::Protocol(_) => "protocol",
+            LlmError::BadJson { .. } => "bad_json",
+            LlmError::Provider(_) => "provider_error",
+            LlmError::Cancelled => "stopped",
+            LlmError::NotConfigured(_) => "not_configured",
+        }
+    }
+
+    /// The text of the error for a record. What the provider says about its
+    /// own refusal is written, in the answer as in the status. A piece that
+    /// could not be read is what the model sent: of it only what the parser
+    /// said is written, and the piece itself while texts are allowed.
+    pub fn journal_text(&self) -> String {
+        match self {
+            LlmError::Network(why) | LlmError::NotConfigured(why) | LlmError::Protocol(why) => {
+                crate::journal::error_text(why)
+            }
+            LlmError::Http { body, .. } => crate::journal::error_text(body),
+            LlmError::Provider(said) => crate::journal::error_text(said),
+            LlmError::BadJson { why, data } => format!(
+                "{} data={}",
+                crate::journal::error_text(why),
+                crate::journal::content(data)
+            ),
+            LlmError::Cancelled => String::new(),
+        }
+    }
 }
 
 pub type LlmStream = BoxStream<'static, Result<LlmChunk, LlmError>>;

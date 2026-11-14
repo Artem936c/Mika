@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use crate::common::{client, send, sse_stream, Step};
 use crate::metering::{request_kind, StreamMeter};
+use crate::trace::RequestLog;
 
 /// What a provider said to `stream_options`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,6 +197,14 @@ impl LlmProvider for OpenAiProvider {
         // while paid calls are counted, and never a reason for a request to
         // fail: a refusal is tried once more without the field.
         let mut body = request_body(&self.model, &req);
+        // Written once, when the request is over, however it ends.
+        let mut log = RequestLog::new(
+            &self.name,
+            &self.base_url,
+            &self.model,
+            request_kind(&req),
+            &req,
+        );
         let provider = (self.base_url.clone(), self.model.clone());
         let known = usage_option(&provider);
         let ask_usage =
@@ -211,18 +220,25 @@ impl LlmProvider for OpenAiProvider {
                 if let Some(fields) = body.as_object_mut() {
                     fields.remove("stream_options");
                 }
+                log.retried();
                 match send(post(&body), self.key.as_ref()).await {
                     Ok(resp) => {
-                        log::warn!("provider refused stream_options, asking without it");
+                        log::warn!(
+                            "provider refused stream_options, tokens are not counted until the app restarts: host={} model={} http={status}",
+                            mika_core::costs::provider_host(&self.base_url),
+                            self.model
+                        );
                         note_usage_option(&provider, UsageOption::Refused);
                         resp
                     }
                     // The request itself is refused: the first answer says why.
                     Err(_) => {
-                        return Err(LlmError::Http {
+                        let error = LlmError::Http {
                             status,
                             body: refusal,
-                        })
+                        };
+                        log.failed(&error);
+                        return Err(error);
                     }
                 }
             }
@@ -232,8 +248,12 @@ impl LlmProvider for OpenAiProvider {
                 }
                 resp
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                log.failed(&e);
+                return Err(e);
+            }
         };
+        log.answered(resp.status().as_u16());
 
         let mut calls: BTreeMap<u64, PendingCall> = BTreeMap::new();
         // Counts the request once, when the stream is over or dropped. Ollama
@@ -242,47 +262,58 @@ impl LlmProvider for OpenAiProvider {
         let free = self.name == "ollama"
             && mika_core::costs::is_private(&mika_core::costs::provider_host(&self.base_url));
         let mut meter = StreamMeter::new(request_kind(&req), &self.base_url, &self.model, free);
-        Ok(sse_stream(resp, self.key.clone(), move |ev, out| {
-            if ev.data.trim() == "[DONE]" {
-                flush(&mut calls, out);
-                return Ok(Step::Finished);
-            }
-            let v: Value = serde_json::from_str(&ev.data)
-                .map_err(|e| LlmError::Protocol(format!("{e}: {}", ev.data)))?;
-            if let Some(err) = v.get("error") {
-                return Err(LlmError::Protocol(err.to_string()));
-            }
-            // The usage chunk has an empty `choices` array.
-            if v["usage"].is_object() {
-                meter.openai(&v["usage"]);
-            }
-            let Some(choice) = v["choices"].get(0) else {
-                return Ok(Step::Continue);
-            };
-            let delta = &choice["delta"];
-            if let Some(text) = delta["content"].as_str().filter(|t| !t.is_empty()) {
-                out.push(LlmChunk::Text(text.to_string()));
-            }
-            if let Some(list) = delta["tool_calls"].as_array() {
-                for (n, tc) in list.iter().enumerate() {
-                    let idx = tc["index"].as_u64().unwrap_or(n as u64);
-                    let entry = calls.entry(idx).or_default();
-                    if let Some(id) = tc["id"].as_str() {
-                        entry.id = id.to_string();
-                    }
-                    if let Some(name) = tc["function"]["name"].as_str() {
-                        entry.name.push_str(name);
-                    }
-                    if let Some(a) = tc["function"]["arguments"].as_str() {
-                        entry.args.push_str(a);
+        Ok(sse_stream(
+            resp,
+            self.key.clone(),
+            log,
+            move |ev, out, log| {
+                if ev.data.trim() == "[DONE]" {
+                    flush(&mut calls, out);
+                    return Ok(Step::Finished);
+                }
+                let v: Value = serde_json::from_str(&ev.data).map_err(|e| LlmError::BadJson {
+                    why: e.to_string(),
+                    data: ev.data.clone(),
+                })?;
+                // The provider's own refusal, sent after the status 200: the
+                // limit of requests, no credits, the context is too long.
+                if let Some(err) = v.get("error") {
+                    return Err(LlmError::Provider(err.to_string()));
+                }
+                // The usage chunk has an empty `choices` array.
+                if v["usage"].is_object() {
+                    meter.openai(&v["usage"]);
+                    log.tokens(meter.tokens());
+                }
+                let Some(choice) = v["choices"].get(0) else {
+                    return Ok(Step::Continue);
+                };
+                let delta = &choice["delta"];
+                if let Some(text) = delta["content"].as_str().filter(|t| !t.is_empty()) {
+                    out.push(LlmChunk::Text(text.to_string()));
+                }
+                if let Some(list) = delta["tool_calls"].as_array() {
+                    for (n, tc) in list.iter().enumerate() {
+                        let idx = tc["index"].as_u64().unwrap_or(n as u64);
+                        let entry = calls.entry(idx).or_default();
+                        if let Some(id) = tc["id"].as_str() {
+                            entry.id = id.to_string();
+                        }
+                        if let Some(name) = tc["function"]["name"].as_str() {
+                            entry.name.push_str(name);
+                        }
+                        if let Some(a) = tc["function"]["arguments"].as_str() {
+                            entry.args.push_str(a);
+                        }
                     }
                 }
-            }
-            if choice["finish_reason"].is_string() {
-                flush(&mut calls, out);
-            }
-            Ok(Step::Continue)
-        }))
+                if let Some(reason) = choice["finish_reason"].as_str() {
+                    log.stop(reason);
+                    flush(&mut calls, out);
+                }
+                Ok(Step::Continue)
+            },
+        ))
     }
 }
 

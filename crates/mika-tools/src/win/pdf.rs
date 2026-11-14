@@ -56,7 +56,7 @@ fn each_page<E: std::fmt::Display>(
                 pages.push(text);
             }
             Err(e) => {
-                log::info!("PDF page {} not read: {e}", i + 1);
+                log::debug!("PDF page not read: page={} error={e}", i + 1);
                 failed.get_or_insert(e);
                 pages.push(String::new());
             }

@@ -435,7 +435,9 @@ impl Tool for ScreenClickTool {
         let double = args.get("double").and_then(Value::as_bool).unwrap_or(false);
         let nth = args.get("n").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
         // A covered window cannot take a click where it is seen.
-        self.env.ui.windows.focus(w.id).map_err(failed)?;
+        crate::sys::focus(&self.env.ui.windows, w.id)
+            .await
+            .map_err(failed)?;
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         let shot = self.env.capture_visible(w.id, 0).await?;
         let screen = self.env.screen.clone();
