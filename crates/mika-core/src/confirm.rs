@@ -209,6 +209,7 @@ pub fn clean(text: &str) -> String {
 }
 
 /// Chat phrases that answer an open request. Only whole phrases count.
+/// Russian and English phrases work in both interface languages.
 pub fn parse_answer(text: &str) -> Option<Answer> {
     const ALWAYS: &[&str] = &[
         "всегда",
@@ -218,6 +219,10 @@ pub fn parse_answer(text: &str) -> Option<Answer> {
         "всегда разрешай",
         "всегда разрешать",
         "да всегда",
+        "always",
+        "always allow",
+        "allow always",
+        "yes always",
     ];
     const ONCE: &[&str] = &[
         "да",
@@ -238,6 +243,15 @@ pub fn parse_answer(text: &str) -> Option<Answer> {
         "один раз",
         "разреши один раз",
         "разрешить один раз",
+        "okay",
+        "yep",
+        "sure",
+        "allow",
+        "allow once",
+        "once",
+        "go ahead",
+        "do it",
+        "confirm",
     ];
     const DENY: &[&str] = &[
         "нет",
@@ -252,6 +266,14 @@ pub fn parse_answer(text: &str) -> Option<Answer> {
         "нельзя",
         "стоп",
         "нет не надо",
+        "nope",
+        "cancel",
+        "deny",
+        "stop",
+        // «don't» as `clean` gives it.
+        "don t",
+        "do not",
+        "never mind",
     ];
     let t = clean(text);
     if ALWAYS.contains(&t.as_str()) {
@@ -302,7 +324,22 @@ const STOP_WORDS: &[&str] = &[
     "no",
     "stop",
     "cancel",
+    "not",
+    // «don't» as `clean` gives it, and written without the apostrophe.
+    "don",
+    "dont",
+    "never",
+    "nope",
+    "deny",
+    "wait",
+    "later",
+    "why",
 ];
+
+/// The one English answer that allows an action forever in the chat but not
+/// when spoken: a single common word. By voice a rule needs «always allow»,
+/// «allow always» or «yes always».
+const CHAT_ONLY_ALWAYS: &str = "always";
 
 /// Prepositions and conjunctions: they need not be said and may be added.
 const FILLERS: &[&str] = &[
@@ -662,6 +699,9 @@ pub fn voice_answer(text: &str, assessment: &Assessment) -> VoiceAnswer {
         };
     }
     match parse_answer(text) {
+        // One English word said in passing must not write a permanent rule:
+        // by voice a rule needs the phrase, «always allow». The chat takes the word.
+        Some(Answer::Always) if t == CHAT_ONLY_ALWAYS => VoiceAnswer::Unclear,
         Some(answer) => VoiceAnswer::Answer(answer),
         None if said.iter().any(|w| ONCE_ANY.contains(w)) || said.first() == Some(&"да") => {
             VoiceAnswer::Answer(Answer::Once)
@@ -1006,6 +1046,101 @@ mod tests {
         for t in ["да нет наверное", "привет", "удали всё", ""] {
             assert_eq!(parse_answer(t), None, "{t}");
         }
+        // The English phrases the confirmation card names, and a few close ones.
+        for t in ["yes", "OK.", "Allow once", "go ahead"] {
+            assert_eq!(parse_answer(t), Some(Answer::Once), "{t}");
+        }
+        for t in ["always", "Always allow!"] {
+            assert_eq!(parse_answer(t), Some(Answer::Always), "{t}");
+        }
+        for t in ["no", "Cancel", "don't", "never mind"] {
+            assert_eq!(parse_answer(t), Some(Answer::Deny), "{t}");
+        }
+        for t in ["yes no maybe", "allow everything", "hello"] {
+            assert_eq!(parse_answer(t), None, "{t}");
+        }
+    }
+
+    #[test]
+    fn voice_in_english_denies_by_one_word_and_approves_by_a_whole_phrase() {
+        let medium = risk(RiskLevel::Medium, "Закрыть «Блокнот»");
+        let low = risk(RiskLevel::Low, "Закрыть «Блокнот»");
+        for (phrase, a) in [
+            ("no, wait", &medium),
+            ("don't do that", &medium),
+            ("why?", &low),
+            ("Not now, later", &medium),
+            ("yes, but dont close it", &medium),
+        ] {
+            assert_eq!(
+                voice_answer(phrase, a),
+                VoiceAnswer::Answer(Answer::Deny),
+                "{phrase}"
+            );
+        }
+        assert_eq!(
+            voice_answer("yes", &medium),
+            VoiceAnswer::Answer(Answer::Once)
+        );
+        // A permanent rule by voice needs the phrase. The single word, which
+        // anyone in the room may say in passing, is an answer in the chat only.
+        for phrase in ["Always allow.", "allow always", "Yes, always!"] {
+            assert_eq!(
+                voice_answer(phrase, &medium),
+                VoiceAnswer::Answer(Answer::Always),
+                "{phrase}"
+            );
+        }
+        for phrase in ["Always.", "always"] {
+            assert_eq!(voice_answer(phrase, &medium), VoiceAnswer::Unclear);
+            assert_eq!(voice_answer(phrase, &low), VoiceAnswer::Unclear);
+            assert_eq!(parse_answer(phrase), Some(Answer::Always), "{phrase}");
+        }
+        // Every English phrase that approves once by voice, and nothing longer.
+        for phrase in [
+            "yes",
+            "ok",
+            "Okay.",
+            "yep",
+            "Sure.",
+            "allow",
+            "Allow once",
+            "once",
+            "Go ahead!",
+            "do it",
+            "confirm",
+        ] {
+            assert_eq!(
+                voice_answer(phrase, &medium),
+                VoiceAnswer::Answer(Answer::Once),
+                "{phrase}"
+            );
+        }
+        for phrase in ["sure thing", "okay then go", "allow it all", "confirm that"] {
+            assert_eq!(
+                voice_answer(phrase, &medium),
+                VoiceAnswer::Unclear,
+                "{phrase}"
+            );
+        }
+        // Agreement with other words around it is not an answer.
+        assert_eq!(
+            voice_answer("yes please do it now", &medium),
+            VoiceAnswer::Unclear
+        );
+        // High risk: English agreement never approves, the name is still needed.
+        let high = risk(RiskLevel::High, "Выключить компьютер");
+        for phrase in ["yes", "always allow", "go ahead"] {
+            assert_eq!(
+                voice_answer(phrase, &high),
+                VoiceAnswer::NeedName("Выключить компьютер".into()),
+                "{phrase}"
+            );
+        }
+        assert_eq!(
+            voice_answer("never mind", &high),
+            VoiceAnswer::Answer(Answer::Deny)
+        );
     }
 
     #[tokio::test]

@@ -137,23 +137,17 @@ pub async fn download(m: &Manifest) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Starts the installer quietly after this process exits, then starts the app again.
+/// Starts the installer quietly once this process has ended, then starts the
+/// app again. The exit may take a while (a screen recording is saved first):
+/// the installer must not replace the program while it still runs.
 pub fn run_installer(installer: &std::path::Path) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let script = format!(
-        "ping -n 3 127.0.0.1 >nul & \"{}\" /S & start \"\" \"{}\"",
+    let then = format!(
+        "\"{}\" /S & start \"\" \"{}\"",
         installer.display(),
         exe.display()
     );
-    std::process::Command::new("cmd.exe")
-        .raw_arg("/D /C")
-        .raw_arg(format!("\"{script}\""))
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("установщик не запустился: {e}"))
+    crate::platform::run_after_exit(&then).map_err(|e| format!("установщик не запустился: {e}"))
 }
 
 #[cfg(test)]

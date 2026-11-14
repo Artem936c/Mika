@@ -25,6 +25,12 @@ const MAX_DEPTH: u8 = 14;
 /// Elements visited in one window, listed or not.
 const MAX_VISITED: usize = 4000;
 const CALL_TIMEOUT: Duration = Duration::from_secs(8);
+/// The question about the password field is asked on a key press of the user:
+/// it must not hold the action up for long. It usually takes milliseconds; the
+/// first one also starts its worker.
+const FOCUS_TIMEOUT: Duration = Duration::from_secs(1);
+/// A focus that is just moving gives an error once: asked again after this.
+const FOCUS_RETRY: Duration = Duration::from_millis(60);
 
 type Reply<T> = mpsc::Sender<Result<T, String>>;
 
@@ -34,27 +40,38 @@ enum Cmd {
     Invoke(u64, u32, Reply<Option<&'static str>>),
     SetText(u64, u32, String, Reply<bool>),
     Focus(u64, u32, Reply<()>),
+    FocusedPassword(Reply<Option<bool>>),
 }
 
 pub struct UiaUi {
     worker: Mutex<Option<mpsc::Sender<Cmd>>>,
+    /// A worker of its own for the question about the password field: it is
+    /// asked on the user's key press with a short wait, and must neither stand
+    /// behind a long reading of a window nor throw that reading away.
+    probe: Mutex<Option<mpsc::Sender<Cmd>>>,
 }
 
 impl UiaUi {
     pub fn new() -> Self {
         Self {
             worker: Mutex::new(None),
+            probe: Mutex::new(None),
         }
     }
 
     fn sender(&self) -> mpsc::Sender<Cmd> {
-        let mut slot = self.worker.lock();
+        Self::sender_of(&self.worker, "ui-automation")
+    }
+
+    /// The worker behind `slot`, started when there is none.
+    fn sender_of(slot: &Mutex<Option<mpsc::Sender<Cmd>>>, name: &str) -> mpsc::Sender<Cmd> {
+        let mut slot = slot.lock();
         if let Some(tx) = slot.as_ref() {
             return tx.clone();
         }
         let (tx, rx) = mpsc::channel();
         std::thread::Builder::new()
-            .name("ui-automation".into())
+            .name(name.into())
             .spawn(move || worker(rx))
             .expect("spawn ui automation thread");
         *slot = Some(tx.clone());
@@ -107,6 +124,24 @@ impl Ui for UiaUi {
         self.call(|r| Cmd::Focus(window, n, r))
             .unwrap_or_else(|| Err(NO_ANSWER.into()))
     }
+
+    fn focused_password(&self) -> Option<bool> {
+        let (tx, rx) = mpsc::channel();
+        let sent = Self::sender_of(&self.probe, "ui-automation-focus")
+            .send(Cmd::FocusedPassword(tx))
+            .is_ok();
+        // No answer in time, or no worker: nobody knows what the field is, and
+        // the caller must not take that for "an ordinary field". A worker that
+        // hangs in a program is left behind; the next question starts a new one.
+        let answer = sent.then(|| rx.recv_timeout(FOCUS_TIMEOUT).ok()).flatten();
+        match answer {
+            Some(known) => known.ok().flatten(),
+            None => {
+                *self.probe.lock() = None;
+                None
+            }
+        }
+    }
 }
 
 /// Elements of the last read window, by their numbers.
@@ -146,6 +181,7 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
                     Cmd::Invoke(_, _, r) => drop(r.send(Err(msg))),
                     Cmd::SetText(_, _, _, r) => drop(r.send(Err(msg))),
                     Cmd::Focus(_, _, r) => drop(r.send(Err(msg))),
+                    Cmd::FocusedPassword(r) => drop(r.send(Err(msg))),
                 }
                 continue;
             }
@@ -175,7 +211,26 @@ fn worker(rx: mpsc::Receiver<Cmd>) {
                         .and_then(|e| unsafe { e.SetFocus() }.map_err(err)),
                 );
             }
+            Cmd::FocusedPassword(r) => {
+                let known = focused_password(uia).or_else(|| {
+                    std::thread::sleep(FOCUS_RETRY);
+                    focused_password(uia)
+                });
+                let _ = r.send(Ok(known));
+            }
         }
+    }
+}
+
+/// Whether the keyboard focus is in a password field. `None` on an error (no
+/// focus, a program that does not answer): then it is not known.
+fn focused_password(uia: &IUIAutomation) -> Option<bool> {
+    // SAFETY: plain COM calls; the element is owned by this thread.
+    unsafe {
+        uia.GetFocusedElement()
+            .and_then(|e| e.CurrentIsPassword())
+            .ok()
+            .map(|p| p.as_bool())
     }
 }
 

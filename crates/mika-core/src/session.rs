@@ -12,8 +12,10 @@ use crate::confirm::{
 };
 use crate::events::{Event, EventBus};
 
-pub const ANSWER_HINT: &str =
-    "Сначала ответь на вопрос о действии: «да», «разреши всегда» или «нет».";
+/// Said in the chat when something else is typed while a question about an action is open.
+pub fn answer_hint() -> String {
+    crate::i18n::tr("core.answer_hint")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Submitted {
@@ -21,6 +23,11 @@ pub enum Submitted {
     Answered,
     Hinted,
     Started,
+    /// A question is open that was never shown where the message came from:
+    /// nothing was answered and nothing was published. The caller shows the
+    /// question there (`Confirmations::pending`) and then calls
+    /// `Session::question_shown`; the next message from there answers it.
+    Unseen,
 }
 
 /// Where the last user message came from. Replies go back the same way.
@@ -39,6 +46,9 @@ pub struct Session {
     cancel: Mutex<CancellationToken>,
     commands: Mutex<Option<CommandStore>>,
     origin: Mutex<Origin>,
+    /// One turn at a time, in the order they were asked for. A turn takes
+    /// the origin when it starts, not when it is queued (decision 0031).
+    turns: tokio::sync::Mutex<()>,
 }
 
 impl Session {
@@ -50,6 +60,7 @@ impl Session {
             cancel: Mutex::new(CancellationToken::new()),
             commands: Mutex::new(None),
             origin: Mutex::new(Origin::Local),
+            turns: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -62,23 +73,69 @@ impl Session {
         *self.origin.lock()
     }
 
+    /// True when a question is open that `origin` was never shown. The
+    /// screen of this computer shows every question. Telegram gets the card
+    /// only of a turn that goes on there: the question of a scenario, of a
+    /// scheduled task or of a turn started at the computer is not sent to the
+    /// phone. Nobody answers a question he was not shown: a "yes" typed in
+    /// Telegram must not approve an action whose card is on another screen.
+    pub fn question_unseen(&self, origin: Origin) -> bool {
+        origin == Origin::Telegram
+            && self.origin() != Origin::Telegram
+            && self.confirms.pending().is_some()
+    }
+
+    /// The open question `id` has just been shown where `origin` reads. The
+    /// turn goes on there from now on, as after an answer from there, so the
+    /// next message from there answers the question. A question that has
+    /// closed meanwhile changes nothing.
+    pub fn question_shown(&self, id: u64, origin: Origin) {
+        // The origin is locked first: a turn that starts right now either
+        // sets its own origin after this, or the question is not its own.
+        let mut current = self.origin.lock();
+        if self.confirms.pending().is_some_and(|p| p.id == id) {
+            *current = origin;
+        }
+    }
+
     pub fn submit(self: &Arc<Self>, text: &str) -> Submitted {
         self.submit_from(text, Origin::Local)
+    }
+
+    /// Runs one turn. It waits for the turn before it and only then takes
+    /// the origin: a scenario that fires while a reply to Telegram is still
+    /// running does not cut that reply off from the phone, and a message that
+    /// waits behind a scenario does not send the scenario's questions there.
+    async fn turn(
+        self: Arc<Self>,
+        origin: Origin,
+        shown: String,
+        text: String,
+        token: CancellationToken,
+    ) {
+        let _own = self.turns.lock().await;
+        *self.origin.lock() = origin;
+        let _ = self.agent.handle_expanded(&shown, &text, token).await;
+    }
+
+    /// Like `submit_task`, but the chat shows `shown` while the model gets
+    /// `text`: a scenario by event shows one short line and sends its whole
+    /// instruction (decision 0031).
+    pub fn submit_task_as(self: &Arc<Self>, shown: &str, text: &str) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let shown = shown.trim().to_string();
+        // The token of now: a "stop" that comes before this turn drops it.
+        let token = self.cancel.lock().clone();
+        tokio::spawn(self.clone().turn(Origin::Local, shown, text, token));
     }
 
     /// Starts a scheduled task. It never answers an open question:
     /// it waits for the running reply and then runs as its own turn.
     pub fn submit_task(self: &Arc<Self>, text: &str) {
-        let text = text.trim().to_string();
-        if text.is_empty() {
-            return;
-        }
-        let token = self.cancel.lock().clone();
-        let this = self.clone();
-        tokio::spawn(async move {
-            *this.origin.lock() = Origin::Local;
-            let _ = this.agent.handle(&text, token).await;
-        });
+        self.submit_task_as(text, text);
     }
 
     /// Must run inside a tokio runtime: a reply starts as a task.
@@ -87,13 +144,19 @@ impl Session {
         if text.is_empty() {
             return Submitted::Empty;
         }
-        *self.origin.lock() = origin;
         let by = match origin {
             Origin::Local => DecidedBy::Chat,
             Origin::Telegram => DecidedBy::Telegram,
             Origin::Voice => DecidedBy::Voice,
         };
         if let Some(p) = self.confirms.pending() {
+            // Only someone who was shown the question answers it.
+            if self.question_unseen(origin) {
+                return Submitted::Unseen;
+            }
+            // An answer belongs to the running turn: it goes on where the
+            // answer came from.
+            *self.origin.lock() = origin;
             self.bus.publish(Event::UserText { text: text.into() });
             let (answer, need_name) = match origin {
                 Origin::Voice => match voice_answer(text, &p.assessment) {
@@ -124,9 +187,9 @@ impl Session {
                             chars.as_str()
                         )
                     }
-                    Err(ConfirmError::NotPending) => ANSWER_HINT.to_string(),
+                    Err(ConfirmError::NotPending) => answer_hint(),
                 },
-                None => ANSWER_HINT.to_string(),
+                None => answer_hint(),
             };
             self.bus.publish(Event::AssistantText {
                 text: hint,
@@ -135,17 +198,47 @@ impl Session {
             return Submitted::Hinted;
         }
         let token = self.cancel.lock().clone();
-        let this = self.clone();
         let shown = text.to_string();
         let command = self.commands.lock().as_ref().and_then(|c| c.find(text));
         let full = command
             .as_ref()
             .map(expand)
             .unwrap_or_else(|| shown.clone());
-        tokio::spawn(async move {
-            let _ = this.agent.handle_expanded(&shown, &full, token).await;
-        });
+        tokio::spawn(self.clone().turn(origin, shown, full, token));
         Submitted::Started
+    }
+
+    /// Starts a turn with `text` and never answers an open question: `None`
+    /// when one is open, and then nothing is published and the origin stays.
+    /// For text that was not typed: a recognised voice message (decision 0029).
+    /// Must run inside a tokio runtime: a reply starts as a task.
+    pub fn submit_new_from(self: &Arc<Self>, text: &str, origin: Origin) -> Option<Submitted> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Some(Submitted::Empty);
+        }
+        if self.confirms.pending().is_some() {
+            return None;
+        }
+        let token = self.cancel.lock().clone();
+        let shown = text.to_string();
+        let command = self.commands.lock().as_ref().and_then(|c| c.find(text));
+        let full = command
+            .as_ref()
+            .map(expand)
+            .unwrap_or_else(|| shown.clone());
+        // Through `turn`, like every other turn: it waits for the turn before
+        // it and takes the origin when it starts (decision 0031).
+        tokio::spawn(self.clone().turn(origin, shown, full, token));
+        Some(Submitted::Started)
+    }
+
+    /// A token the next `stop` cancels, wherever that stop comes from: the
+    /// computer or Telegram. Whoever took it before doing slow work for a
+    /// turn that has not started learns from it that the work is not wanted
+    /// any more (decision 0029).
+    pub fn stop_token(&self) -> CancellationToken {
+        self.cancel.lock().clone()
     }
 
     /// Stops the running reply, drops queued ones and denies an open question.
@@ -155,6 +248,49 @@ impl Session {
         *c = CancellationToken::new();
         drop(c);
         self.confirms.deny_pending(DecidedBy::Policy);
+    }
+
+    /// Starts a direct turn: the chat shows `shown`, then what `answer` gives
+    /// (see `Agent::handle_direct`). For an action the user started on this
+    /// computer: when the turn begins the origin becomes `Local`, so the reply
+    /// stays here unless a message from Telegram arrives while it is made (the
+    /// origin is one value for the session). While a question about an
+    /// action is open nothing starts and `answer` is dropped without being run.
+    /// Must run inside a tokio runtime, like `submit_from`.
+    pub fn submit_direct<F>(self: &Arc<Self>, shown: &str, answer: F) -> Submitted
+    where
+        F: std::future::Future<Output = Result<String, String>> + Send + 'static,
+    {
+        let shown = shown.trim().to_string();
+        if shown.is_empty() {
+            return Submitted::Empty;
+        }
+        if self.confirms.pending().is_some() {
+            self.bus.publish(Event::AssistantText {
+                text: answer_hint(),
+                spoken: None,
+            });
+            return Submitted::Hinted;
+        }
+        let token = self.cancel.lock().clone();
+        let this = self.clone();
+        tokio::spawn(async move {
+            // One turn at a time, in the order they were asked for: a
+            // scenario queued behind this turn must not take the origin
+            // while it runs (decision 0031).
+            let _own = this.turns.lock().await;
+            // The answer is first asked for when the turn really begins, after
+            // a running reply: only then the origin becomes this computer. Set
+            // at once, it would take the questions of a turn that came from
+            // Telegram away from the phone.
+            let turn = this.clone();
+            let answer = async move {
+                *turn.origin.lock() = Origin::Local;
+                answer.await
+            };
+            let _ = this.agent.handle_direct(&shown, answer, token).await;
+        });
+        Submitted::Started
     }
 }
 
@@ -270,9 +406,11 @@ mod tests {
         assert_eq!(s.submit("а погода?"), Submitted::Hinted);
         assert!(s.confirms.pending().is_some());
         let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let hint = answer_hint();
+        assert_ne!(hint, "core.answer_hint", "the text is missing in ru.json");
         assert!(events
             .iter()
-            .any(|e| matches!(e, Event::AssistantText { text, .. } if text == ANSWER_HINT)));
+            .any(|e| matches!(e, Event::AssistantText { text, .. } if *text == hint)));
         s.stop();
     }
 
@@ -318,9 +456,9 @@ mod tests {
             s.submit_from("отбой!", Origin::Telegram),
             Submitted::Started
         );
-        assert_eq!(s.origin(), Origin::Telegram);
         tokio::time::sleep(Duration::from_millis(20)).await;
         wait_idle(&state).await;
+        assert_eq!(s.origin(), Origin::Telegram);
         let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(events.contains(&Event::UserText {
             text: "отбой!".into()
@@ -331,6 +469,186 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_task_shows_one_line_and_sends_the_model_another() {
+        let bus = EventBus::new(64);
+        let state = StateHandle::new(bus.clone());
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let confirms = Confirmations::new(bus.clone(), state.clone());
+        let gate: Arc<dyn Gate> = Arc::new(PolicyGate::new(
+            RuleStore::new(db.clone()),
+            AuditLog::new(db),
+            confirms.clone(),
+        ));
+        let agent = Arc::new(Agent::new(
+            Arc::new(EchoLast),
+            Arc::new(ToolRegistry::new()),
+            gate,
+            bus.clone(),
+            state.clone(),
+            "s".into(),
+        ));
+        let s = Session::new(agent, confirms, bus.clone());
+        *s.origin.lock() = Origin::Telegram;
+        let mut rx = bus.subscribe();
+        // Nothing to send: nothing starts.
+        s.submit_task_as("⚡ Сценарий «Пусто»", "  ");
+        s.submit_task_as(
+            " ⚡ Сценарий «Наушники»: подключено звуковое устройство ",
+            "Сработал мой сценарий. Выполни по шагам: Включи музыку",
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_idle(&state).await;
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let shown: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::UserText { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            vec!["⚡ Сценарий «Наушники»: подключено звуковое устройство"]
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::AssistantText { text, .. } if text == "Сработал мой сценарий. Выполни по шагам: Включи музыку"
+        )));
+        // A task is a local turn, wherever the last message came from.
+        assert_eq!(s.origin(), Origin::Local);
+
+        // An ordinary task shows what it sends.
+        let mut rx = bus.subscribe();
+        s.submit_task("Проверь почту");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_idle(&state).await;
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.contains(&Event::UserText {
+            text: "Проверь почту".into()
+        }));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::AssistantText { text, .. } if text == "Проверь почту")));
+    }
+
+    #[tokio::test]
+    async fn a_task_queued_behind_a_telegram_turn_does_not_take_its_origin() {
+        let (s, _bus, state) = session();
+        assert_eq!(
+            s.submit_from("который час", Origin::Telegram),
+            Submitted::Started
+        );
+        wait_pending(&s).await;
+        let first = s.confirms.pending().unwrap().id;
+        assert_eq!(s.origin(), Origin::Telegram);
+        // A scenario fires while the Telegram turn waits for its answer.
+        s.submit_task_as("⚡ Сценарий «Ушёл»", "Сработал мой сценарий");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The rest of the Telegram turn still goes to the phone.
+        assert_eq!(s.origin(), Origin::Telegram);
+        assert_eq!(s.confirms.pending().unwrap().id, first);
+        s.confirms
+            .answer(first, Answer::Once, DecidedBy::Telegram)
+            .unwrap();
+        // The scenario starts when that turn has ended: its question is local.
+        for _ in 0..1000 {
+            if s.confirms.pending().is_some_and(|p| p.id != first) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let second = s.confirms.pending().expect("the scenario asks").id;
+        assert_ne!(second, first);
+        assert_eq!(s.origin(), Origin::Local);
+        s.confirms
+            .answer(second, Answer::Once, DecidedBy::Chat)
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        wait_idle(&state).await;
+    }
+
+    /// Thinks for a while, then answers with the text of the last message.
+    struct SlowEcho;
+
+    #[async_trait]
+    impl LlmProvider for SlowEcho {
+        fn name(&self) -> &str {
+            "fake"
+        }
+        async fn stream(&self, req: LlmRequest) -> Result<LlmStream, LlmError> {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let last = req.messages.last().unwrap().content.clone();
+            Ok(futures::stream::iter(vec![Ok(LlmChunk::Text(last))]).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_telegram_message_behind_a_scenario_takes_the_origin_only_at_its_turn() {
+        let bus = EventBus::new(64);
+        let state = StateHandle::new(bus.clone());
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let confirms = Confirmations::new(bus.clone(), state.clone());
+        let gate: Arc<dyn Gate> = Arc::new(PolicyGate::new(
+            RuleStore::new(db.clone()),
+            AuditLog::new(db),
+            confirms.clone(),
+        ));
+        let agent = Arc::new(Agent::new(
+            Arc::new(SlowEcho),
+            Arc::new(ToolRegistry::new()),
+            gate,
+            bus.clone(),
+            state.clone(),
+            "s".into(),
+        ));
+        let s = Session::new(agent, confirms, bus.clone());
+        let mut rx = bus.subscribe();
+        s.submit_task_as("⚡ Сценарий «Наушники»", "Сработал мой сценарий");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The scenario is thinking; no question is open.
+        assert_eq!(
+            s.submit_from("привет", Origin::Telegram),
+            Submitted::Started
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The message waits: a question of the scenario would stay on the computer.
+        assert_eq!(s.origin(), Origin::Local);
+        let mut replies = Vec::new();
+        for _ in 0..2000 {
+            while let Ok(e) = rx.try_recv() {
+                if let Event::AssistantText { text, .. } = e {
+                    replies.push(text);
+                }
+            }
+            if replies.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(replies, vec!["Сработал мой сценарий", "привет"]);
+        // Its own turn goes back to the phone.
+        assert_eq!(s.origin(), Origin::Telegram);
+    }
+
+    #[tokio::test]
+    async fn stop_drops_a_task_that_waits_for_its_turn() {
+        let (s, bus, state) = session();
+        s.submit("который час");
+        wait_pending(&s).await;
+        let mut rx = bus.subscribe();
+        s.submit_task_as("⚡ Сценарий «Ушёл»", "Сработал мой сценарий");
+        s.stop();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        wait_idle(&state).await;
+        // The queued scenario asked nothing and answered nothing.
+        assert!(s.confirms.pending().is_none());
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::AssistantText { .. })));
+    }
+
+    #[tokio::test]
     async fn stop_denies_open_question() {
         let (s, _bus, state) = session();
         s.submit("который час");
@@ -338,5 +656,314 @@ mod tests {
         s.stop();
         wait_idle(&state).await;
         assert!(s.confirms.pending().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_question_of_this_computer_is_not_answered_from_telegram_before_it_is_shown_there() {
+        let (s, bus, state) = session();
+        // A turn of this computer: a scenario, a scheduled task or the chat.
+        s.submit_task("check the time");
+        wait_pending(&s).await;
+        let id = s.confirms.pending().unwrap().id;
+        assert_eq!(s.origin(), Origin::Local);
+        assert!(s.question_unseen(Origin::Telegram));
+        // The computer itself and the microphone at it see every question.
+        assert!(!s.question_unseen(Origin::Local));
+        assert!(!s.question_unseen(Origin::Voice));
+
+        let mut rx = bus.subscribe();
+        // Whatever is typed in Telegram: an answer in either language, a
+        // permanent one, or something else.
+        for typed in ["yes", "always allow", "no", "what is open?"] {
+            assert_eq!(
+                s.submit_from(typed, Origin::Telegram),
+                Submitted::Unseen,
+                "{typed}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(rx.try_recv().is_err(), "nothing may reach the bus");
+        assert_eq!(s.confirms.pending().unwrap().id, id, "the question stays");
+        assert_eq!(s.origin(), Origin::Local, "the turn stays here");
+
+        // Another question was shown, not this one: nothing changes.
+        s.question_shown(id + 1, Origin::Telegram);
+        assert!(s.question_unseen(Origin::Telegram));
+        // The card went to the phone: the turn goes on there and the next
+        // message answers.
+        s.question_shown(id, Origin::Telegram);
+        assert_eq!(s.origin(), Origin::Telegram);
+        assert!(!s.question_unseen(Origin::Telegram));
+        assert_eq!(s.submit_from("yes", Origin::Telegram), Submitted::Answered);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        wait_idle(&state).await;
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::ConfirmResolved {
+                answer: Answer::Once,
+                by: DecidedBy::Telegram,
+                ..
+            }
+        )));
+        // No question is open: nothing is unseen, and nothing can be marked.
+        assert!(!s.question_unseen(Origin::Telegram));
+        *s.origin.lock() = Origin::Local;
+        s.question_shown(id, Origin::Telegram);
+        assert_eq!(s.origin(), Origin::Local);
+    }
+
+    #[tokio::test]
+    async fn a_question_of_a_telegram_turn_is_answered_from_telegram_at_once() {
+        let (s, _bus, state) = session();
+        assert_eq!(
+            s.submit_from("check the time", Origin::Telegram),
+            Submitted::Started
+        );
+        wait_pending(&s).await;
+        assert!(!s.question_unseen(Origin::Telegram));
+        assert_eq!(s.submit_from("yes", Origin::Telegram), Submitted::Answered);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        wait_idle(&state).await;
+    }
+
+    #[tokio::test]
+    async fn text_that_was_not_typed_never_answers_a_question() {
+        let (s, bus, state) = session();
+        assert_eq!(s.submit("который час"), Submitted::Started);
+        wait_pending(&s).await;
+        let id = s.confirms.pending().unwrap().id;
+        assert_eq!(s.origin(), Origin::Local);
+        let mut rx = bus.subscribe();
+        // A recognised «да» is not a yes, and neither is anything else.
+        for heard in ["да", "Да.", "разреши всегда", "нет", "а погода?"]
+        {
+            assert_eq!(s.submit_new_from(heard, Origin::Telegram), None, "{heard}");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(rx.try_recv().is_err(), "nothing may reach the bus");
+        assert_eq!(s.confirms.pending().unwrap().id, id, "the question stays");
+        assert_eq!(s.origin(), Origin::Local, "the origin stays");
+        // Empty text is empty whether or not a question is open.
+        assert_eq!(
+            s.submit_new_from("  ", Origin::Telegram),
+            Some(Submitted::Empty)
+        );
+        assert_eq!(s.origin(), Origin::Local);
+        s.stop();
+        wait_idle(&state).await;
+    }
+
+    #[tokio::test]
+    async fn a_stop_token_tells_of_the_next_stop_only() {
+        let (s, _bus, _state) = session();
+        let before = s.stop_token();
+        assert!(!before.is_cancelled());
+        s.stop();
+        assert!(before.is_cancelled(), "a stop that came after it was taken");
+        let after = s.stop_token();
+        assert!(!after.is_cancelled(), "a stop that came before is not told");
+        s.stop();
+        assert!(after.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn text_that_was_not_typed_starts_a_turn_and_runs_a_command() {
+        let bus = EventBus::new(64);
+        let state = StateHandle::new(bus.clone());
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let confirms = Confirmations::new(bus.clone(), state.clone());
+        let gate: Arc<dyn Gate> = Arc::new(PolicyGate::new(
+            RuleStore::new(db.clone()),
+            AuditLog::new(db.clone()),
+            confirms.clone(),
+        ));
+        let agent = Arc::new(Agent::new(
+            Arc::new(EchoLast),
+            Arc::new(ToolRegistry::new()),
+            gate,
+            bus.clone(),
+            state.clone(),
+            "s".into(),
+        ));
+        let s = Session::new(agent, confirms, bus.clone());
+        let store = CommandStore::new(db);
+        store.save("Отбой", "Выключи звук").unwrap();
+        s.set_commands(store);
+        let mut rx = bus.subscribe();
+        assert_eq!(
+            s.submit_new_from(" Отбой. ", Origin::Telegram),
+            Some(Submitted::Started)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_idle(&state).await;
+        // The origin is taken when the turn starts, not when it is queued.
+        assert_eq!(s.origin(), Origin::Telegram);
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.contains(&Event::UserText {
+            text: "Отбой.".into()
+        }));
+        assert!(events.iter().any(
+            |e| matches!(e, Event::AssistantText { text, .. } if text.ends_with("Выключи звук"))
+        ));
+    }
+
+    async fn wait_state(state: &StateHandle, want: AssistantState) {
+        for _ in 0..1000 {
+            if state.get() == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("state {want:?} never came");
+    }
+
+    #[tokio::test]
+    async fn direct_turn_during_a_question_gets_the_hint_and_is_not_run() {
+        let (s, bus, _state) = session();
+        s.submit("который час");
+        wait_pending(&s).await;
+        let mut rx = bus.subscribe();
+        // What unrelated text gets while the question is open: the same hint.
+        assert_eq!(s.submit("а погода?"), Submitted::Hinted);
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = polled.clone();
+        let got = s.submit_direct("вопрос про окно", async move {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("ответ".to_string())
+        });
+        assert_eq!(got, Submitted::Hinted);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(s.confirms.pending().is_some());
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let said: Vec<&String> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::AssistantText { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert_eq!(said[0], said[1]);
+        // The direct turn itself never reached the chat.
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::UserText { text } if text.contains("окно"))));
+        s.stop();
+    }
+
+    #[tokio::test]
+    async fn direct_turn_answers_on_this_computer() {
+        let (s, bus, state) = session();
+        *s.origin.lock() = Origin::Telegram;
+        let mut rx = bus.subscribe();
+        assert_eq!(
+            s.submit_direct("  ", async { Ok("ответ".to_string()) }),
+            Submitted::Empty
+        );
+        assert_eq!(s.origin(), Origin::Telegram);
+        assert_eq!(
+            s.submit_direct(" вопрос про окно ", async {
+                Ok("ответ".to_string())
+            }),
+            Submitted::Started
+        );
+        let mut events = Vec::new();
+        let reply = Event::AssistantText {
+            text: "ответ".into(),
+            spoken: None,
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !events.contains(&reply) {
+                events.push(rx.recv().await.unwrap());
+            }
+        })
+        .await
+        .expect("no reply");
+        assert_eq!(
+            events[0],
+            Event::UserText {
+                text: "вопрос про окно".into()
+            }
+        );
+        wait_idle(&state).await;
+        // The reply must not go to Telegram.
+        assert_eq!(s.origin(), Origin::Local);
+        assert_eq!(s.agent.history().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn direct_turn_takes_the_origin_only_when_it_begins() {
+        let (s, _bus, state) = session();
+        // A turn is running: it holds the turn until it is let go.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let open = gate.clone();
+        assert_eq!(
+            s.submit_direct("первый вопрос", async move {
+                open.notified().await;
+                Ok("первый ответ".to_string())
+            }),
+            Submitted::Started
+        );
+        wait_state(&state, AssistantState::Thinking).await;
+        // As if that turn had come from Telegram: its questions go to the phone.
+        *s.origin.lock() = Origin::Telegram;
+        assert_eq!(
+            s.submit_direct("второй вопрос", async {
+                Ok("второй ответ".to_string())
+            }),
+            Submitted::Started
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            s.origin(),
+            Origin::Telegram,
+            "a waiting direct turn must not take the running turn's origin"
+        );
+        gate.notify_one();
+        for _ in 0..1000 {
+            if s.agent.history().len() == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(s.agent.history().len(), 4);
+        assert_eq!(s.origin(), Origin::Local);
+        wait_idle(&state).await;
+    }
+
+    #[tokio::test]
+    async fn stop_cancels_a_direct_turn() {
+        let (s, bus, state) = session();
+        let mut rx = bus.subscribe();
+        assert_eq!(
+            s.submit_direct("вопрос", std::future::pending::<Result<String, String>>()),
+            Submitted::Started
+        );
+        wait_state(&state, AssistantState::Thinking).await;
+        s.stop();
+        wait_idle(&state).await;
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::AssistantText { .. } | Event::Error { .. })));
+        assert!(s.agent.history().is_empty());
+
+        // The next one runs: «Стоп» ended only the turn that was running.
+        assert_eq!(
+            s.submit_direct("ещё вопрос", async {
+                Ok("ответ".to_string())
+            }),
+            Submitted::Started
+        );
+        for _ in 0..1000 {
+            if s.agent.history().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(s.agent.history().len(), 2);
+        wait_idle(&state).await;
     }
 }

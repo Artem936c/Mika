@@ -24,6 +24,9 @@ pub struct Selection {
 /// What to do with the selected text. Returns the request and whether the
 /// answer replaces the selection.
 pub fn instruction(action: &str) -> Option<(&'static str, bool)> {
+    if let Some(found) = crate::lang::selection_instruction(action) {
+        return Some(found);
+    }
     Some(match action {
         "translate" => (
             "Переведи текст ниже: русский на английский, любой другой язык на русский. Ответь только переводом, без пояснений и кавычек.",

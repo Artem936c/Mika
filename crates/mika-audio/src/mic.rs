@@ -1,7 +1,7 @@
 //! Microphone capture for one spoken phrase: record until the speaker stops,
 //! then hand back a 16 kHz mono WAV file for recognition.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -36,27 +36,43 @@ pub enum MicError {
 
 /// Lets another thread end a recording.
 #[derive(Debug, Default)]
-pub struct MicControl(AtomicU8);
+pub struct MicControl {
+    /// 0 while recording, 1 finished, 2 cancelled.
+    state: AtomicU8,
+    /// A key is held down: the pause after speech does not end the recording.
+    hold: AtomicBool,
+}
 
 impl MicControl {
     /// Stop and use what was said so far.
     pub fn finish(&self) {
         let _ = self
-            .0
+            .state
             .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
     }
 
     /// Stop and throw the recording away.
     pub fn cancel(&self) {
-        self.0.store(2, Ordering::Relaxed);
+        self.state.store(2, Ordering::Relaxed);
+    }
+
+    /// While set, the pause after speech does not end the recording: the
+    /// speaker holds a key and lets it go when done. Silence from the start
+    /// and the length limit still end it.
+    pub fn set_hold(&self, on: bool) {
+        self.hold.store(on, Ordering::Relaxed);
+    }
+
+    pub fn held(&self) -> bool {
+        self.hold.load(Ordering::Relaxed)
     }
 
     fn finished(&self) -> bool {
-        self.0.load(Ordering::Relaxed) == 1
+        self.state.load(Ordering::Relaxed) == 1
     }
 
     fn cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed) == 2
+        self.state.load(Ordering::Relaxed) == 2
     }
 }
 
@@ -202,6 +218,17 @@ impl Vad {
     }
 }
 
+/// Whether the recording ends at this step. While a key is held (`held`) the
+/// pause after speech does not end it; the length limit and silence from the
+/// start do. `elapsed_ms` is the sound measured so far.
+pub fn ends_phrase(step: VadStep, held: bool, elapsed_ms: u32) -> bool {
+    match step {
+        VadStep::Continue => false,
+        VadStep::NoSpeech => true,
+        VadStep::Done => !held || elapsed_ms >= MAX_PHRASE_MS,
+    }
+}
+
 /// A recording device of Windows: the one named in the settings, or the default.
 #[derive(Default)]
 pub struct SystemMicrophone {
@@ -332,6 +359,7 @@ impl Microphone for SystemMicrophone {
         let frame_len = (rate as u64 * FRAME_MS as u64 / 1000).max(1) as usize;
         let mut samples: Vec<f32> = Vec::new();
         let mut measured = 0usize;
+        let mut frames = 0u32;
         let mut vad = Vad::default();
         let outcome = loop {
             if control.cancelled() {
@@ -351,12 +379,18 @@ impl Microphone for SystemMicrophone {
                     break Err(MicError::Failed("запись оборвалась".into()))
                 }
             }
-            let mut step = VadStep::Continue;
-            while samples.len() - measured >= frame_len && step == VadStep::Continue {
-                step = vad.push(rms(&samples[measured..measured + frame_len]));
+            let mut end = VadStep::Continue;
+            while samples.len() - measured >= frame_len {
+                let step = vad.push(rms(&samples[measured..measured + frame_len]));
                 measured += frame_len;
+                frames += 1;
+                // A pause under a held key is not the end: keep measuring.
+                if ends_phrase(step, control.held(), frames * FRAME_MS) {
+                    end = step;
+                    break;
+                }
             }
-            match step {
+            match end {
                 VadStep::Continue => {}
                 VadStep::Done => break Ok(()),
                 VadStep::NoSpeech => break Err(MicError::NoSpeech),
@@ -507,6 +541,89 @@ mod tests {
         let c = MicControl::default();
         c.finish();
         assert!(c.finished());
+    }
+
+    #[test]
+    fn hold_does_not_disturb_finish_and_cancel() {
+        let c = MicControl::default();
+        assert!(!c.held());
+        c.set_hold(true);
+        assert!(c.held() && !c.finished() && !c.cancelled());
+        c.finish();
+        assert!(c.finished() && c.held());
+        c.set_hold(false);
+        assert!(c.finished() && !c.held());
+        let c = MicControl::default();
+        c.set_hold(true);
+        c.cancel();
+        c.set_hold(false);
+        assert!(c.cancelled() && !c.finished());
+    }
+
+    #[test]
+    fn a_held_key_keeps_the_recording_through_a_pause() {
+        // Not held: as before.
+        assert!(!ends_phrase(VadStep::Continue, false, 3000));
+        assert!(ends_phrase(VadStep::Done, false, 3000));
+        assert!(ends_phrase(VadStep::NoSpeech, false, NO_SPEECH_MS));
+        // Held: the pause is not the end, the limit and silence are.
+        assert!(!ends_phrase(VadStep::Continue, true, 3000));
+        assert!(!ends_phrase(VadStep::Done, true, 3000));
+        assert!(!ends_phrase(VadStep::Done, true, MAX_PHRASE_MS - FRAME_MS));
+        assert!(ends_phrase(VadStep::Done, true, MAX_PHRASE_MS));
+        assert!(ends_phrase(VadStep::NoSpeech, true, NO_SPEECH_MS));
+        assert!(ends_phrase(VadStep::NoSpeech, true, MAX_PHRASE_MS));
+    }
+
+    /// The frame loop of `record` without a device: when the phrase ends if
+    /// the key is held for the first `held_ms` of the recording.
+    fn record_ends(levels: impl IntoIterator<Item = f32>, held_ms: u32) -> (VadStep, u32) {
+        let mut vad = Vad::default();
+        let mut frames = 0;
+        for level in levels {
+            let step = vad.push(level);
+            frames += 1;
+            let elapsed = frames * FRAME_MS;
+            if ends_phrase(step, elapsed <= held_ms, elapsed) {
+                return (step, elapsed);
+            }
+        }
+        (VadStep::Continue, frames * FRAME_MS)
+    }
+
+    #[test]
+    fn speech_after_a_long_pause_is_recorded_while_the_key_is_held() {
+        // Speech, three seconds of thinking, speech again, silence.
+        let levels = || {
+            quiet(300)
+                .chain(loud(900))
+                .chain(quiet(3000))
+                .chain(loud(900))
+                .chain(quiet(5000))
+        };
+        // Without a hold the first pause ends the phrase: 1200 + 1100 ms.
+        let (step, at) = record_ends(levels(), 0);
+        assert_eq!(step, VadStep::Done);
+        assert!((2280..=2340).contains(&at), "{at}");
+        // Held past the second speech: the pause after it ends the phrase, 5100 + 1100 ms.
+        let (step, at) = record_ends(levels(), 5400);
+        assert_eq!(step, VadStep::Done);
+        assert!((6180..=6240).contains(&at), "{at}");
+        // Let go in the middle of a pause that is already long: the phrase ends at once.
+        let (step, at) = record_ends(levels(), 3000);
+        assert_eq!(step, VadStep::Done);
+        assert_eq!(at, 3030);
+        // Held for ever: the limit ends it.
+        let (step, at) = record_ends(loud(900).chain(quiet(60_000)), u32::MAX);
+        assert_eq!(step, VadStep::Done);
+        assert_eq!(at, MAX_PHRASE_MS);
+        // Held and silent from the start: given up as usual.
+        let (step, at) = record_ends(quiet(20_000), u32::MAX);
+        assert_eq!(step, VadStep::NoSpeech);
+        assert!(
+            (NO_SPEECH_MS..NO_SPEECH_MS + FRAME_MS).contains(&at),
+            "{at}"
+        );
     }
 
     #[test]

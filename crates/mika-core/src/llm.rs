@@ -120,12 +120,34 @@ pub type LlmStream = BoxStream<'static, Result<LlmChunk, LlmError>>;
 #[async_trait]
 pub trait Vision: Send + Sync {
     async fn ask(&self, png: &[u8], question: &str) -> Result<String, String>;
+
+    /// Several frames of one video, in time order. By default only the first
+    /// frame is shown.
+    async fn ask_frames(&self, pngs: &[Vec<u8>], question: &str) -> Result<String, String> {
+        match pngs.first() {
+            Some(png) => self.ask(png, question).await,
+            None => Err("нет кадров".into()),
+        }
+    }
+}
+
+/// A recognised phrase with its time, seconds from the start of the WAV.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeechSegment {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
 }
 
 /// Speech recognition. Takes a WAV file, returns the text that was said.
 #[async_trait]
 pub trait SpeechToText: Send + Sync {
     async fn transcribe(&self, wav: &[u8]) -> Result<String, String>;
+
+    /// Phrases with their times. `None` when the provider cannot tell times.
+    async fn transcribe_segments(&self, _wav: &[u8]) -> Result<Option<Vec<SpeechSegment>>, String> {
+        Ok(None)
+    }
 }
 
 /// Speech synthesis. Returns an audio file: WAV, MP3 or Ogg.
@@ -138,6 +160,70 @@ pub trait TextToSpeech: Send + Sync {
 #[async_trait]
 pub trait ImageGen: Send + Sync {
     async fn generate(&self, prompt: &str) -> Result<Vec<u8>, String>;
+}
+
+/// Least room for reasoning inside one text request, in characters.
+const REASONING_ROOM: usize = 3000;
+
+/// Most characters one text request reads from the model before it stops: the
+/// answer and room for reasoning the model writes into its text, as much again
+/// as the answer and 3000 characters at least. A request cannot cost more
+/// output than this, as far as the text shows it.
+pub fn stream_cap(max_chars: usize) -> usize {
+    max_chars.saturating_add(max_chars.max(REASONING_ROOM))
+}
+
+/// The answer of a text request and what was read to get it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextAnswer {
+    pub text: String,
+    /// Characters the model streamed, reasoning blocks included: the output
+    /// the request cost.
+    pub streamed: usize,
+}
+
+/// Why a text request gave no answer, and what was read before it failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextFailure {
+    pub reason: String,
+    /// Characters the model streamed before the failure.
+    pub streamed: usize,
+}
+
+impl TextFailure {
+    /// A failure before anything was read.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            streamed: 0,
+        }
+    }
+}
+
+impl std::fmt::Display for TextFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+/// A model asked for plain text by a tool. The request carries no tools, and
+/// tool calls the model tries anyway are dropped.
+#[async_trait]
+pub trait TextModel: Send + Sync {
+    /// The model id that `model` means: an empty `model` is the chat model.
+    fn model_id(&self, model: &str) -> String;
+
+    /// One request, the whole answer with reasoning blocks cut out. Reading
+    /// stops once the answer is longer than `max_chars` characters, or once
+    /// the model has streamed more than `stream_cap(max_chars)` characters
+    /// with its reasoning. Both outcomes say how much was streamed.
+    async fn complete(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        max_chars: usize,
+    ) -> Result<TextAnswer, TextFailure>;
 }
 
 #[async_trait]
@@ -267,6 +353,78 @@ pub async fn complete(
     tokio::time::timeout(timeout, collect).await.ok().flatten()
 }
 
+/// What `complete_capped` says when the model spent the whole request on
+/// reasoning.
+pub const ONLY_REASONING: &str = "модель рассуждала дольше, чем отведено на ответ";
+
+/// One request without tools: the text the model streams back, reasoning
+/// blocks cut out, at most `max_chars` characters, trimmed.
+///
+/// Tool calls the model tries anyway are dropped. Reading stops as soon as the
+/// answer is longer than `max_chars`, or the model has streamed more than
+/// `stream_cap(max_chars)` characters, reasoning included: text the filter
+/// cuts out is paid for like any other. The stream is then dropped, and the
+/// provider's reader ends when it sees that. There is no timeout inside:
+/// callers wrap it.
+pub async fn complete_capped(
+    provider: &dyn LlmProvider,
+    system: &str,
+    user: &str,
+    max_chars: usize,
+) -> Result<TextAnswer, TextFailure> {
+    use futures::StreamExt;
+    let req = LlmRequest {
+        messages: vec![ChatMessage::system(system), ChatMessage::user(user)],
+        tools: Vec::new(),
+    };
+    let mut stream = provider
+        .stream(req)
+        .await
+        .map_err(|e| TextFailure::new(e.to_string()))?;
+    let raw_cap = stream_cap(max_chars);
+    let mut text = String::new();
+    let mut chars = 0usize;
+    let mut streamed = 0usize;
+    let mut thoughts = ThoughtFilter::default();
+    let mut capped = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| TextFailure {
+            reason: e.to_string(),
+            streamed,
+        })?;
+        match chunk {
+            LlmChunk::Text(t) => {
+                streamed += t.chars().count();
+                let kept = thoughts.push(&t);
+                chars += kept.chars().count();
+                text.push_str(&kept);
+                if chars > max_chars || streamed > raw_cap {
+                    capped = true;
+                    break;
+                }
+            }
+            LlmChunk::ToolCall(_) => {}
+        }
+    }
+    drop(stream);
+    if !capped {
+        text.push_str(&thoughts.finish());
+    }
+    if let Some((at, _)) = text.char_indices().nth(max_chars) {
+        text.truncate(at);
+    }
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        let reason = if capped {
+            ONLY_REASONING.to_string()
+        } else {
+            LlmError::Protocol("пустой ответ".into()).to_string()
+        };
+        return Err(TextFailure { reason, streamed });
+    }
+    Ok(TextAnswer { text, streamed })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +536,179 @@ mod tests {
         assert_eq!(
             retell(vec!["  Просто ", "ответ "]).await.as_deref(),
             Some("Просто ответ")
+        );
+    }
+
+    /// Streams the given chunks once, remembers the request and counts the
+    /// chunks that were really read.
+    struct Script {
+        chunks: Vec<Result<LlmChunk, LlmError>>,
+        request: std::sync::Mutex<Option<LlmRequest>>,
+        read: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Script {
+        fn new(chunks: Vec<Result<LlmChunk, LlmError>>) -> Self {
+            Self {
+                chunks,
+                request: std::sync::Mutex::new(None),
+                read: Default::default(),
+            }
+        }
+
+        fn texts(chunks: &[&str]) -> Self {
+            Self::new(
+                chunks
+                    .iter()
+                    .map(|t| Ok(LlmChunk::Text(t.to_string())))
+                    .collect(),
+            )
+        }
+
+        fn read(&self) -> usize {
+            self.read.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmProvider for Script {
+        fn name(&self) -> &str {
+            "script"
+        }
+        async fn stream(&self, req: LlmRequest) -> Result<LlmStream, LlmError> {
+            use futures::StreamExt;
+            *self.request.lock().unwrap() = Some(req);
+            let read = self.read.clone();
+            Ok(futures::stream::iter(self.chunks.clone())
+                .inspect(move |_| {
+                    read.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })
+                .boxed())
+        }
+    }
+
+    fn answer(text: &str, streamed: usize) -> Result<TextAnswer, TextFailure> {
+        Ok(TextAnswer {
+            text: text.into(),
+            streamed,
+        })
+    }
+
+    #[tokio::test]
+    async fn capped_request_carries_no_tools() {
+        let p = Script::texts(&["Ответ"]);
+        let got = complete_capped(&p, "система", "вопрос", 100).await;
+        assert_eq!(got, answer("Ответ", 5));
+        let req = p.request.lock().unwrap().clone().unwrap();
+        assert!(req.tools.is_empty());
+        assert_eq!(
+            req.messages,
+            vec![ChatMessage::system("система"), ChatMessage::user("вопрос")]
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_drops_tool_calls_and_reasoning() {
+        let chunks = ["<think>открою файл</th", "ink> Факт один. "];
+        let p = Script::new(vec![
+            Ok(LlmChunk::Text(chunks[0].into())),
+            Ok(LlmChunk::ToolCall(ToolCall {
+                id: "c1".into(),
+                name: "delete_file".into(),
+                arguments: serde_json::json!({"path": "C:\\x"}),
+            })),
+            Ok(LlmChunk::Text(chunks[1].into())),
+        ]);
+        let got = complete_capped(&p, "s", "u", 100).await;
+        // The reasoning is cut out of the answer and stays in the count.
+        let streamed = chunks.iter().map(|c| c.chars().count()).sum();
+        assert_eq!(got, answer("Факт один.", streamed));
+        assert_eq!(p.read(), 3);
+    }
+
+    #[tokio::test]
+    async fn capped_stops_reading_at_the_limit() {
+        let p = Script::texts(&["абвгд", "еёжзи", "клмно", "прсту"]);
+        let got = complete_capped(&p, "s", "u", 7).await;
+        assert_eq!(got, answer("абвгдеё", 10));
+        assert_eq!(p.read(), 2, "the rest of the stream is not read");
+        // An answer of exactly the limit is read to its end and kept whole.
+        let p = Script::texts(&["абвгд", "её"]);
+        assert_eq!(complete_capped(&p, "s", "u", 7).await, answer("абвгдеё", 7));
+    }
+
+    #[test]
+    fn reasoning_gets_room_beside_the_answer() {
+        assert_eq!(stream_cap(800), 3800);
+        assert_eq!(stream_cap(2000), 5000);
+        assert_eq!(stream_cap(9000), 18_000);
+        assert_eq!(stream_cap(usize::MAX), usize::MAX);
+    }
+
+    #[tokio::test]
+    async fn capped_stops_a_model_that_only_reasons() {
+        // Ten chunks of 1000 characters inside a block that never closes.
+        let block: &'static str = Box::leak("я".repeat(1000).into_boxed_str());
+        let mut chunks = vec!["<think>"];
+        chunks.extend(std::iter::repeat_n(block, 10));
+        let p = Script::texts(&chunks);
+        let got = complete_capped(&p, "s", "u", 100).await;
+        // 100 characters of answer leave 3000 for reasoning: the fourth block
+        // goes over, the six after it are never read.
+        assert_eq!(
+            got,
+            Err(TextFailure {
+                reason: ONLY_REASONING.into(),
+                streamed: 7 + 4000,
+            })
+        );
+        assert_eq!(p.read(), 5);
+
+        // Reasoning that fits is counted, and the answer after it is kept.
+        let p = Script::texts(&["<think>", block, block, "</think>", "Готово."]);
+        assert_eq!(
+            complete_capped(&p, "s", "u", 100).await,
+            answer("Готово.", 7 + 2000 + 8 + 7)
+        );
+    }
+
+    #[tokio::test]
+    async fn capped_empty_answer_and_stream_error_are_errors() {
+        let empty = Script::texts(&["  ", "<think>только мысли"]);
+        assert_eq!(
+            complete_capped(&empty, "s", "u", 100).await,
+            Err(TextFailure {
+                reason: "непонятный ответ провайдера: пустой ответ".into(),
+                streamed: 21,
+            })
+        );
+        let broken = Script::new(vec![
+            Ok(LlmChunk::Text("начало".into())),
+            Err(LlmError::Network("обрыв".into())),
+        ]);
+        let failure = complete_capped(&broken, "s", "u", 100).await.unwrap_err();
+        assert_eq!(failure.to_string(), "нет связи с провайдером: обрыв");
+        assert_eq!(failure.streamed, 6);
+    }
+
+    /// A provider that cannot even start the request.
+    struct Refusing;
+
+    #[async_trait]
+    impl LlmProvider for Refusing {
+        fn name(&self) -> &str {
+            "refusing"
+        }
+        async fn stream(&self, _req: LlmRequest) -> Result<LlmStream, LlmError> {
+            Err(LlmError::NotConfigured("не указана модель".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn capped_request_that_never_starts_costs_nothing() {
+        assert_eq!(
+            complete_capped(&Refusing, "s", "u", 100).await,
+            Err(TextFailure::new("провайдер не настроен: не указана модель"))
         );
     }
 }

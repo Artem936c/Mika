@@ -21,6 +21,15 @@ export interface Pending {
   deadline: number;
 }
 
+/**
+ * A question whose target is shown whole, without a scroll box. A scenario by
+ * event runs later by itself, so its limits and its whole instruction must be
+ * in sight when it is confirmed (decision 0031).
+ */
+export function showsWhole(tool: string): boolean {
+  return tool === 'trigger_create';
+}
+
 /** Heading of the confirmation card for a risk level. */
 export function confirmHead(level: RiskLevel): MessageKey {
   return `confirm.head_${level}`;
@@ -30,6 +39,14 @@ export function confirmHead(level: RiskLevel): MessageKey {
 export function alwaysTitle(p: Pending): MessageKey {
   if (p.allowAlways) return 'confirm.always_title';
   return p.assessment.level === 'high' ? 'confirm.always_high' : 'confirm.always_wide';
+}
+
+/**
+ * Whether the card holds a text the English interface cannot show in English yet:
+ * the summary and the reason come from Rust, and there they are still Russian.
+ */
+export function untranslated(p: Pending, lang: string): boolean {
+  return lang === 'en' && /[\u0400-\u04ff]/.test(`${p.assessment.summary} ${p.assessment.reason}`);
 }
 
 function isAssessment(v: unknown): v is Assessment {

@@ -255,7 +255,7 @@ impl UiEnv {
     }
 }
 
-fn program(w: &WindowInfo) -> String {
+pub(crate) fn program(w: &WindowInfo) -> String {
     if w.process.is_empty() {
         "неизвестная программа".into()
     } else {
@@ -263,7 +263,7 @@ fn program(w: &WindowInfo) -> String {
     }
 }
 
-fn label(w: &WindowInfo) -> String {
+pub(crate) fn label(w: &WindowInfo) -> String {
     format!("«{}» ({})", truncate(&w.title, 60), program(w))
 }
 
@@ -872,6 +872,37 @@ pub fn parse_keys(text: &str) -> Result<Vec<Vec<u16>>, String> {
     chords.into_iter().map(parse_chord).collect()
 }
 
+/// Refuses keys that would start one of the assistant's own global hotkeys.
+fn refuse_own_hotkeys(chords: &[Vec<u16>]) -> Result<(), ToolError> {
+    match chords
+        .iter()
+        .find_map(|chord| crate::direct::own_hotkey_in(chord))
+    {
+        Some(combo) => Err(failed(crate::direct::own_hotkey_refusal(&combo))),
+        None => Ok(()),
+    }
+}
+
+impl UiEnv {
+    /// Keys go to the window in front, and one chord can change which window
+    /// that is: they stop when it became the assistant's own window or one of
+    /// the blind zone.
+    fn keys_may_land(&self) -> Result<(), ToolError> {
+        let Some(front) = self.windows.foreground() else {
+            return Ok(());
+        };
+        if front.process == self.own_process {
+            return Err(failed(
+                "впереди оказалось моё собственное окно: клавиши в него не нажимаю",
+            ));
+        }
+        if is_blind_title(&front.title) {
+            return Err(failed(BLIND_REFUSAL));
+        }
+        Ok(())
+    }
+}
+
 pub struct UiKeysTool(pub UiEnv);
 
 #[async_trait]
@@ -893,7 +924,8 @@ impl Tool for UiKeysTool {
     fn assess(&self, args: &Value) -> Result<Assessment, ToolError> {
         let w = self.0.target(args)?;
         let keys = arg_str(args, "keys")?;
-        parse_keys(keys).map_err(ToolError::BadArguments)?;
+        let chords = parse_keys(keys).map_err(ToolError::BadArguments)?;
+        refuse_own_hotkeys(&chords)?;
         Ok(self.0.act(
             &w,
             "Нажать клавиши в окне",
@@ -909,10 +941,12 @@ impl Tool for UiKeysTool {
     ) -> Result<ToolOutput, ToolError> {
         let w = self.0.target(&args)?;
         let chords = parse_keys(arg_str(&args, "keys")?).map_err(ToolError::BadArguments)?;
+        refuse_own_hotkeys(&chords)?;
         let before = self.0.foreign_windows();
         self.0.windows.focus(w.id).map_err(failed)?;
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         for chord in &chords {
+            self.0.keys_may_land()?;
             self.0.input.chord(chord).map_err(failed)?;
             tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         }
@@ -1360,6 +1394,64 @@ mod tests {
         );
         assert!(tool.assess(&json!({"keys": "ctrl+ъ"})).is_err());
         assert!(tool.assess(&json!({"keys": "  "})).is_err());
+    }
+
+    #[tokio::test]
+    async fn keys_never_press_her_own_global_hotkey() {
+        crate::direct::set_test_hotkeys();
+        let (e, f) = ui_env();
+        let tool = UiKeysTool(e);
+        // Refused before the user is asked, alone or hidden among other keys.
+        for keys in [
+            "ctrl+alt+f23",
+            "alt+CTRL+F23",
+            "ctrl+s ctrl+alt+f23 tab space",
+        ] {
+            let refused = tool.assess(&json!({ "keys": keys })).unwrap_err();
+            assert!(refused.to_string().contains("Ctrl+Alt+F23"), "{refused}");
+            assert!(run(&tool, json!({ "keys": keys })).await.is_err());
+        }
+        assert!(
+            f.chords.lock().is_empty(),
+            "no key of the sequence is pressed"
+        );
+        assert!(f.focused.lock().is_empty());
+        // Other modifiers are another combination: Windows starts nothing.
+        run(&tool, json!({"keys": "ctrl+f23 ctrl+alt+shift+f23"}))
+            .await
+            .unwrap();
+        assert_eq!(f.chords.lock().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn keys_stop_when_her_own_window_or_a_blind_one_comes_to_front() {
+        for (title, process) in [("Мика", "mika.exe"), ("Вход в банк — Chrome", "chrome.exe")]
+        {
+            let (e, f) = ui_env();
+            let tool = UiKeysTool(e);
+            let running =
+                tokio::spawn(
+                    async move { run(&tool, json!({"keys": "ctrl+n tab space enter"})).await },
+                );
+            // The first chord opened another window in front.
+            for _ in 0..2000 {
+                if !f.chords.lock().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            *f.foreground.lock() = Some(WindowInfo {
+                id: 99,
+                title: title.into(),
+                process: process.into(),
+            });
+            assert!(running.await.unwrap().is_err(), "{process}");
+            assert_eq!(
+                *f.chords.lock(),
+                vec![vec![0x11, 0x4E]],
+                "{process}: the rest of the keys must not land in that window"
+            );
+        }
     }
 
     #[tokio::test]

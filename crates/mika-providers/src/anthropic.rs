@@ -8,6 +8,7 @@ use mika_core::secrets::Secret;
 use serde_json::{json, Value};
 
 use crate::common::{client, send, sse_stream, Step};
+use crate::metering::{request_kind, StreamMeter};
 
 pub const API_VERSION: &str = "2023-06-01";
 pub const MAX_TOKENS: u32 = 4096;
@@ -125,11 +126,15 @@ impl LlmProvider for AnthropicProvider {
         let resp = send(http, self.key.as_ref()).await?;
 
         let mut uses: BTreeMap<u64, PendingUse> = BTreeMap::new();
+        // Counts the request once, when the stream is over or dropped (decision 0028).
+        let mut meter = StreamMeter::new(request_kind(&req), &self.base_url, &self.model, false);
         Ok(sse_stream(resp, self.key.clone(), move |ev, out| {
             let v: Value = serde_json::from_str(&ev.data)
                 .map_err(|e| LlmError::Protocol(format!("{e}: {}", ev.data)))?;
             let kind = v["type"].as_str().or(ev.event.as_deref()).unwrap_or("");
             match kind {
+                "message_start" => meter.anthropic_start(&v["message"]["usage"]),
+                "message_delta" => meter.anthropic_delta(&v["usage"]),
                 "content_block_start" => {
                     let block = &v["content_block"];
                     if block["type"] == "tool_use" {

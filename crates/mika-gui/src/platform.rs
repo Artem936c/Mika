@@ -4,7 +4,6 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use mika_core::config::ProviderKind;
 use mika_core::paths::{data_dir, logs_dir};
 use mika_core::secrets::SecretStore;
 
@@ -124,39 +123,78 @@ fn folders_for(data: PathBuf, logs: PathBuf) -> Vec<PathBuf> {
     v
 }
 
-/// Deletes keys and autostart now, and the folders right after the app exits
-/// (the database file is open until then).
-pub fn wipe_all_data(secrets: &dyn SecretStore) -> Result<(), String> {
-    for kind in [
-        ProviderKind::Openai,
-        ProviderKind::Anthropic,
-        ProviderKind::Ollama,
-    ] {
-        secrets
-            .delete(&kind.secret_key())
-            .map_err(|e| e.to_string())?;
+/// Deletes every key whose name does not depend on the settings. The list is
+/// the one a backup collects its keys by, so nothing kept is left behind.
+fn wipe_keys(secrets: &dyn SecretStore) -> Result<(), String> {
+    for key in mika_core::backup::fixed_secret_keys() {
+        secrets.delete(&key).map_err(|e| e.to_string())?;
     }
-    for key in [
-        mika_core::config::EMBEDDING_SECRET_KEY,
-        mika_core::config::IMAGE_SECRET_KEY,
-        mika_core::config::TELEGRAM_SECRET_KEY,
-        mika_core::config::SPEECH_SECRET_KEY,
-    ] {
-        secrets.delete(key).map_err(|e| e.to_string())?;
-    }
-    set_autostart(false)?;
-    let mut script = String::from("ping -n 3 127.0.0.1 >nul");
-    for dir in data_folders() {
-        script.push_str(&format!(" & rmdir /s /q \"{}\"", dir.display()));
-    }
+    Ok(())
+}
+
+/// Longest wait for this process to end before a script that runs after it
+/// goes on, seconds. The exit stops the background jobs and saves a screen
+/// recording first (`Ctx::shutdown_media`), and that may take three minutes.
+const EXIT_WAIT_S: u32 = 240;
+
+/// The start of a `cmd.exe` script whose work must not begin before the
+/// process `pid` has ended: it waits for that process, then two more seconds.
+///
+/// A fixed pause alone is not enough. While this process saves a recording at
+/// its exit it still owns the name of the single instance and keeps the
+/// database open: a copy of the app started meanwhile would quit at once, and
+/// a folder removal would leave the open files behind. Without PowerShell the
+/// wait is skipped and only the pause is left, as before.
+fn after_exit(pid: u32) -> String {
+    format!(
+        "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -NonInteractive \
+         -Command \"Wait-Process -Id {pid} -Timeout {EXIT_WAIT_S} -ErrorAction SilentlyContinue\" \
+         & ping -n 3 127.0.0.1 >nul"
+    )
+}
+
+/// A hidden `cmd.exe` that runs `then` after the process `pid` has ended.
+fn after_exit_command(pid: u32, then: &str) -> std::process::Command {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("cmd.exe")
-        .raw_arg("/D /C")
-        .raw_arg(&script)
-        .creation_flags(CREATE_NO_WINDOW)
+    let mut cmd = std::process::Command::new("cmd.exe");
+    // `/S`: the outer quotes are taken off and the rest is run as written.
+    cmd.raw_arg("/D /S /C")
+        .raw_arg(format!("\"{} & {then}\"", after_exit(pid)))
+        .creation_flags(CREATE_NO_WINDOW);
+    cmd
+}
+
+/// Runs the `cmd.exe` commands `then` once this process has ended, however
+/// long its exit takes. Call it right before `app.exit`.
+pub fn run_after_exit(then: &str) -> std::io::Result<()> {
+    after_exit_command(std::process::id(), then)
         .spawn()
         .map(|_| ())
+}
+
+/// The commands that remove `folders`: each one again after a pause when
+/// something of it is left (a file a child process had not let go of yet).
+fn removal_script(folders: &[PathBuf]) -> String {
+    folders
+        .iter()
+        .map(|dir| {
+            let dir = dir.display();
+            format!(
+                "rmdir /s /q \"{dir}\" & if exist \"{dir}\" (ping -n 3 127.0.0.1 >nul & rmdir /s /q \"{dir}\")"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" & ")
+}
+
+/// Deletes keys and autostart now, and the folders once the app has ended:
+/// the database file is open until then, and the exit may take a while when
+/// a screen recording is being saved.
+pub fn wipe_all_data(secrets: &dyn SecretStore) -> Result<(), String> {
+    wipe_keys(secrets)?;
+    set_autostart(false)?;
+    run_after_exit(&removal_script(&data_folders()))
         .map_err(|e| format!("cannot schedule folder removal: {e}"))
 }
 
@@ -189,6 +227,79 @@ mod tests {
             ]
         );
         assert!(!v.contains(&install));
+    }
+
+    #[test]
+    fn wipe_deletes_every_fixed_key_the_calendar_link_included() {
+        use mika_core::secrets::{MemorySecretStore, Secret};
+        let keys = mika_core::backup::fixed_secret_keys();
+        assert!(keys.contains(&mika_core::config::CALENDAR_SECRET_KEY.to_string()));
+        assert!(keys.contains(&"calendar.ics_url".to_string()));
+        assert_eq!(keys.len(), 8);
+        let store = MemorySecretStore::default();
+        for key in &keys {
+            store.set(key, &Secret::new("value")).unwrap();
+        }
+        wipe_keys(&store).unwrap();
+        for key in &keys {
+            assert_eq!(store.get(key).unwrap(), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn what_runs_after_the_exit_waits_for_the_process_itself() {
+        let script = after_exit(4242);
+        let wait = script.find("Wait-Process -Id 4242 ").unwrap();
+        // The pause comes after the wait: it is what is left without PowerShell.
+        assert!(wait < script.find("ping -n 3").unwrap());
+        assert!(script.contains(&format!("-Timeout {EXIT_WAIT_S} ")));
+        // Longer than the longest exit: jobs are given 185 s and the cleanup 3 s.
+        const { assert!(EXIT_WAIT_S > 185 + 3) };
+
+        // A process that lives for about five seconds, like an exit that saves
+        // a recording. The old script paused for two seconds and went on.
+        let mut slow = std::process::Command::new("ping.exe")
+            .args(["-n", "6", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mark = dir.path().join("after.txt");
+        let then = format!("echo done>\"{}\"", mark.display());
+        let status = after_exit_command(slow.id(), &then).status().unwrap();
+        assert!(status.success());
+        // The work was done, and only after the process had ended.
+        assert!(
+            slow.try_wait().unwrap().is_some(),
+            "the script went on while the process was still alive"
+        );
+        assert!(mark.exists());
+    }
+
+    #[test]
+    fn folders_are_removed_again_when_something_is_left() {
+        let script = removal_script(&[PathBuf::from(r"C:\a b"), PathBuf::from(r"D:\logs")]);
+        assert_eq!(script.matches("rmdir /s /q \"C:\\a b\"").count(), 2);
+        assert_eq!(script.matches("rmdir /s /q \"D:\\logs\"").count(), 2);
+        assert!(script.contains("if exist \"C:\\a b\" ("));
+
+        // Run for real on a folder of the test: it is gone afterwards.
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("data folder");
+        std::fs::create_dir_all(gone.join("inner")).unwrap();
+        std::fs::write(gone.join("inner").join("mika.db"), b"x").unwrap();
+        // A process that has already ended: nothing to wait for.
+        let mut ended = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "exit"])
+            .spawn()
+            .unwrap();
+        ended.wait().unwrap();
+        let script = removal_script(std::slice::from_ref(&gone));
+        // The script ends with `if exist` of a folder that is gone: its exit
+        // code says nothing, the folder does.
+        let _ = after_exit_command(ended.id(), &script).status().unwrap();
+        assert!(!gone.exists());
+        assert!(dir.path().exists());
     }
 
     #[test]

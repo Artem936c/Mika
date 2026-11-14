@@ -7,7 +7,9 @@
   import type { Emotion } from './avatar';
   import { t, type MessageKey } from './i18n';
   import type { IconName } from './icons';
+  import Costs from './settings/Costs.svelte';
   import Extensions from './settings/Extensions.svelte';
+  import Hotkeys from './settings/Hotkeys.svelte';
   import IslandPage from './settings/IslandPage.svelte';
   import Memory from './settings/Memory.svelte';
   import Persona from './settings/Persona.svelte';
@@ -15,7 +17,7 @@
   import Tools from './settings/Tools.svelte';
   import Voice from './settings/Voice.svelte';
 
-  type Page = 'persona' | 'providers' | 'permissions' | 'tools' | 'memory' | 'extensions' | 'voice' | 'island' | 'general';
+  type Page = 'persona' | 'providers' | 'permissions' | 'tools' | 'memory' | 'extensions' | 'voice' | 'island' | 'hotkeys' | 'costs' | 'general';
 
   let {
     name,
@@ -33,6 +35,8 @@
     { id: 'extensions', icon: 'puzzle', lead: 'ext.lead' },
     { id: 'voice', icon: 'vol', lead: 'voice.lead' },
     { id: 'island', icon: 'mon', lead: 'island.lead' },
+    { id: 'hotkeys', icon: 'kbd', lead: 'hotkeys.lead' },
+    { id: 'costs', icon: 'coins', lead: 'costs.lead' },
     { id: 'general', icon: 'set', lead: 'general.lead' },
   ];
 
@@ -80,6 +84,10 @@
           <Voice {name} />
         {:else if page === 'island'}
           <IslandPage />
+        {:else if page === 'hotkeys'}
+          <Hotkeys />
+        {:else if page === 'costs'}
+          <Costs />
         {:else}
           <General {name} />
         {/if}
@@ -103,6 +111,14 @@
     padding: 14px 12px;
     min-height: 0;
     overflow: clip;
+    display: flex;
+    flex-direction: column;
+  }
+  /* The list of pages scrolls when the window is too low for all of them. */
+  nav {
+    min-height: 0;
+    overflow-y: auto;
+    scrollbar-width: thin;
   }
   .me {
     display: flex;

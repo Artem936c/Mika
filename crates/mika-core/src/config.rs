@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     pub assistant: AssistantConfig,
+    pub i18n: crate::i18n::I18nConfig,
     pub window: WindowConfig,
     pub voice: VoiceConfig,
     pub privacy: PrivacyConfig,
@@ -21,11 +22,17 @@ pub struct Config {
     pub embedding: EmbeddingConfig,
     pub updates: UpdatesConfig,
     pub notifications: NotificationsConfig,
+    pub events: EventsConfig,
     pub briefing: BriefingConfig,
     pub rhythm: RhythmConfig,
+    pub costs: crate::costs::CostsConfig,
     pub tracking: TrackingConfig,
     pub calendar: CalendarConfig,
+    pub hotkeys: HotkeysConfig,
+    pub dictation: DictationConfig,
+    pub screen_ask: ScreenAskConfig,
     pub docs: DocsConfig,
+    pub research: ResearchConfig,
 }
 
 /// Breaks and her small lines of her own.
@@ -46,6 +53,25 @@ impl Default for RhythmConfig {
             breaks: false,
             break_every_min: 50,
             lively: true,
+        }
+    }
+}
+
+/// Scenarios by event (decision 0031).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EventsConfig {
+    /// Scenarios run when their event happens. Off pauses all of them.
+    pub enabled: bool,
+    /// Most scenario runs in any hour, all scenarios together. 1..=60.
+    pub max_per_hour: u32,
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_per_hour: 12,
         }
     }
 }
@@ -88,6 +114,78 @@ pub struct DocsConfig {
     pub folders: Vec<String>,
 }
 
+/// Deep search: where reports go, which model reads the pages, limits of one run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ResearchConfig {
+    /// Folder for reports; empty means `Documents\Mika\Research` in the user profile.
+    pub folder: String,
+    /// Model for the inner requests; empty means the chat model.
+    pub model: String,
+    /// Search requests in one run.
+    pub max_searches: u32,
+    /// Pages whose text goes to the model in one run.
+    pub max_pages: u32,
+    /// Minutes one run may take.
+    pub max_minutes: u32,
+    /// Tokens of all inner model requests of one run, estimated.
+    pub max_tokens: u32,
+}
+
+impl Default for ResearchConfig {
+    fn default() -> Self {
+        Self {
+            folder: String::new(),
+            model: String::new(),
+            max_searches: 5,
+            max_pages: 8,
+            max_minutes: 5,
+            max_tokens: 50_000,
+        }
+    }
+}
+
+pub const RESEARCH_SEARCHES: (u32, u32) = (2, 10);
+pub const RESEARCH_PAGES: (u32, u32) = (2, 16);
+pub const RESEARCH_MINUTES: (u32, u32) = (2, 15);
+pub const RESEARCH_TOKENS: (u32, u32) = (20_000, 200_000);
+/// Above this many tokens a run is high risk: asked every time.
+pub const RESEARCH_HIGH_TOKENS: u32 = 100_000;
+
+/// Limits of one deep search, inside their bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResearchLimits {
+    pub searches: u32,
+    pub pages: u32,
+    pub minutes: u32,
+    pub tokens: u32,
+}
+
+impl ResearchConfig {
+    /// The limits of one run, each inside its bounds.
+    pub fn limits(&self) -> ResearchLimits {
+        let within = |value: u32, (min, max): (u32, u32)| value.clamp(min, max);
+        ResearchLimits {
+            searches: within(self.max_searches, RESEARCH_SEARCHES),
+            pages: within(self.max_pages, RESEARCH_PAGES),
+            minutes: within(self.max_minutes, RESEARCH_MINUTES),
+            tokens: within(self.max_tokens, RESEARCH_TOKENS),
+        }
+    }
+}
+
+impl ResearchLimits {
+    /// Most paid model requests of one run: the plan, one per page, the report.
+    pub fn llm_calls(&self) -> u32 {
+        self.pages + 2
+    }
+
+    /// Whether a run with these limits is asked every time.
+    pub fn high(&self) -> bool {
+        self.tokens > RESEARCH_HIGH_TOKENS
+    }
+}
+
 /// Notifications of other programs. Off until the user turns them on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -118,6 +216,12 @@ pub struct BriefingConfig {
     pub time: String,
     /// Day of the last summary, `YYYY-MM-DD`.
     pub last_date: String,
+    /// The evening summary of the day (decision 0028).
+    pub evening_enabled: bool,
+    /// Local time `HH:MM` after which the evening summary comes, once a day.
+    pub evening_time: String,
+    /// Day of the last evening summary, `YYYY-MM-DD`.
+    pub evening_last_date: String,
 }
 
 impl Default for BriefingConfig {
@@ -126,6 +230,9 @@ impl Default for BriefingConfig {
             enabled: false,
             time: "08:00".into(),
             last_date: String::new(),
+            evening_enabled: false,
+            evening_time: "21:00".into(),
+            evening_last_date: String::new(),
         }
     }
 }
@@ -139,6 +246,16 @@ impl BriefingConfig {
         self.enabled
             && now.time() >= at
             && self.last_date != now.date().format("%Y-%m-%d").to_string()
+    }
+
+    /// Whether the evening summary is due at `now`: the same rule, on its own fields.
+    pub fn evening_due(&self, now: chrono::NaiveDateTime) -> bool {
+        let Ok(at) = chrono::NaiveTime::parse_from_str(self.evening_time.trim(), "%H:%M") else {
+            return false;
+        };
+        self.evening_enabled
+            && now.time() >= at
+            && self.evening_last_date != now.date().format("%Y-%m-%d").to_string()
     }
 }
 
@@ -270,7 +387,7 @@ pub struct WindowConfig {
 #[serde(default)]
 pub struct VoiceConfig {
     pub speak_replies: bool,
-    /// Name of the Windows voice; empty picks a Russian one.
+    /// Name of the Windows voice; empty picks one for the language she replies in.
     pub voice: String,
     /// Speech rate of the Windows voice, 0.5..=2.0.
     pub rate: f32,
@@ -306,6 +423,8 @@ pub struct VoiceConfig {
     pub brief_long: bool,
     /// Fish Audio Drama 3 marks up replies for the voice (decision 0026).
     pub tts_expressive: bool,
+    /// A phrase without voice marks of its own gets a direction by her mood (decision 0029).
+    pub mood_directions: bool,
 }
 
 impl Default for VoiceConfig {
@@ -329,6 +448,7 @@ impl Default for VoiceConfig {
             tone_by_mood: true,
             brief_long: true,
             tts_expressive: false,
+            mood_directions: false,
         }
     }
 }
@@ -337,10 +457,29 @@ impl VoiceConfig {
     /// Replies are marked up for the voice: the switch is on, replies are
     /// spoken, the provider speaks them and its model performs the marks.
     pub fn expressive(&self) -> bool {
-        self.tts_expressive
-            && self.speak_replies
-            && self.tts == TtsEngine::Provider
-            && expressive_model(&self.tts_model)
+        self.performs_marks() && self.speak_replies
+    }
+
+    /// The voice performs marks: the switch of expressive speech is on, the
+    /// provider speaks and its model performs them. Whether replies are
+    /// spoken on this computer does not matter here.
+    pub fn performs_marks(&self) -> bool {
+        self.tts_expressive && self.tts == TtsEngine::Provider && expressive_model(&self.tts_model)
+    }
+
+    /// The provider speaks and has a model: it can make a voice message.
+    pub fn provider_speaks(&self) -> bool {
+        self.tts == TtsEngine::Provider && !self.tts_model.trim().is_empty()
+    }
+
+    /// The direction a phrase without marks of its own gets for this mood;
+    /// `None` when the switch is off, the voice performs no marks, or she is calm.
+    pub fn mood_direction(&self, mood: crate::emotion::Emotion) -> Option<&'static str> {
+        if self.mood_directions && self.performs_marks() {
+            mood.direction()
+        } else {
+            None
+        }
     }
 }
 
@@ -433,6 +572,17 @@ pub struct TelegramConfig {
     pub enabled: bool,
     /// Numeric id of the only account that may send commands; 0 means nobody.
     pub user_id: i64,
+    /// Voice messages are recognised and run as commands (decision 0029).
+    pub voice_in: bool,
+    /// A voice message is answered with a voice message too. Works only with `voice_in`.
+    pub voice_reply: bool,
+}
+
+impl TelegramConfig {
+    /// A voice message is answered by voice: both switches are on.
+    pub fn voice_replies(&self) -> bool {
+        self.voice_in && self.voice_reply
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -518,6 +668,8 @@ pub struct ToolsConfig {
     pub news_feed: String,
     /// Tool groups the user switched off; their tools are not offered to the model.
     pub disabled_groups: Vec<String>,
+    /// ffmpeg.exe or a folder with it; empty = search PATH, then the downloaded copy.
+    pub ffmpeg_path: String,
 }
 
 pub const DEFAULT_NEWS_FEED: &str = "https://lenta.ru/rss/news";
@@ -528,8 +680,33 @@ impl Default for ToolsConfig {
             web_enabled: false,
             news_feed: DEFAULT_NEWS_FEED.into(),
             disabled_groups: Vec::new(),
+            ffmpeg_path: String::new(),
         }
     }
+}
+
+/// Global hotkeys the user chose: action id -> combination as `Ctrl+Alt+D`.
+/// An action without an entry uses its defaults (`mika_core::hotkeys::HOTKEYS`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HotkeysConfig {
+    pub custom: std::collections::BTreeMap<String, String>,
+}
+
+/// Dictation into the window in front. Off until the user turns it on;
+/// also needs `privacy.microphone_enabled`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DictationConfig {
+    pub enabled: bool,
+}
+
+/// A question about a picture of the window in front. Off until the user turns it on;
+/// also needs `privacy.screen_enabled`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScreenAskConfig {
+    pub enabled: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -764,6 +941,7 @@ mod tests {
             enabled: true,
             time: "08:30".into(),
             last_date: "2026-11-12".into(),
+            ..Default::default()
         };
         assert!(!b.due(at("2026-11-13 08:00")));
         assert!(b.due(at("2026-11-13 11:00")));
@@ -774,6 +952,69 @@ mod tests {
         assert!(!b.due(at("2026-11-13 11:00")));
         assert!(!NotificationsConfig::default().enabled);
         assert!(!BriefingConfig::default().enabled);
+    }
+
+    #[test]
+    fn evening_summary_and_costs_have_defaults_and_roundtrip() {
+        use crate::costs::ManualPrice;
+        let at = |s: &str| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap();
+        let mut c = Config::default();
+        assert!(c.costs.enabled && c.costs.day_limit == 0.0 && c.costs.month_limit == 0.0);
+        assert!(c.costs.currency.is_empty() && c.costs.prices.is_empty());
+        assert!(!c.briefing.evening_enabled);
+        assert_eq!(c.briefing.evening_time, "21:00");
+        assert!(c.briefing.evening_last_date.is_empty());
+
+        // The evening summary keeps its own time and day, apart from the morning one.
+        assert!(!c.briefing.evening_due(at("2026-11-14 22:00")), "off");
+        c.briefing.evening_enabled = true;
+        assert!(!c.briefing.evening_due(at("2026-11-14 20:59")));
+        assert!(c.briefing.evening_due(at("2026-11-14 21:00")));
+        assert!(!c.briefing.due(at("2026-11-14 21:00")));
+        c.briefing.evening_last_date = "2026-11-14".into();
+        assert!(!c.briefing.evening_due(at("2026-11-14 23:00")));
+        assert!(c.briefing.evening_due(at("2026-11-15 21:30")));
+        c.briefing.evening_time = "вечер".into();
+        assert!(!c.briefing.evening_due(at("2026-11-15 21:30")));
+        c.briefing.evening_time = "20:30".into();
+
+        // An old file without the new fields loads with the defaults.
+        let (_d, p) = tmp();
+        std::fs::write(
+            &p,
+            "[briefing]\nenabled = true\ntime = \"07:00\"\nlast_date = \"2026-11-13\"\n",
+        )
+        .unwrap();
+        let old = Config::load(&p).unwrap();
+        assert!(old.briefing.enabled && !old.briefing.evening_enabled);
+        assert_eq!(old.briefing.evening_time, "21:00");
+        assert_eq!(old.costs, crate::costs::CostsConfig::default());
+
+        c.costs.day_limit = 100.0;
+        c.costs.month_limit = 2000.0;
+        c.costs.currency = "RUB".into();
+        c.costs.prices = vec![
+            ManualPrice {
+                provider: "api.openai.com".into(),
+                model: "gpt-4o-mini".into(),
+                currency: "USD".into(),
+                input_mtok: 0.15,
+                output_mtok: 0.6,
+                ..Default::default()
+            },
+            ManualPrice {
+                provider: "api.openai.com".into(),
+                model: "whisper-1".into(),
+                currency: "USD".into(),
+                per_minute: 0.006,
+                ..Default::default()
+            },
+        ];
+        c.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[[costs.prices]]"), "{text}");
+        assert!(text.contains("evening_time = \"20:30\""), "{text}");
+        assert_eq!(Config::load(&p).unwrap(), c);
     }
 
     #[test]
@@ -844,5 +1085,265 @@ mod tests {
         for v in off {
             assert!(!v.expressive(), "{v:?}");
         }
+    }
+
+    #[test]
+    fn telegram_voice_and_mood_directions_start_off_and_old_files_load_without_them() {
+        let c = Config::default();
+        assert!(!c.telegram.voice_in && !c.telegram.voice_reply);
+        assert!(!c.telegram.voice_replies());
+        assert!(!c.voice.mood_directions);
+        let (_d, p) = tmp();
+        std::fs::write(
+            &p,
+            "[telegram]\nenabled = true\nuser_id = 42\n[voice]\ntts_expressive = true\n",
+        )
+        .unwrap();
+        let old = Config::load(&p).unwrap();
+        assert!(old.telegram.enabled && old.telegram.user_id == 42);
+        assert!(!old.telegram.voice_in && !old.telegram.voice_reply);
+        assert!(!old.voice.mood_directions);
+        let mut c = old.clone();
+        c.telegram.voice_in = true;
+        c.telegram.voice_reply = true;
+        c.voice.mood_directions = true;
+        c.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("voice_in = true"), "{text}");
+        assert!(text.contains("voice_reply = true"), "{text}");
+        assert!(text.contains("mood_directions = true"), "{text}");
+        assert_eq!(Config::load(&p).unwrap(), c);
+    }
+
+    #[test]
+    fn a_voice_reply_in_telegram_needs_both_switches() {
+        let mut t = TelegramConfig {
+            voice_reply: true,
+            ..Default::default()
+        };
+        // The second switch alone does nothing: it works only with the first.
+        assert!(!t.voice_replies());
+        t.voice_in = true;
+        assert!(t.voice_replies());
+        t.voice_reply = false;
+        assert!(!t.voice_replies());
+    }
+
+    #[test]
+    fn a_voice_performs_marks_whether_or_not_replies_are_spoken_here() {
+        let drama = VoiceConfig {
+            tts_expressive: true,
+            speak_replies: false,
+            tts: TtsEngine::Provider,
+            tts_model: "fish-audio/drama-3".into(),
+            ..Default::default()
+        };
+        assert!(drama.performs_marks() && !drama.expressive());
+        assert!(drama.provider_speaks());
+        let off = [
+            VoiceConfig {
+                tts_expressive: false,
+                ..drama.clone()
+            },
+            VoiceConfig {
+                tts: TtsEngine::Windows,
+                ..drama.clone()
+            },
+            VoiceConfig {
+                tts_model: "fish-audio/s2-pro".into(),
+                ..drama.clone()
+            },
+        ];
+        for v in off {
+            assert!(!v.performs_marks(), "{v:?}");
+        }
+        // A provider voice needs a model to make a voice message.
+        assert!(!VoiceConfig::default().provider_speaks());
+        let no_model = VoiceConfig {
+            tts: TtsEngine::Provider,
+            tts_model: "  ".into(),
+            ..Default::default()
+        };
+        assert!(!no_model.provider_speaks());
+        let other = VoiceConfig {
+            tts: TtsEngine::Provider,
+            tts_model: "google/gemini-tts".into(),
+            ..Default::default()
+        };
+        assert!(other.provider_speaks() && !other.performs_marks());
+    }
+
+    #[test]
+    fn a_mood_direction_needs_the_switch_a_voice_with_marks_and_a_mood() {
+        use crate::emotion::Emotion;
+        let on = VoiceConfig {
+            mood_directions: true,
+            tts_expressive: true,
+            // Replies need not be spoken on this computer: Telegram hears them.
+            speak_replies: false,
+            tts: TtsEngine::Provider,
+            tts_model: "fish-audio/drama-3".into(),
+            ..Default::default()
+        };
+        assert_eq!(on.mood_direction(Emotion::Sad), Some("sad, quietly"));
+        assert_eq!(on.mood_direction(Emotion::Neutral), None);
+        assert_eq!(on.mood_direction(Emotion::Think), None);
+        let off = [
+            VoiceConfig {
+                mood_directions: false,
+                ..on.clone()
+            },
+            VoiceConfig {
+                tts_expressive: false,
+                ..on.clone()
+            },
+            VoiceConfig {
+                tts: TtsEngine::Windows,
+                ..on.clone()
+            },
+            VoiceConfig {
+                tts_model: "fish-audio/s2-pro".into(),
+                ..on.clone()
+            },
+        ];
+        for v in off {
+            assert_eq!(v.mood_direction(Emotion::Sad), None, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn hotkeys_dictation_and_screen_ask_start_off_and_roundtrip() {
+        let mut c = Config::default();
+        assert!(c.hotkeys.custom.is_empty());
+        assert!(!c.dictation.enabled && !c.screen_ask.enabled);
+        let (_d, p) = tmp();
+        c.hotkeys
+            .custom
+            .insert("dictation".into(), "Ctrl+Alt+J".into());
+        c.dictation.enabled = true;
+        c.screen_ask.enabled = true;
+        c.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[hotkeys.custom]"), "{text}");
+        assert!(text.contains("dictation = \"Ctrl+Alt+J\""), "{text}");
+        assert!(text.contains("[dictation]") && text.contains("[screen_ask]"));
+        assert_eq!(Config::load(&p).unwrap(), c);
+    }
+
+    #[test]
+    fn file_without_hotkey_sections_loads_with_everything_off() {
+        let (_d, p) = tmp();
+        std::fs::write(&p, "[privacy]\nmicrophone_enabled = true\n").unwrap();
+        let old = Config::load(&p).unwrap();
+        assert!(old.privacy.microphone_enabled);
+        assert!(old.hotkeys.custom.is_empty());
+        assert!(!old.dictation.enabled && !old.screen_ask.enabled);
+    }
+
+    #[test]
+    fn scenarios_by_event_are_on_with_a_limit_and_old_files_load() {
+        let c = Config::default();
+        assert!(c.events.enabled);
+        assert_eq!(c.events.max_per_hour, 12);
+        let (_d, p) = tmp();
+        std::fs::write(&p, "[events]\nenabled = false\n").unwrap();
+        let old = Config::load(&p).unwrap();
+        assert!(!old.events.enabled);
+        assert_eq!(old.events.max_per_hour, 12);
+        old.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[events]"), "{text}");
+        assert_eq!(Config::load(&p).unwrap(), old);
+    }
+
+    #[test]
+    fn research_defaults_and_old_files_without_the_section() {
+        let r = ResearchConfig::default();
+        assert!(r.folder.is_empty() && r.model.is_empty());
+        assert_eq!(
+            (r.max_searches, r.max_pages, r.max_minutes, r.max_tokens),
+            (5, 8, 5, 50_000)
+        );
+        let limits = r.limits();
+        assert_eq!(
+            limits,
+            ResearchLimits {
+                searches: 5,
+                pages: 8,
+                minutes: 5,
+                tokens: 50_000
+            }
+        );
+        assert_eq!(limits.llm_calls(), 10);
+        assert!(!limits.high());
+        let (_d, p) = tmp();
+        std::fs::write(&p, "[docs]\nfolders = [\"C:\\\\Docs\"]\n").unwrap();
+        let old = Config::load(&p).unwrap();
+        assert_eq!(old.research, ResearchConfig::default());
+    }
+
+    #[test]
+    fn research_limits_stay_inside_their_bounds() {
+        let low = ResearchConfig {
+            max_searches: 0,
+            max_pages: 0,
+            max_minutes: 0,
+            max_tokens: 0,
+            ..Default::default()
+        }
+        .limits();
+        assert_eq!(
+            low,
+            ResearchLimits {
+                searches: 2,
+                pages: 2,
+                minutes: 2,
+                tokens: 20_000
+            }
+        );
+        let high = ResearchConfig {
+            max_searches: 10_000_000,
+            max_pages: 10_000_000,
+            max_minutes: 10_000_000,
+            max_tokens: 10_000_000,
+            ..Default::default()
+        }
+        .limits();
+        assert_eq!(
+            high,
+            ResearchLimits {
+                searches: 10,
+                pages: 16,
+                minutes: 15,
+                tokens: 200_000
+            }
+        );
+        assert!(high.high());
+        assert_eq!(high.llm_calls(), 18);
+        let edge = ResearchConfig {
+            max_tokens: RESEARCH_HIGH_TOKENS,
+            ..Default::default()
+        };
+        assert!(!edge.limits().high());
+    }
+
+    #[test]
+    fn research_section_roundtrips() {
+        let (_d, p) = tmp();
+        let c = Config {
+            research: ResearchConfig {
+                folder: "D:\\Reports".into(),
+                model: "mistralai/mistral-nemo".into(),
+                max_searches: 3,
+                max_pages: 4,
+                max_minutes: 6,
+                max_tokens: 120_000,
+            },
+            ..Default::default()
+        };
+        c.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[research]"), "{text}");
+        assert_eq!(Config::load(&p).unwrap(), c);
     }
 }

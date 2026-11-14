@@ -1,21 +1,25 @@
 //! Fakes of the system interfaces for tool tests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use mika_core::bgjobs::JobBoard;
 use mika_core::events::EventBus;
 use mika_core::gate::Approval;
+use mika_core::llm::{TextAnswer, TextFailure};
 use mika_core::memory::Memory;
+use mika_core::sound_capture::{SoundCapture, SoundSource, SoundStats, SoundTake};
 use mika_core::storage::Db;
 use mika_core::tools::{Tool, ToolError, ToolOutput};
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::observe::{AudioDevice, Proc, Sensors, SessionState};
 use crate::sys::*;
 
 #[derive(Default)]
@@ -54,6 +58,24 @@ pub struct Fakes {
     pub rdp_files: Mutex<Vec<PathBuf>>,
     pub runs: Mutex<Vec<(String, Vec<String>, Duration)>>,
     pub run_output: Mutex<RunOutput>,
+    /// Answers in turn, before `run_output`.
+    pub run_outputs: Mutex<VecDeque<RunOutput>>,
+    /// The folder of every streamed run.
+    pub run_cwds: Mutex<Vec<Option<PathBuf>>>,
+    /// What a program other than ffprobe writes to its output file.
+    pub run_write: Mutex<Option<Vec<u8>>>,
+    /// What speech recognition hears in every piece.
+    pub stt_text: Mutex<String>,
+    /// Phrases with times for every piece; `None`: the provider cannot tell times.
+    pub stt_segments: Mutex<Option<Vec<SpeechSegment>>>,
+    /// So many recognitions fail first.
+    pub stt_errors: Mutex<usize>,
+    /// Recognition of a WAV of this many bytes always fails.
+    pub stt_fail_len: Mutex<Option<usize>>,
+    /// Length of every WAV given to speech recognition.
+    pub stt_wavs: Mutex<Vec<usize>>,
+    /// Number of frames of every `ask_frames`.
+    pub vision_frames: Mutex<Vec<usize>>,
     /// URL prefix -> body.
     pub http: Mutex<HashMap<String, String>>,
     pub http_calls: Mutex<Vec<String>>,
@@ -77,6 +99,85 @@ pub struct Fakes {
     /// What the fake browser shows; every action returns it.
     pub page: Mutex<Option<Page>>,
     pub browser_log: Mutex<Vec<String>>,
+    /// `Input::modifiers_down` says "held" this many more times.
+    pub modifiers_down: Mutex<u32>,
+    /// What `Ui::focused_password` returns.
+    pub focused_password: Mutex<bool>,
+    /// `Ui::focused_password` cannot tell: it returns `None`.
+    pub password_unknown: Mutex<bool>,
+    /// What the fake sensors of the event watcher see.
+    pub audio_devices: Mutex<Vec<AudioDevice>>,
+    pub procs: Mutex<Vec<Proc>>,
+    pub session_state: Mutex<SessionState>,
+    pub idle_s: Mutex<u64>,
+    /// Text of a window by its id; a window that is not here cannot be read.
+    pub window_texts: Mutex<HashMap<u64, String>>,
+    /// The method name of every sensor call.
+    pub sensor_calls: Mutex<Vec<&'static str>>,
+    /// A sensor method that fails.
+    pub sensor_error: Mutex<Option<&'static str>>,
+    /// Where each window stands; a window that is not here is minimized.
+    pub window_bounds: Mutex<HashMap<u64, Rect>>,
+    /// Whole areas of the monitors; empty means one monitor 0,0 1920x1080.
+    pub monitor_bounds: Mutex<Vec<Rect>>,
+    /// While true, a controlled run goes on until it is told to quit or is
+    /// cancelled; false lets it end by itself.
+    pub run_hold: Mutex<bool>,
+    /// How long a controlled run goes on after it was told to finish.
+    pub run_linger: Mutex<Duration>,
+    /// How long every streamed run takes; a stop ends it at once.
+    pub run_delay: Mutex<Duration>,
+    /// Every sound take that started: its source and its file.
+    pub sound_takes: Mutex<Vec<(SoundSource, PathBuf)>>,
+    /// Why no sound take starts.
+    pub sound_error: Mutex<Option<String>>,
+    /// The "Microphone" switch.
+    pub mic_allowed: Arc<AtomicBool>,
+    /// Answers of the text model: the first whose needle is in the system or user text wins.
+    pub llm: Mutex<Vec<(String, Result<String, String>)>>,
+    /// Characters of reasoning the text model streams beside every answer.
+    pub llm_reasoning: Mutex<usize>,
+    /// Every request to the text model: (model, system, user, max_chars).
+    pub llm_calls: Mutex<Vec<(String, String, String, usize)>>,
+}
+
+impl Fake {
+    /// Notes a sensor call; an error when this sensor is set to fail.
+    fn sensor(&self, method: &'static str) -> Result<(), String> {
+        self.0.sensor_calls.lock().push(method);
+        if *self.0.sensor_error.lock() == Some(method) {
+            return Err("датчик не ответил".into());
+        }
+        Ok(())
+    }
+}
+
+impl Sensors for Fake {
+    fn audio_devices(&self) -> Result<Vec<AudioDevice>, String> {
+        self.sensor("audio_devices")?;
+        Ok(self.0.audio_devices.lock().clone())
+    }
+    fn processes(&self) -> Result<Vec<Proc>, String> {
+        self.sensor("processes")?;
+        Ok(self.0.procs.lock().clone())
+    }
+    fn session(&self) -> Result<SessionState, String> {
+        self.sensor("session")?;
+        Ok(*self.0.session_state.lock())
+    }
+    fn idle_seconds(&self) -> u64 {
+        let _ = self.sensor("idle_seconds");
+        *self.0.idle_s.lock()
+    }
+    fn window_text(&self, window: u64) -> Result<String, String> {
+        self.sensor("window_text")?;
+        self.0
+            .window_texts
+            .lock()
+            .get(&window)
+            .cloned()
+            .ok_or_else(|| "окно не читается".to_string())
+    }
 }
 
 #[async_trait]
@@ -205,6 +306,22 @@ impl Windows for Fake {
         self.0.moved.lock().push((id, n));
         Ok(())
     }
+    fn bounds(&self, id: u64) -> Option<Rect> {
+        self.0.window_bounds.lock().get(&id).copied()
+    }
+    fn monitor_bounds(&self) -> Vec<Rect> {
+        let set = self.0.monitor_bounds.lock().clone();
+        if set.is_empty() {
+            vec![Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            }]
+        } else {
+            set
+        }
+    }
 }
 
 impl Ui for Fake {
@@ -231,6 +348,12 @@ impl Ui for Fake {
         self.0.ui_calls.lock().push(format!("focus {window} {n}"));
         Ok(())
     }
+    fn focused_password(&self) -> Option<bool> {
+        if *self.0.password_unknown.lock() {
+            return None;
+        }
+        Some(*self.0.focused_password.lock())
+    }
 }
 
 impl Input for Fake {
@@ -252,6 +375,14 @@ impl Input for Fake {
     fn wheel(&self, x: i32, y: i32, lines: i32) -> Result<(), String> {
         self.0.wheels.lock().push((x, y, lines));
         Ok(())
+    }
+    fn modifiers_down(&self) -> bool {
+        let mut left = self.0.modifiers_down.lock();
+        if *left == 0 {
+            return false;
+        }
+        *left -= 1;
+        true
     }
 }
 
@@ -302,6 +433,11 @@ impl Vision for Fake {
             return Ok(seq.remove(0));
         }
         Ok(format!("вижу {} байт, вопрос: {question}", png.len()))
+    }
+
+    async fn ask_frames(&self, pngs: &[Vec<u8>], question: &str) -> Result<String, String> {
+        self.0.vision_frames.lock().push(pngs.len());
+        Ok(format!("вижу {} кадров, вопрос: {question}", pngs.len()))
     }
 }
 
@@ -411,6 +547,28 @@ impl RdpSource for Fake {
     }
 }
 
+impl Fake {
+    /// Records a run and gives the next answer: the queue first, then
+    /// `run_output`. With `run_write` set, a program other than ffprobe
+    /// writes those bytes to its last `file:` argument, as FFmpeg would.
+    fn answer(&self, program: &str, args: &[String], timeout: Duration) -> RunOutput {
+        self.0
+            .runs
+            .lock()
+            .push((program.into(), args.to_vec(), timeout));
+        if !program.to_lowercase().contains("ffprobe") {
+            if let (Some(bytes), Some(out)) = (
+                self.0.run_write.lock().clone(),
+                args.last().and_then(|a| a.strip_prefix("file:")),
+            ) {
+                let _ = std::fs::write(out, bytes);
+            }
+        }
+        let next = self.0.run_outputs.lock().pop_front();
+        next.unwrap_or_else(|| self.0.run_output.lock().clone())
+    }
+}
+
 #[async_trait]
 impl Runner for Fake {
     async fn run(
@@ -420,11 +578,145 @@ impl Runner for Fake {
         timeout: Duration,
         _cancel: CancellationToken,
     ) -> Result<RunOutput, String> {
-        self.0
-            .runs
-            .lock()
-            .push((program.into(), args.to_vec(), timeout));
-        Ok(self.0.run_output.lock().clone())
+        Ok(self.answer(program, args, timeout))
+    }
+
+    async fn run_streaming(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&Path>,
+        timeout: Duration,
+        cancel: CancellationToken,
+        on_stdout: &(dyn for<'l> Fn(&'l str) + Send + Sync),
+    ) -> Result<RunOutput, String> {
+        self.0.run_cwds.lock().push(cwd.map(Path::to_path_buf));
+        let out = self.answer(program, args, timeout);
+        let delay = *self.0.run_delay.lock();
+        if !delay.is_zero() {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = cancel.cancelled() => return Err("остановлено".into()),
+            }
+        }
+        for line in out.stdout.lines() {
+            on_stdout(line);
+        }
+        Ok(out)
+    }
+
+    async fn run_controlled(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&Path>,
+        timeout: Duration,
+        cancel: CancellationToken,
+        quit: CancellationToken,
+        _quit_wait: Duration,
+        on_stdout: &(dyn for<'l> Fn(&'l str) + Send + Sync),
+    ) -> Result<RunOutput, String> {
+        self.0.run_cwds.lock().push(cwd.map(Path::to_path_buf));
+        let mut out = self.answer(program, args, timeout);
+        // Lines after `AFTER_QUIT` are what the program still writes between
+        // being told to finish and its end.
+        let (before, after) = match out.stdout.split_once(AFTER_QUIT) {
+            Some((before, after)) => (before.to_string(), after.to_string()),
+            None => (out.stdout.clone(), String::new()),
+        };
+        for line in before.lines() {
+            on_stdout(line);
+        }
+        // The program goes on until it is told to finish.
+        while *self.0.run_hold.lock() && !quit.is_cancelled() {
+            if cancel.is_cancelled() {
+                return Err("остановлено".into());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Told to finish, it may take its time to end.
+        let linger = *self.0.run_linger.lock();
+        if !linger.is_zero() && quit.is_cancelled() {
+            tokio::time::sleep(linger).await;
+        }
+        for line in after.lines().filter(|l| !l.is_empty()) {
+            on_stdout(line);
+        }
+        out.stdout = format!("{before}{after}");
+        Ok(out)
+    }
+
+    fn run_blocking(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<RunOutput, String> {
+        Ok(self.answer(program, args, timeout))
+    }
+}
+
+/// In the answer of a controlled run: the lines after this one are written
+/// only after the run was told to finish.
+pub const AFTER_QUIT: &str = "--after-quit--\n";
+
+/// A sound take of the fake: an empty WAV file appears when it stops.
+struct FakeTake(PathBuf);
+
+impl SoundTake for FakeTake {
+    fn stop(self: Box<Self>) -> Result<SoundStats, String> {
+        let mut wav = Vec::with_capacity(44);
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&36u32.to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&48_000u32.to_le_bytes());
+        wav.extend_from_slice(&192_000u32.to_le_bytes());
+        wav.extend_from_slice(&4u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&self.0, wav).map_err(|e| e.to_string())?;
+        Ok(SoundStats {
+            seconds: 1.0,
+            silent: false,
+        })
+    }
+}
+
+impl SoundCapture for Fake {
+    fn start(&self, source: SoundSource, wav: &Path) -> Result<Box<dyn SoundTake>, String> {
+        if let Some(e) = self.0.sound_error.lock().clone() {
+            return Err(e);
+        }
+        self.0.sound_takes.lock().push((source, wav.to_path_buf()));
+        Ok(Box::new(FakeTake(wav.to_path_buf())))
+    }
+}
+
+#[async_trait]
+impl SpeechToText for Fake {
+    async fn transcribe(&self, wav: &[u8]) -> Result<String, String> {
+        self.0.stt_wavs.lock().push(wav.len());
+        if *self.0.stt_fail_len.lock() == Some(wav.len()) {
+            return Err("сбой распознавания".into());
+        }
+        let mut errors = self.0.stt_errors.lock();
+        if *errors > 0 {
+            *errors -= 1;
+            return Err("сбой распознавания".into());
+        }
+        Ok(self.0.stt_text.lock().clone())
+    }
+
+    async fn transcribe_segments(&self, wav: &[u8]) -> Result<Option<Vec<SpeechSegment>>, String> {
+        let segments = self.0.stt_segments.lock().clone();
+        if segments.is_some() {
+            self.0.stt_wavs.lock().push(wav.len());
+        }
+        Ok(segments)
     }
 }
 
@@ -437,6 +729,74 @@ impl Http for Fake {
             .find(|(prefix, _)| url.starts_with(prefix.as_str()))
             .map(|(_, body)| body.clone())
             .ok_or_else(|| format!("нет ответа для {url}"))
+    }
+}
+
+#[async_trait]
+impl TextModel for Fake {
+    fn model_id(&self, model: &str) -> String {
+        let model = model.trim();
+        if model.is_empty() {
+            "fake-model".into()
+        } else {
+            model.to_string()
+        }
+    }
+
+    async fn complete(
+        &self,
+        model: &str,
+        system: &str,
+        user: &str,
+        max_chars: usize,
+    ) -> Result<TextAnswer, TextFailure> {
+        self.0
+            .llm_calls
+            .lock()
+            .push((model.into(), system.into(), user.into(), max_chars));
+        let reasoning = *self.0.llm_reasoning.lock();
+        let answers = self.0.llm.lock();
+        let answer = answers
+            .iter()
+            .find(|(needle, _)| system.contains(needle.as_str()) || user.contains(needle.as_str()))
+            .map(|(_, answer)| answer.clone())
+            .unwrap_or_else(|| Err("нет ответа модели".into()));
+        match answer {
+            Ok(text) => {
+                let text: String = text.chars().take(max_chars).collect();
+                let streamed = text.chars().count() + reasoning;
+                Ok(TextAnswer { text, streamed })
+            }
+            Err(reason) => Err(TextFailure::new(reason)),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::research::net::Net for Fake {
+    async fn get(
+        &self,
+        url: &str,
+        max_bytes: usize,
+    ) -> Result<crate::research::net::Fetched, crate::research::net::NetError> {
+        use crate::research::net::{check_url, Fetched, NetError};
+        self.0.http_calls.lock().push(url.into());
+        check_url(url).map_err(NetError::Refused)?;
+        let map = self.0.http.lock();
+        let body = map
+            .iter()
+            .find(|(prefix, _)| url.starts_with(prefix.as_str()))
+            .map(|(_, body)| body.clone())
+            .ok_or(NetError::Status(404))?;
+        let mut cut = max_bytes.min(body.len());
+        while !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        Ok(Fetched {
+            url: url.into(),
+            html: body[..cut].to_string(),
+            truncated: cut < body.len(),
+        })
     }
 }
 
@@ -478,6 +838,8 @@ pub fn env_with(db: Arc<Db>, user_profile: &str) -> (ToolEnv, Arc<Fakes>) {
     let f = Arc::new(Fakes::default());
     *f.radios.lock() = (Some(true), None);
     let fake = || Arc::new(Fake(f.clone()));
+    let bus = EventBus::new(256);
+    let mic_allowed = f.mic_allowed.clone();
     let env = ToolEnv {
         launcher: fake(),
         volume: fake(),
@@ -495,6 +857,7 @@ pub fn env_with(db: Arc<Db>, user_profile: &str) -> (ToolEnv, Arc<Fakes>) {
         media: fake(),
         radios: fake(),
         browser: fake(),
+        sensors: fake(),
         user_profile: user_profile.into(),
         shared: Shared {
             web_enabled: Arc::new(AtomicBool::new(true)),
@@ -506,7 +869,7 @@ pub fn env_with(db: Arc<Db>, user_profile: &str) -> (ToolEnv, Arc<Fakes>) {
             memory: Memory::new(db.clone(), None),
             vision: fake(),
             images: fake(),
-            bus: EventBus::new(64),
+            bus: bus.clone(),
             tasks: mika_core::task::TaskBoard::new(EventBus::new(64)),
             watches: Default::default(),
             focus: Default::default(),
@@ -515,6 +878,19 @@ pub fn env_with(db: Arc<Db>, user_profile: &str) -> (ToolEnv, Arc<Fakes>) {
             app_time_on: Default::default(),
             calendar: Default::default(),
             docs: crate::docs::DocIndex::new(db.clone(), None),
+            ffmpeg_path: Default::default(),
+            stt: fake(),
+            av_outputs: Default::default(),
+            triggers: mika_core::triggers::TriggerStore::new(db.clone()),
+            waits: Default::default(),
+            jobs: JobBoard::new(bus),
+            rec: crate::ffmpeg::RecordDeps {
+                sound: fake(),
+                mic_allowed: Arc::new(move || mic_allowed.load(Ordering::Relaxed)),
+            },
+            text_model: fake(),
+            research: Default::default(),
+            research_runs: Default::default(),
         },
         db,
     };

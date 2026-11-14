@@ -6,9 +6,11 @@ mod common;
 pub mod factory;
 pub mod live;
 pub mod mcp;
+pub mod metering;
 pub mod openai;
 pub mod speech;
 pub mod sse;
 pub mod telegram;
+mod text;
 
 pub use factory::{build_or_placeholder, build_provider, probe, redact};

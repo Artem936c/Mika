@@ -17,7 +17,6 @@ use mika_tools::usage::UsageStore;
 use parking_lot::Mutex;
 
 use crate::app::Ctx;
-use crate::everyday::idle_seconds;
 use crate::strings::tr;
 
 /// How often the rhythm loop looks around.
@@ -314,7 +313,8 @@ impl Ctx {
     fn rhythm_tick(self: &Arc<Self>, w: &mut Watch) {
         let now = Local::now();
         let at = now.timestamp();
-        let (idle, back) = w.presence(idle_seconds(), at);
+        // The user's own input: what she sent herself does not count.
+        let (idle, back) = w.presence(self.idle_seconds(), at);
         let (rhythm, app_time) = {
             let c = self.config.lock();
             (c.rhythm.clone(), c.tracking.app_time)
@@ -328,6 +328,11 @@ impl Ctx {
             self.focus_over(&held);
         }
         let focused = shared.focus.active(at);
+        // Budget warnings that waited for the end of focus (decision 0028):
+        // after its summary, as silent lines, never among the notifications.
+        if !focused {
+            self.release_cost_alerts();
+        }
 
         let every = rhythm.break_every_min.clamp(15, 240) as i64 * 60;
         if let Some(since) = w.working_since {

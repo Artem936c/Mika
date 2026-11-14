@@ -41,6 +41,7 @@
     brief_long: boolean;
     tts_expressive: boolean;
     expressive_model: boolean;
+    mood_directions: boolean;
   }
 
   let { name }: { name: string } = $props();
@@ -108,6 +109,16 @@
     try {
       await invoke('set_expressive_speech', { value: v });
       s.tts_expressive = v;
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  async function setMoodDirections(v: boolean) {
+    if (!s) return;
+    try {
+      await invoke('set_mood_directions', { value: v });
+      s.mood_directions = v;
     } catch (e) {
       fail(e);
     }
@@ -363,6 +374,8 @@
     </div>
     <Switch checked={s.tts_expressive} title={t('voice.expressive')} sub={t('voice.expressive_sub')} onchange={setExpressive} />
     {#if s.tts_expressive && !s.expressive_model}<p class="warn">{t('voice.expressive_other_model')}</p>{/if}
+    <Switch checked={s.mood_directions} title={t('voice.mood_dir')} sub={t('voice.mood_dir_sub')} onchange={setMoodDirections} />
+    {#if s.mood_directions && !(s.tts_expressive && s.expressive_model)}<p class="warn">{t('voice.mood_dir_needs')}</p>{/if}
     <Switch checked={s.tts_cache} title={t('voice.cache')} sub={t('voice.cache_sub', { size: cacheSize })} onchange={setCache} />
   {/if}
   <Switch checked={s.brief_long} title={t('voice.brief')} sub={t('voice.brief_sub')} onchange={setBrief} />

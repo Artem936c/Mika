@@ -86,24 +86,17 @@ pub(crate) fn briefing_calendar(
     (waited >= CALENDAR_WAIT).then_some(false)
 }
 
-/// Seconds since the last key press or mouse move in this session.
-pub(crate) fn idle_seconds() -> u64 {
-    use windows_sys::Win32::System::SystemInformation::GetTickCount;
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
-    let mut info = LASTINPUTINFO {
-        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
-        dwTime: 0,
-    };
-    // SAFETY: fills a plain struct owned here.
-    if unsafe { GetLastInputInfo(&mut info) } == 0 {
-        return 0;
-    }
-    // SAFETY: no arguments.
-    let now = unsafe { GetTickCount() };
-    (now.wrapping_sub(info.dwTime) / 1000) as u64
-}
-
 impl Ctx {
+    /// Seconds since the user's own last key press or mouse move. Asked from
+    /// the sensor of the tools, the one the scenarios by event use: it does
+    /// not count the keys and clicks Mika sends herself (decision 0031).
+    /// Windows keeps one "last input" time for both, so read raw, a media key
+    /// pressed by a scenario while the user is away would look like the user
+    /// at the computer, and a summary would be made and said to an empty room.
+    pub(crate) fn idle_seconds(&self) -> u64 {
+        self.tool_env().sensors.idle_seconds()
+    }
+
     /// Reads new notifications while the user allows it.
     pub fn start_notifications(self: &Arc<Self>) {
         let me = Arc::downgrade(self);
@@ -156,7 +149,10 @@ impl Ctx {
         let watched = (t.app == "Telegram")
             .then(|| self.tool_env().shared.watches.matching(&t.title, at))
             .flatten();
-        if let Some(w) = watched {
+        // A reply in a chat she keeps up is a paid turn of her own: with the
+        // budget reached the message is only shown, like any other
+        // notification (decision 0028).
+        if let Some(w) = watched.filter(|_| mika_core::costs::unattended_allowed()) {
             self.publish_notification(t);
             let task = mika_tools::watch::reply_task(&w, &t.app, &t.text);
             self.session.submit_task(&task);
@@ -185,7 +181,8 @@ impl Ctx {
             .append_note(&format!("🔔 Уведомление: {}", notice_line(t)));
     }
 
-    /// Gives the morning summary once a day, when someone is at the computer.
+    /// Gives the morning summary and the evening summary of the day, each
+    /// once a day, when someone is at the computer.
     pub fn start_briefing(self: &Arc<Self>) {
         let me = Arc::downgrade(self);
         tauri::async_runtime::spawn(async move {
@@ -194,10 +191,11 @@ impl Ctx {
                 tokio::time::sleep(BRIEFING_EVERY).await;
                 let Some(ctx) = me.upgrade() else { break };
                 let now = chrono::Local::now().naive_local();
-                let (due, city, calendar_on) = {
+                let (due, evening_due, city, calendar_on) = {
                     let c = ctx.config.lock();
                     (
                         c.briefing.due(now),
+                        c.briefing.evening_due(now),
                         c.island.city.clone(),
                         c.calendar.enabled,
                     )
@@ -207,11 +205,18 @@ impl Ctx {
                     .shared
                     .focus
                     .active(chrono::Local::now().timestamp());
-                if !due
-                    || focused
-                    || idle_seconds() > PRESENT_S
-                    || ctx.state() != AssistantState::Idle
-                {
+                let present = !focused
+                    && ctx.idle_seconds() <= PRESENT_S
+                    && ctx.state() == AssistantState::Idle;
+                if !(due || evening_due) || !present {
+                    continue;
+                }
+                // Both summaries are paid requests she makes by herself: with
+                // the budget reached they wait (decision 0028). The day is not
+                // marked, so a summary whose time has passed still comes if
+                // the budget frees on the same day; the user is told once per
+                // period by the tracker, not every half a minute.
+                if !mika_core::costs::unattended_allowed() {
                     continue;
                 }
                 // The same test as the calendar reader's: on, with a link.
@@ -228,6 +233,22 @@ impl Ctx {
                     continue;
                 };
                 waiting = None;
+                // The summary of the day in the evening (decision 0028). It
+                // waited for the calendar too: it tells the meetings of today
+                // and of tomorrow. The day is written before the model is
+                // asked, so a failure does not repeat every half a minute.
+                if evening_due {
+                    ctx.config.lock().briefing.evening_last_date =
+                        now.date().format("%Y-%m-%d").to_string();
+                    if let Err(e) = ctx.save_config() {
+                        log::warn!("cannot save config: {e}");
+                    }
+                    log::info!("evening summary");
+                    if let Err(why) = ctx.evening_summary().await {
+                        log::warn!("the day is not summed up: {why:?}");
+                    }
+                    continue;
+                }
                 ctx.config.lock().briefing.last_date = now.date().format("%Y-%m-%d").to_string();
                 if let Err(e) = ctx.save_config() {
                     log::warn!("cannot save config: {e}");
@@ -242,6 +263,35 @@ impl Ctx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Her own keys and clicks must not look like the user at the computer:
+    /// the app asks the idle time from the sensor that tells them apart
+    /// (`Ctx::idle_seconds`) and never from Windows past it.
+    #[test]
+    fn the_idle_time_is_never_read_from_windows_past_the_sensor() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        assert!(files.len() > 10, "the sources of the app were not found");
+        // Written in two parts, or this file would find itself.
+        let raw = concat!("GetLast", "InputInfo");
+        for file in files {
+            let source = std::fs::read_to_string(&file).unwrap();
+            assert!(!source.contains(raw), "{}", file.display());
+        }
+    }
 
     fn toast(app_id: &str, title: &str, text: &str) -> Toast {
         Toast {

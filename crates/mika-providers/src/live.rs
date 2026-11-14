@@ -66,6 +66,10 @@ impl Live {
         &self.config
     }
 
+    pub(crate) fn secrets(&self) -> &dyn SecretStore {
+        self.secrets.as_ref()
+    }
+
     pub(crate) fn http(&self) -> &reqwest::Client {
         &self.http
     }
@@ -154,32 +158,52 @@ impl Embedder for Live {
         if model.is_empty() {
             return Err("модель эмбеддингов не задана".into());
         }
+        let base = self.base(&base);
         let v = self
             .post(
-                format!("{}/embeddings", self.base(&base)),
+                format!("{base}/embeddings"),
                 self.key(EMBEDDING_SECRET_KEY),
                 json!({ "model": model, "input": texts }),
             )
             .await?;
+        crate::metering::record_embedding(&base, &model, &v["usage"]);
         parse_embeddings(&v, texts.len())
     }
 }
 
+/// System prompt for frames of a video file.
+const VIDEO_FRAMES_PROMPT: &str = "Тебе даны кадры одного видеофайла по порядку времени; время каждого кадра указано в вопросе. Отвечай по-русски, коротко и по делу. Описывай только то, что видно на кадрах, не выдумывай.";
+
+/// System prompt for a screenshot.
+const SCREEN_PROMPT: &str = "Ты смотришь на снимок экрана компьютера. Отвечай по-русски, коротко и точно, только о том, что видно.";
+
 #[async_trait]
 impl Vision for Live {
     async fn ask(&self, png: &[u8], question: &str) -> Result<String, String> {
+        self.look(SCREEN_PROMPT, &[png], question).await
+    }
+
+    async fn ask_frames(&self, pngs: &[Vec<u8>], question: &str) -> Result<String, String> {
+        if pngs.is_empty() {
+            return Err("нет кадров".into());
+        }
+        let frames: Vec<&[u8]> = pngs.iter().map(Vec::as_slice).collect();
+        self.look(VIDEO_FRAMES_PROMPT, &frames, question).await
+    }
+}
+
+impl Live {
+    /// One question about the pictures to the vision model.
+    async fn look(&self, system: &str, pngs: &[&[u8]], question: &str) -> Result<String, String> {
         let mut cfg = self.config.lock().llm.clone();
         if !cfg.vision_model.trim().is_empty() {
             cfg.model = cfg.vision_model.trim().to_string();
         }
         let provider = build_provider(&cfg, self.secrets.as_ref()).map_err(|e| e.to_string())?;
+        let mut user = ChatMessage::user(question);
+        user.images = pngs.iter().map(|p| base64_engine().encode(p)).collect();
         let req = LlmRequest {
-            messages: vec![
-                ChatMessage::system(
-                    "Ты смотришь на снимок экрана компьютера. Отвечай по-русски, коротко и точно, только о том, что видно.",
-                ),
-                ChatMessage::user_with_image(question, base64_engine().encode(png)),
-            ],
+            messages: vec![ChatMessage::system(system), user],
             tools: Vec::new(),
         };
         let mut stream = provider.stream(req).await.map_err(|e| e.to_string())?;
@@ -212,13 +236,16 @@ impl ImageGen for Live {
             );
         }
         let key = self.key(IMAGE_SECRET_KEY);
+        let base = self.base(&base);
         let v = self
             .post(
-                format!("{}/images/generations", self.base(&base)),
+                format!("{base}/images/generations"),
                 key.clone(),
                 json!({ "model": model, "prompt": prompt, "n": 1 }),
             )
             .await?;
+        // The provider answered: the picture is paid for, whatever comes of its download.
+        crate::metering::record_image(&base, &model, &v["usage"]);
         let first = &v["data"][0];
         if let Some(b64) = first["b64_json"].as_str() {
             return base64_engine()

@@ -20,7 +20,7 @@ use crate::memory::Recall;
 use crate::state::{AssistantState, StateHandle};
 use crate::storage::Db;
 use crate::task::{TaskBoard, TASK_MAX_STEPS};
-use crate::tools::ToolRegistry;
+use crate::tools::{with_progress, ToolError, ToolRegistry};
 
 /// LLM calls per user message. A task with a plan gets `task::TASK_MAX_STEPS`.
 pub const MAX_STEPS: usize = 14;
@@ -54,6 +54,8 @@ const MAX_TOOL_RESULT: usize = 16_000;
 const MAX_TOOL_PREVIEW: usize = 400;
 /// Past conversation sent with each request, characters. Small local models have small contexts.
 pub const HISTORY_BUDGET: usize = 40_000;
+/// Error of a direct turn whose answer came back empty.
+const EMPTY_DIRECT_REPLY: &str = "модель ничего не ответила";
 
 fn message_size(m: &ChatMessage) -> usize {
     m.content.chars().count()
@@ -139,6 +141,9 @@ pub fn looping(text: &str) -> bool {
 }
 
 pub fn system_prompt(assistant: &AssistantConfig) -> String {
+    if crate::i18n::lang() == crate::i18n::Lang::En {
+        return crate::i18n::prompt::system_prompt_en(assistant);
+    }
     format!(
         "Ты {name}, живой голосовой и текстовый помощник на компьютере пользователя с Windows. \
 Говоришь по-русски, о себе в женском роде, к собеседнику обращаешься на «ты» напрямую, \
@@ -451,6 +456,10 @@ impl Agent {
                 prompt.push_str(text.trim());
             }
         }
+        if let Some(note) = crate::i18n::prompt::reply_note(crate::i18n::lang()) {
+            prompt.push_str("\n\n");
+            prompt.push_str(note);
+        }
         if marks {
             prompt.push_str("\n\n");
             prompt.push_str(MARKS_HINT);
@@ -546,6 +555,68 @@ impl Agent {
         result.map(|(reply, _)| reply)
     }
 
+    /// A direct turn: the user started an action whose answer is made outside
+    /// the agent loop, such as a question about a picture of a window. The chat
+    /// shows `shown`, then what `answer` gives; the pair joins the history and
+    /// «Стоп» ends the wait, as with any reply. The model of the agent, the
+    /// tools, the gate, the task board and the recall are not touched.
+    /// Returns the reply, `None` after an error or a stop.
+    pub async fn handle_direct<F>(
+        &self,
+        shown: &str,
+        answer: F,
+        cancel: CancellationToken,
+    ) -> Option<String>
+    where
+        F: std::future::Future<Output = Result<String, String>> + Send,
+    {
+        let _turn = self.turn.lock().await;
+        let shown = shown.trim();
+        self.bus.publish(Event::UserText { text: shown.into() });
+        self.state.set(AssistantState::Thinking);
+
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            got = answer => Some(got.and_then(|text| {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    Err(EMPTY_DIRECT_REPLY.to_string())
+                } else {
+                    Ok(text)
+                }
+            })),
+        };
+        let reply = match outcome {
+            Some(Ok(reply)) => {
+                self.bus.publish(Event::AssistantText {
+                    text: reply.clone(),
+                    spoken: None,
+                });
+                self.commit(vec![
+                    ChatMessage::user(shown),
+                    ChatMessage::assistant(reply.clone()),
+                ]);
+                Some(reply)
+            }
+            Some(Err(message)) => {
+                self.bus.publish(Event::Error { message });
+                None
+            }
+            // Stopped by the user: nothing more is said and nothing is kept.
+            None => None,
+        };
+        self.state.set(AssistantState::Idle);
+        reply
+    }
+
+    /// Whether a turn is running now, whatever the shared state shows. An
+    /// action of the user that must not run beside a reply asks this: the
+    /// state alone cannot tell its own `Thinking` from a turn's.
+    pub fn turn_running(&self) -> bool {
+        self.turn.try_lock().is_err()
+    }
+
     fn commit(&self, msgs: Vec<ChatMessage>) {
         if let Some((db, conv)) = &self.store {
             for m in &msgs {
@@ -568,6 +639,9 @@ impl Agent {
         let mut nudges = 0;
         // The step before had voice marks on.
         let mut marked = false;
+        // A tool of this message sent its work to the background: «скажу,
+        // когда закончится» is then the right answer, not a stalled turn.
+        let mut backgrounded = false;
         while step < self.step_limit() {
             if marked {
                 // The next step finds its marks anew: so must the speaker.
@@ -580,7 +654,7 @@ impl Agent {
                 // Small models end a turn in silence after tools, or promise
                 // «подожди секунду» and stop: remind them to act or to report.
                 // An empty reply is never an answer, with or without tools before it.
-                let stalled = text.trim().is_empty() || promises_action(&text);
+                let stalled = text.trim().is_empty() || (promises_action(&text) && !backgrounded);
                 if stalled && nudges < MAX_NUDGES {
                     nudges += 1;
                     if !text.is_empty() {
@@ -615,6 +689,7 @@ impl Agent {
             msgs.push(ChatMessage::assistant_with_calls(text, calls.clone()));
             for call in calls {
                 let result = self.execute(&call, cancel, marked).await;
+                backgrounded |= result.starts_with(crate::bgjobs::STARTED_PREFIX);
                 msgs.push(ChatMessage::tool_result(call.id, result));
                 if cancel.is_cancelled() {
                     return Err(AgentError::Cancelled);
@@ -893,6 +968,11 @@ impl Agent {
         };
         let assessment = match tool.assess(&args) {
             Ok(a) => a,
+            Err(ToolError::NotReady { message, data }) => {
+                let msg = format!("Ошибка: {message}");
+                self.finish(call, false, &msg, Some(data), started);
+                return msg;
+            }
             Err(e) => {
                 let msg = format!("Ошибка: {e}");
                 self.finish(call, false, &msg, None, started);
@@ -919,11 +999,18 @@ impl Agent {
         };
         self.state.set(AssistantState::Thinking);
         // "Stop" ends the wait for any tool, even one that does not watch its token.
-        let run = tool.run(args, approval, cancel.child_token());
+        let run = with_progress(
+            call.id.clone(),
+            self.bus.clone(),
+            tool.run(args, approval, cancel.child_token()),
+        );
         let (ok, text, data) = tokio::select! {
             _ = cancel.cancelled() => (false, "Остановлено пользователем.".to_string(), None),
             r = run => match r {
                 Ok(out) => (true, out.text, out.data),
+                Err(ToolError::NotReady { message, data }) => {
+                    (false, format!("Ошибка: {message}"), Some(data))
+                }
                 Err(e) => (false, format!("Ошибка: {e}"), None),
             },
         };
@@ -1655,6 +1742,53 @@ Actually, I'll call generate_image.
         }
     }
 
+    #[tokio::test]
+    async fn a_promise_after_work_went_to_the_background_is_an_answer() {
+        let started = format!(
+            "{} задание №1 «Сжать «отпуск.mp4»».",
+            crate::bgjobs::STARTED_PREFIX
+        );
+        let reply = "Запустила в фоне, подожди немного: скажу, когда закончится.";
+        assert!(promises_action(reply));
+        let p = FakeProvider::new(vec![
+            Some(vec![call("c1", "echo", json!({ "text": started }))]),
+            Some(vec![text(reply)]),
+        ]);
+        let (a, _rx, _) = agent(p.clone());
+        assert_eq!(
+            a.handle("сожми", CancellationToken::new()).await,
+            Ok(reply.into())
+        );
+        assert_eq!(p.requests.lock().len(), 2, "no reminder was sent");
+
+        // Silence is still no answer, and the next message starts anew.
+        let p = FakeProvider::new(vec![
+            Some(vec![call("c1", "echo", json!({ "text": started }))]),
+            Some(vec![]),
+            Some(vec![text("Запустила в фоне.")]),
+            Some(vec![text("Подожди секунду.")]),
+            Some(vec![text("Ничего не делаю.")]),
+        ]);
+        let (a, _rx, _) = agent(p.clone());
+        assert_eq!(
+            a.handle("сожми", CancellationToken::new()).await,
+            Ok("Запустила в фоне.".into())
+        );
+        assert_eq!(p.requests.lock().len(), 3);
+        assert_eq!(
+            a.handle("а теперь?", CancellationToken::new()).await,
+            Ok("Ничего не делаю.".into())
+        );
+        let reqs = p.requests.lock();
+        assert_eq!(reqs.len(), 5);
+        assert!(reqs[4]
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains("не доделав"));
+    }
+
     #[test]
     fn tag_filter_drops_invented_emoji_tags() {
         assert_eq!(filter(&["[🤔] Шаг 1"]), ("Шаг 1".into(), vec![]));
@@ -1786,6 +1920,109 @@ Actually, I'll call generate_image.
             e,
             Event::ToolFinished { data: Some(d), .. } if d["kind"] == "volume" && d["level"] == 40
         )));
+    }
+
+    /// Reports progress while it runs; with `ready: false` it cannot work yet.
+    struct SlowTool {
+        ready: bool,
+    }
+
+    #[async_trait]
+    impl crate::tools::Tool for SlowTool {
+        fn spec(&self) -> crate::llm::ToolSpec {
+            crate::tools::spec("slow", "test", json!({"type": "object"}))
+        }
+        fn assess(
+            &self,
+            args: &Value,
+        ) -> Result<crate::tools::Assessment, crate::tools::ToolError> {
+            if !self.ready && args.get("late").is_none() {
+                return Err(ToolError::NotReady {
+                    message: "нет программы".into(),
+                    data: json!({"kind": "ffmpeg_missing"}),
+                });
+            }
+            Ok(crate::tools::Assessment::new(
+                crate::tools::RiskLevel::Low,
+                "s",
+                "t",
+                "r",
+            ))
+        }
+        async fn run(
+            &self,
+            _args: Value,
+            _approval: crate::gate::Approval,
+            _cancel: CancellationToken,
+        ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+            if !self.ready {
+                return Err(ToolError::NotReady {
+                    message: "пропала программа".into(),
+                    data: json!({"kind": "ffmpeg_missing"}),
+                });
+            }
+            let progress = crate::tools::progress_handle();
+            // Another task, as a process callback would be.
+            tokio::spawn(async move { progress.set(50) }).await.unwrap();
+            Ok(crate::tools::ToolOutput::new("готово"))
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_publishes_tool_progress_with_the_call_id() {
+        let p = FakeProvider::new(vec![
+            Some(vec![call("c7", "slow", json!({}))]),
+            Some(vec![text("Готово")]),
+        ]);
+        let bus = EventBus::new(64);
+        let mut rx = bus.subscribe();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(SlowTool { ready: true }));
+        let a = Agent::new(
+            p.clone(),
+            Arc::new(reg),
+            Arc::new(LowRiskOnlyGate),
+            bus.clone(),
+            StateHandle::new(bus),
+            "sys".into(),
+        );
+        a.handle("давай", CancellationToken::new()).await.unwrap();
+        assert!(drain(&mut rx).iter().any(|e| matches!(
+            e,
+            Event::ToolProgress { id, share: 50 } if id == "c7"
+        )));
+    }
+
+    #[tokio::test]
+    async fn agent_passes_the_card_of_a_not_ready_tool() {
+        for (args, output) in [
+            (json!({}), "Ошибка: нет программы"),
+            (json!({"late": true}), "Ошибка: пропала программа"),
+        ] {
+            let p = FakeProvider::new(vec![
+                Some(vec![call("c1", "slow", args)]),
+                Some(vec![text("Нужен FFmpeg")]),
+            ]);
+            let bus = EventBus::new(64);
+            let mut rx = bus.subscribe();
+            let mut reg = ToolRegistry::new();
+            reg.register(Arc::new(SlowTool { ready: false }));
+            let a = Agent::new(
+                p.clone(),
+                Arc::new(reg),
+                Arc::new(LowRiskOnlyGate),
+                bus.clone(),
+                StateHandle::new(bus),
+                "sys".into(),
+            );
+            a.handle("сожми", CancellationToken::new()).await.unwrap();
+            assert_eq!(tool_results(&p.requests.lock()[1]), vec![output]);
+            assert!(drain(&mut rx).iter().any(|e| matches!(
+                e,
+                Event::ToolFinished { ok: false, data: Some(d), output: o, .. }
+                    if d["kind"] == "ffmpeg_missing" && o == output
+            )));
+        }
     }
 
     #[tokio::test]
@@ -2388,5 +2625,173 @@ Actually, I'll call generate_image.
         ] {
             assert!(MARKS_HINT.contains(rule), "{rule}");
         }
+    }
+
+    #[tokio::test]
+    async fn direct_turn_shows_the_question_and_keeps_the_pair() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let p = FakeProvider::new(vec![]);
+        let (a, mut rx, state) = agent(p.clone());
+        let a = a
+            .with_history(vec![ChatMessage::user("раньше")])
+            .with_store(db.clone(), "main");
+        let reply = a
+            .handle_direct(
+                "  Вопрос про окно «Отчёт»: что тут?  ",
+                async { Ok("  Это таблица.\n".to_string()) },
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(reply.as_deref(), Some("Это таблица."));
+        assert_eq!(
+            drain(&mut rx),
+            vec![
+                Event::UserText {
+                    text: "Вопрос про окно «Отчёт»: что тут?".into()
+                },
+                Event::StateChanged {
+                    from: AssistantState::Idle,
+                    to: AssistantState::Thinking
+                },
+                Event::AssistantText {
+                    text: "Это таблица.".into(),
+                    spoken: None
+                },
+                Event::StateChanged {
+                    from: AssistantState::Thinking,
+                    to: AssistantState::Idle
+                },
+            ]
+        );
+        assert_eq!(state.get(), AssistantState::Idle);
+        let pair = vec![
+            ChatMessage::user("Вопрос про окно «Отчёт»: что тут?"),
+            ChatMessage::assistant("Это таблица."),
+        ];
+        assert_eq!(a.history()[1..], pair[..]);
+        assert_eq!(db.load_messages("main").unwrap(), pair);
+        // The model of the agent is never asked.
+        assert!(p.requests.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_turn_error_is_published_and_nothing_is_kept() {
+        let (a, mut rx, state) = agent(FakeProvider::new(vec![]));
+        let reply = a
+            .handle_direct(
+                "вопрос",
+                async { Err("нет связи".to_string()) },
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(reply, None);
+        let ev = drain(&mut rx);
+        assert!(ev.contains(&Event::Error {
+            message: "нет связи".into()
+        }));
+        assert!(!ev.iter().any(|e| matches!(e, Event::AssistantText { .. })));
+        assert!(a.history().is_empty());
+        assert_eq!(state.get(), AssistantState::Idle);
+    }
+
+    #[tokio::test]
+    async fn direct_turn_with_an_empty_answer_is_an_error() {
+        let (a, mut rx, state) = agent(FakeProvider::new(vec![]));
+        let reply = a
+            .handle_direct(
+                "вопрос",
+                async { Ok(" \n ".to_string()) },
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(reply, None);
+        let ev = drain(&mut rx);
+        assert!(ev.contains(&Event::Error {
+            message: "модель ничего не ответила".into()
+        }));
+        assert!(!ev.iter().any(|e| matches!(e, Event::AssistantText { .. })));
+        assert!(a.history().is_empty());
+        assert_eq!(state.get(), AssistantState::Idle);
+    }
+
+    #[tokio::test]
+    async fn direct_turn_stopped_says_nothing_more() {
+        let (a, mut rx, state) = agent(FakeProvider::new(vec![]));
+        // Stopped before the answer came.
+        let cancel = CancellationToken::new();
+        let c2 = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            c2.cancel();
+        });
+        let reply = a
+            .handle_direct(
+                "вопрос",
+                std::future::pending::<Result<String, String>>(),
+                cancel,
+            )
+            .await;
+        assert_eq!(reply, None);
+        // A token cancelled beforehand wins over a ready answer.
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let reply = a
+            .handle_direct("ещё вопрос", async { Ok("ответ".to_string()) }, cancelled)
+            .await;
+        assert_eq!(reply, None);
+        let ev = drain(&mut rx);
+        assert!(!ev
+            .iter()
+            .any(|e| matches!(e, Event::AssistantText { .. } | Event::Error { .. })));
+        assert!(a.history().is_empty());
+        assert_eq!(state.get(), AssistantState::Idle);
+    }
+
+    #[tokio::test]
+    async fn direct_turn_waits_for_the_running_reply() {
+        let (a, mut rx, state) = agent(FakeProvider::new(vec![None]));
+        let a = Arc::new(a);
+        assert!(!a.turn_running());
+        let cancel = CancellationToken::new();
+        let running = {
+            let (a, cancel) = (a.clone(), cancel.clone());
+            tokio::spawn(async move { a.handle("долгий вопрос", cancel).await })
+        };
+        for _ in 0..1000 {
+            if state.get() == AssistantState::Thinking {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(a.turn_running());
+        let direct = {
+            let a = a.clone();
+            tokio::spawn(async move {
+                a.handle_direct(
+                    "вопрос про окно",
+                    async { Ok("ответ".to_string()) },
+                    CancellationToken::new(),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let shown = Event::UserText {
+            text: "вопрос про окно".into(),
+        };
+        assert!(!drain(&mut rx).contains(&shown));
+        assert!(!direct.is_finished());
+
+        cancel.cancel();
+        assert_eq!(running.await.unwrap(), Err(AgentError::Cancelled));
+        assert_eq!(direct.await.unwrap().as_deref(), Some("ответ"));
+        let ev = drain(&mut rx);
+        assert!(ev.contains(&shown));
+        assert!(ev.contains(&Event::AssistantText {
+            text: "ответ".into(),
+            spoken: None
+        }));
+        assert_eq!(state.get(), AssistantState::Idle);
+        assert!(!a.turn_running());
     }
 }

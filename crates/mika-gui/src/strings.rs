@@ -1,23 +1,8 @@
-//! Interface texts for the Rust side. One file with the Svelte UI: `frontend/src/locales/ru.json`.
+//! Interface texts for the Rust side: `mika_core::i18n` reads `frontend/src/locales/*.json`.
 
-use std::collections::HashMap;
-use std::sync::OnceLock;
-
-const RU: &str = include_str!("../../../frontend/src/locales/ru.json");
-
-fn table() -> &'static HashMap<String, String> {
-    static TABLE: OnceLock<HashMap<String, String>> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        serde_json::from_str(RU).unwrap_or_else(|e| {
-            log::error!("locale file is broken: {e}");
-            HashMap::new()
-        })
-    })
-}
-
-/// Text for `key`. An unknown key comes back as is, so a typo is visible on screen.
+/// Text for `key` in the interface language. An unknown key comes back as is, so a typo is visible on screen.
 pub fn tr(key: &str) -> String {
-    table().get(key).cloned().unwrap_or_else(|| key.to_string())
+    mika_core::i18n::tr(key)
 }
 
 #[cfg(test)]
@@ -32,8 +17,15 @@ mod tests {
             "tray.hide",
             "tray.show",
             "tray.shortcut_none",
+            "hotkeys.err_taken",
+            "dictation.err_blind",
+            "screen_ask.err_blind",
+            "screen_ask.err_gone",
             "error.name_empty",
             "error.name_long",
+            "tray.recording",
+            "tray.rec_stop",
+            "error.bgjob_gone",
         ] {
             assert_ne!(tr(key), key, "{key} is missing in ru.json");
         }

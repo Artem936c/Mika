@@ -1,11 +1,44 @@
 // Development-only preview without Tauri: open http://localhost:5173/?mock=chat
-// Scenarios: island, listen, think, speak, chat, cards, reminder, confirm, high, long, settings.
+// Scenarios: island, listen, think, speak, chat, cards, av, reminder, confirm, high, long, settings.
 // `&page=providers|permissions|tools|memory|extensions|voice|island|general` picks a settings page, `&timer` shows a countdown, `&narrow` hides the avatar column,
 // `&cloud` switches the voice page to the provider engine, `&drama` to Drama 3 with expressive speech on,
+// FFmpeg on the tools page: not found by default, `&ffmpeg` found in PATH, `&ffmpeg_dl` downloaded by Mika,
+// `&ffmpeg_gpl` a GPL build, `&ffmpeg_bad` a saved path without ffmpeg.exe, `&ffmpeg_fail` a download that fails its checksum,
 // `?view=avatar&mock=speak` shows the desktop avatar window. Not bundled into production builds.
+// Day summary and spending: scenario `day` is the card of the day and the evening summary, scenario `costs` the card of spending and a budget warning;
+// `&page=costs` is the settings page of spending: `&costs_empty` nothing counted and no limits, `&costs_over` the day limit passed,
+// `&costs_noprice` a model without a price, requests without token data and a second currency; `&evening` turns the evening summary on (tools page);
+// `&costs_free` only a local model was used: nothing spent, which is not «the price is unknown».
+// With `&costs_over` the page also says that her own paid work is on hold (the switch under the budget turns that off).
+// Scenario `tgvoice`: a command that came as a Telegram voice message. Telegram on the extensions page:
+// `&tgvoice` voice messages in and voice replies on, `&tgvoice_in` voice messages in only, `&nostt` no recognition model.
+// `&moodvoice` turns on the mood direction switch of the voice page.
+// Epic 18: scenario `dictation` walks the island through a dictation into another program (`&blind` shows the refusal instead),
+// scenario `screen_ask` opens the chat with the card of a window picture (`&mic` enables its voice button, `&screen_off` makes the send fail),
+// `?mock=settings&page=hotkeys` is the hotkeys page: `&dictation` and `&screen_ask` turn the two actions on, `&hk_taken` leaves dictation
+// without a free combination, `&mic` and `&screen` are the privacy switches, `&nostt` means no speech recognition model is set.
+// `&needs` on the hotkeys page makes an action whose master switch (`&mic`, `&screen`) is off wait for it; `&gone` in scenario
+// `screen_ask` lets the app throw the picture away after three seconds.
+// Events and watching: scenario `events` (a scenario is made and runs, a watch is set and tells), `event_confirm` (the question
+// before a scenario is saved; `&long` with an instruction of 300 characters, `&inchat` inside the chat). On the extensions page:
+// `&noevents` no scenarios and no watches, `&events_off` scenarios on pause.
+// Background jobs: `bgjob` a compression that went to the background and a second job waiting in the queue (`&fail`: the first one fails),
+// `folder` a whole folder as one job, `folderask` its confirm card, `recask` the confirm card of a screen recording
+// (`&ofwindow`: of one window with a long title), `rec&window` the ordinary window with the red dot of a recording,
+// `rec` the island with the red dot of a recording (`&inchat`: the chat with its card, `&done`: it ends with a file).
+// Deep search: `research` runs one in the chat (`&partial` a report cut by the time limit, `&fail` a search that found nothing),
+// `research_ask` shows its confirm card (`&high` with a token limit above 100 thousand, `&inchat` inside the chat);
+// `&research_high` shows the settings block on the tools page with such a limit.
+// Backup block on the general page (`?mock=settings&page=general`): `&backup_plain` a copy without a password,
+// `&backup_wrong` every password is refused, `&backup_newer` a copy of a newer format, `&backup_fail` the export fails,
+// `&backup_cancel` the file dialog is cancelled, `&backup_keysfail` one key is not written. The copy holds three scenarios
+// by event: one of an instruction, one of a saved command the copy holds, one of a command that is nowhere.
+// `?mock=chat&welcome` shows the restore link on the first-run screen.
+// `&lang=en` starts the preview in English; the language picker on `&page=general` and on `&welcome` switches it in place.
 
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { emit } from '@tauri-apps/api/event';
+import { clock } from '../lib/chat';
 
 const LONG_COMMAND =
   'Get-ChildItem "$env:USERPROFILE\\Downloads" -Recurse | Where-Object { $_.Length -gt 100MB } | Sort-Object Length -Descending | ' +
@@ -52,6 +85,366 @@ const WEATHER = {
 
 const REPLY = 'Изучила информацию. Сегодня −10 и ветер, оденься потеплее. Завтра потеплеет до −4, пойдёт снег.';
 
+/** The card of the tool `day_summary`. */
+const DAY_CARD = {
+  kind: 'day_summary',
+  date: '2026-11-14',
+  title: 'пятница, 14 ноября',
+  app_total: '6 ч 20 мин',
+  apps: [
+    { name: 'VS Code', seconds: 11100, text: '3 ч 05 мин' },
+    { name: 'Chrome', seconds: 6000, text: '1 ч 40 мин' },
+    { name: 'Telegram', seconds: 2100, text: '35 мин' },
+  ],
+  counts: [
+    { id: 'focus', value: '50 мин' },
+    { id: 'meetings', value: '2' },
+    { id: 'todos', value: '3' },
+    { id: 'reminders', value: '2' },
+    { id: 'tasks', value: '2' },
+  ],
+  spent: '12,40 ₽',
+};
+
+/** The card of the tool `cost_report`. */
+const COST_CARD = {
+  kind: 'cost_report',
+  label: 'сегодня',
+  totals: [{ currency: 'RUB', cost: 12.4, text: '12,40 ₽' }],
+  budget: {
+    currency: 'RUB',
+    day_spent: 12.4,
+    day_limit: 100,
+    day_share: 12,
+    month_spent: 310,
+    month_limit: 2000,
+    month_share: 15,
+    day_text: '12,40 ₽ из 100 ₽',
+    month_text: '310 ₽ из 2 000 ₽',
+  },
+  kinds: [
+    { kind: 'chat', name: 'ответы модели', money: '9,10 ₽', units: '310 тыс. токенов', requests: 84, free: false },
+    { kind: 'speech', name: 'озвучка', money: '3,10 ₽', units: '2,9 тыс. знаков', requests: 41, free: false },
+    { kind: 'transcription', name: 'распознавание речи', money: '0,20 ₽', units: '4 мин 10 с', requests: 6, free: false },
+  ],
+  unpriced: 3,
+  blind: 2,
+  free: false,
+};
+
+const EVENING_REMARK = {
+  type: 'remark',
+  kind: 'day',
+  text: 'Итог дня:\nСегодня ты шесть часов двадцать минут провёл за компьютером, больше всего в VS Code. Закрыл три дела и был на двух встречах. Завтра в 9:30 планёрка — составить план на день?',
+};
+
+const SIGNS: Record<string, string> = { RUB: '₽', USD: '$', EUR: '€' };
+
+/** Money as the core writes it; enough for a preview. */
+function moneyText(cost: number, code: string): string {
+  const digits = Number.isInteger(cost) ? 0 : 2;
+  const n = new Intl.NumberFormat('ru-RU', { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(cost);
+  return SIGNS[code] ? `${n} ${SIGNS[code]}` : n;
+}
+
+interface MockPrice {
+  provider: string;
+  model: string;
+  currency: string;
+  input_mtok: number;
+  output_mtok: number;
+  per_kchar: number;
+  per_minute: number;
+  per_image: number;
+}
+
+/** One model of one kind in a report of spending. `cost` in roubles, `null` when there is no money. */
+function usageLine(kind: string, model: string, requests: number, units: string, cost: number | null, extra: Record<string, unknown> = {}) {
+  return {
+    kind,
+    provider: 'routerai.ru',
+    model,
+    requests,
+    blind: 0,
+    unpriced: 0,
+    tokens_in: 0,
+    tokens_cached: 0,
+    tokens_out: 0,
+    chars: 0,
+    seconds: 0,
+    images: 0,
+    units,
+    cost: cost === null ? [] : [{ currency: 'RUB', cost, text: moneyText(cost, 'RUB') }],
+    free: false,
+    price: 'list',
+    ...extra,
+  };
+}
+
+type MockLine = ReturnType<typeof usageLine>;
+
+const COST_ORDER = ['chat', 'vision', 'speech', 'transcription', 'image', 'embedding'];
+
+/** A report as the core builds it from the lines of models. */
+function costReport(models: MockLine[], from: string, to: string, main: string) {
+  const sum = (lines: MockLine[]) => {
+    const by = new Map<string, number>();
+    for (const l of lines) for (const m of l.cost) by.set(m.currency, (by.get(m.currency) ?? 0) + m.cost);
+    return [...by.entries()]
+      .filter(([, cost]) => cost > 0)
+      .sort(([a], [b]) => Number(b === main) - Number(a === main))
+      .map(([currency, cost]) => ({ currency, cost: Math.round(cost * 100) / 100, text: moneyText(Math.round(cost * 100) / 100, currency) }));
+  };
+  const count = (lines: MockLine[], field: 'requests' | 'unpriced' | 'blind') => lines.reduce((n, l) => n + l[field], 0);
+  const kinds = COST_ORDER.map((kind) => models.filter((l) => l.kind === kind))
+    .filter((lines) => lines.length > 0)
+    .map((lines) => ({
+      ...lines[0],
+      provider: '',
+      model: '',
+      requests: count(lines, 'requests'),
+      unpriced: count(lines, 'unpriced'),
+      blind: count(lines, 'blind'),
+      cost: sum(lines),
+      price: 'none',
+    }));
+  const totals = sum(models);
+  const requests = count(models, 'requests');
+  // Every request has its money and the money is zero: a local model.
+  const free = requests > 0 && totals.length === 0 && models.every((l) => l.free);
+  return { from, to, totals, kinds, models, requests, unpriced: count(models, 'unpriced'), blind: count(models, 'blind'), free };
+}
+/** A background job as the job board sends it. */
+interface MockJob {
+  id: number;
+  kind: string;
+  title: string;
+  state: 'queued' | 'running' | 'stopping' | 'done' | 'failed' | 'stopped';
+  live: boolean;
+  share: number;
+  note?: string;
+  text?: string;
+  data?: unknown;
+}
+
+const REC_TITLE = 'Записать экран';
+const REC_FILE = String.raw`C:\Users\me\Videos\Mika\Запись экрана 2026-11-14 15-30-05.mp4`;
+const FOLDER_TITLE = 'Сжать 12 видео из папки «Отпуск» до 720p (1,8 ГБ, 47:10)';
+const FOLDER_OUT = String.raw`C:\Users\me\Videos\Отпуск\720p`;
+
+/** Confirm cards of the folder tool and of screen recording, the target in lines as the tools write it. */
+const JOB_ASKS = {
+  folderask: {
+    tool: 'av_folder',
+    user: 'Сожми все видео из папки «Отпуск» до 720p',
+    assessment: {
+      level: 'medium',
+      summary: FOLDER_TITLE,
+      target: [
+        String.raw`C:\Users\me\Videos\Отпуск → ` + FOLDER_OUT,
+        'день1.mp4, день2.mp4, день3.mp4, день4.mp4, день5.mp4 и ещё 7',
+        'Не подходят 2: титры.mp4 — уже меньше нужного размера; обрывок.avi — файл не читается',
+      ].join('\n'),
+      reason: 'исходные файлы не меняются, результаты — новые файлы; работа пойдёт в фоне',
+      scope: String.raw`compress: c:\users\me\videos\отпуск -> c:\users\me\videos\отпуск\720p`,
+    },
+  },
+  recask: {
+    tool: 'screen_record',
+    user: 'Запиши экран вместе с моим голосом',
+    assessment: {
+      level: 'high',
+      summary: REC_TITLE,
+      target: ['Микрофон: записывается', 'Звук компьютера: записывается', 'Длина: до 30 минут', 'Экран: монитор 1, 2560×1440', `Файл: ${REC_FILE}`].join('\n'),
+      reason: 'запись экрана и звука включается только с твоего подтверждения, каждый раз заново; на окнах с паролями и оплатой запись встаёт на паузу',
+      scope: 'экран',
+    },
+  },
+} as const;
+
+/** The same card for one window: its title is the page's own text, sixty characters of it. */
+const REC_WINDOW_ASK = {
+  tool: 'screen_record',
+  user: 'Запиши окно браузера вместе с моим голосом',
+  assessment: {
+    level: 'high',
+    summary: 'Записать окно chrome',
+    target: [
+      'Микрофон: записывается',
+      'Звук компьютера: записывается',
+      'Длина: до 30 минут',
+      'Окно: «Отчёт за третий квартал — сводная таблица продаж по региона…» (chrome.exe), 1920×1040',
+      `Файл: ${REC_FILE}`,
+    ].join('\n'),
+    reason:
+      'запись экрана и звука включается только с твоего подтверждения, каждый раз заново; на окнах с паролями и оплатой запись встаёт на паузу; окно пишется, пока его программа на переднем плане',
+    scope: 'chrome.exe',
+  },
+} as const;
+
+const RESEARCH_QUESTION = 'Чем тепловой насос «воздух-вода» отличается от «грунт-вода» для дома 120 м², и что выгоднее';
+const RESEARCH_FOLDER = String.raw`C:\Users\me\Documents\Mika\Research`;
+const RESEARCH_MODEL = 'mistralai/mistral-nemo';
+
+const RESEARCH_REPORT = {
+  kind: 'research_report',
+  path: `${RESEARCH_FOLDER}\\2026-11-14 12-30 Чем тепловой насос воздух вода отличается от грунт.md`,
+  title: RESEARCH_QUESTION,
+  sources: 6,
+  unread: 3,
+  unsourced: 1,
+  llm_calls: 9,
+  tokens: 38200,
+  seconds: 143,
+  limits: [] as string[],
+};
+
+/** The confirm card of a deep search: medium by default, high above 100 thousand tokens. */
+const researchAssessment = (high: boolean) => ({
+  level: high ? 'high' : 'medium',
+  summary: `Глубокий поиск: «${RESEARCH_QUESTION}»`,
+  target: `Лимиты: поисков до 5, страниц до 8, минут до 5, токенов до ${high ? 150 : 50} тыс. по оценке, без скрытых рассуждений модели.\nОбращений к модели ${RESEARCH_MODEL}: до 10, каждое платное.\nОтчёт: ${RESEARCH_FOLDER}`,
+  reason: high ? 'лимит больше 100 тыс. токенов: такой поиск спрашивается каждый раз' : 'запросы уйдут в DuckDuckGo, тексты страниц — модели; запишет один файл .md',
+  scope: `5/8/5/${high ? 150000 : 50000} ${RESEARCH_MODEL} -> ${RESEARCH_FOLDER.toLowerCase()}`,
+});
+
+// A copy made on another PC, as the backup commands describe it.
+const BACKUP_SAFETY = String.raw`C:\Users\me\AppData\Roaming\Mika\backups\before-restore.mikabackup`;
+
+const BACKUP_FILE = {
+  path: String.raw`D:\Копии\mika-backup-2026-11-14.mikabackup`,
+  name: 'mika-backup-2026-11-14.mikabackup',
+  bytes: 4_812_300,
+  created_at: '2026-11-14T15:30:00+05:00',
+  device: 'OLD-PC',
+  app_version: '0.3.3',
+  encrypted: true,
+  keys: 5,
+  newer_app: false,
+};
+
+const BACKUP_OFF = [
+  { id: 'microphone' },
+  { id: 'screen' },
+  { id: 'dictation' },
+  { id: 'telegram' },
+  { id: 'telegram_voice' },
+  { id: 'web' },
+  { id: 'briefing' },
+  { id: 'evening' },
+  { id: 'mcp', count: 1 },
+  { id: 'docs', count: 1 },
+];
+// Scenarios by event of the copy: the second runs a saved command the copy holds, the third one it does not.
+const BACKUP_SCENARIOS = [
+  {
+    name: 'Наушники',
+    event: 'audio_connected',
+    filter: 'sony',
+    idle_min: 0,
+    action: { kind: 'instruction', text: 'Включи музыку и сделай громкость 30' },
+    cooldown_s: 60,
+    max_per_day: 20,
+    command_in_file: false,
+    command_here: false,
+  },
+  {
+    name: 'Работа',
+    event: 'app_started',
+    filter: 'code.exe',
+    idle_min: 0,
+    action: { kind: 'command', text: 'Рабочий режим' },
+    cooldown_s: 300,
+    max_per_day: 5,
+    command_in_file: true,
+    command_here: false,
+  },
+  {
+    name: 'Ушёл',
+    event: 'user_away',
+    filter: '',
+    idle_min: 15,
+    action: { kind: 'command', text: 'Тишина' },
+    cooldown_s: 3600,
+    max_per_day: 10,
+    command_in_file: false,
+    command_here: false,
+  },
+];
+const BACKUP_DOCS = [String.raw`C:\Users\old\Documents\Работа`];
+
+const BACKUP_PREVIEW = {
+  file: BACKUP_FILE,
+  categories: [
+    { id: 'settings', in_file: 1, here: 1, available: true, selected: true },
+    { id: 'history', in_file: 1520, here: 12, available: true, selected: true },
+    { id: 'memory', in_file: 34, here: 0, available: true, selected: true },
+    { id: 'notes', in_file: 9, here: 2, available: true, selected: true },
+    { id: 'todos', in_file: 4, here: 0, available: true, selected: true },
+    { id: 'reminders', in_file: 3, here: 1, available: true, selected: true },
+    { id: 'tasks', in_file: 2, here: 0, available: true, selected: false },
+    { id: 'commands', in_file: 2, here: 0, available: true, selected: true },
+    { id: 'scenarios', in_file: 3, here: 1, available: true, selected: true },
+    { id: 'rules_deny', in_file: 1, here: 0, available: true, selected: true },
+    { id: 'rules_allow', in_file: 3, here: 1, available: true, selected: false },
+    { id: 'secrets', in_file: 5, here: 2, available: true, selected: true },
+  ],
+  allow_rules: [
+    { tool: 'open_app', pattern: 'проводник' },
+    { tool: 'run_shell', pattern: 'get-childitem' },
+    { tool: 'av_convert', pattern: String.raw`c:\видео -> c:\видео` },
+  ],
+  allow_rules_total: 3,
+  allow_rules_dropped: 0,
+  tasks: [
+    { text: 'Расскажи погоду и что в календаре', due_at: 1794366000, repeat: 'daily' },
+    { text: 'Проверь, ответили ли в рабочем чате', due_at: 1794300600, repeat: 'every:30' },
+  ],
+  tasks_total: 2,
+  scenarios: BACKUP_SCENARIOS,
+  scenarios_total: 3,
+  secrets: [
+    { kind: 'llm_openai', name: null, replaces: true },
+    { kind: 'speech', name: null, replaces: false },
+    { kind: 'telegram', name: null, replaces: false },
+    { kind: 'calendar', name: null, replaces: false },
+    { kind: 'mcp', name: 'files', replaces: false },
+  ],
+  addresses: [
+    { purpose: 'llm', incoming: 'https://routerai.ru/api/v1', current: 'https://api.openai.com/v1', changed: true, key_here: true, key_in_file: true },
+  ],
+  mcp: [
+    {
+      name: 'files',
+      target: String.raw`npx -y @modelcontextprotocol/server-filesystem C:\data`,
+      was_enabled: true,
+      current: '',
+      changed: true,
+      token_here: false,
+      token_in_file: true,
+    },
+  ],
+  telegram: { was_enabled: true, user_id: 123456789, current: 0, changed: true, token_here: true, token_in_file: true },
+  switched_off: BACKUP_OFF,
+  docs_folders: BACKUP_DOCS,
+  schema_newer: false,
+  skipped_unknown: 0,
+  dropped_rows: 0,
+  safety_copy: BACKUP_SAFETY,
+};
+
+const BACKUP_RESULT = {
+  restored: BACKUP_PREVIEW.categories.map((c) => ({ id: c.id, count: c.in_file })),
+  keys_written: 5,
+  keys_failed: [] as { kind: string; name: string | null }[],
+  switched_off: BACKUP_OFF,
+  docs_folders: BACKUP_DOCS,
+  scenarios_without_command: 0,
+  restart_needed: true,
+  config_error: null,
+  safety_copy: BACKUP_SAFETY,
+};
+
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export async function install(scenario: string) {
@@ -59,12 +452,329 @@ export async function install(scenario: string) {
   document.body.style.background =
     'radial-gradient(760px 520px at 16% 108%,#51308f 0,transparent 62%),radial-gradient(700px 520px at 88% 104%,#b0437f 0,transparent 60%),radial-gradient(900px 500px at 60% -10%,#16436e 0,transparent 62%),linear-gradient(#0c0f1c,#131022)';
   let state = 'idle';
-  let name = 'Мика';
+  let lang = params.get('lang') === 'en' ? 'en' : 'ru';
+  // Before the first-run screen is passed the name follows the language.
+  let name = lang === 'en' && params.has('welcome') ? 'Mika' : 'Мика';
   let persona = 'caring';
   let inIsland = !params.has('narrow');
   let onDesktop = false;
   // `&window` starts the preview as an ordinary window.
   let windowed = params.has('window');
+  const ffmpeg = {
+    downloaded: params.has('ffmpeg_dl'),
+    inPath: params.has('ffmpeg'),
+    setting: params.has('ffmpeg_bad') ? String.raw`D:\Tools\ffmpeg` : '',
+    downloading: false,
+  };
+  const research = { folder: '', model: '', searches: 5, pages: 8, minutes: 5, tokens: params.has('research_high') ? 150_000 : 50_000 };
+  const researchView = () => ({
+    folder: research.folder,
+    folder_shown: research.folder || RESEARCH_FOLDER,
+    folder_default: RESEARCH_FOLDER,
+    model: research.model,
+    model_shown: research.model || RESEARCH_MODEL,
+    max_searches: research.searches,
+    max_pages: research.pages,
+    max_minutes: research.minutes,
+    max_tokens: research.tokens,
+    llm_calls: research.pages + 2,
+    high_tokens: research.tokens > 100_000,
+    high_folder: /^c:\\(windows|program files)/i.test(research.folder),
+  });
+  const ffmpegView = () => {
+    const source = ffmpeg.inPath ? 'path' : ffmpeg.downloaded ? 'downloaded' : null;
+    return {
+      found: source !== null,
+      source,
+      path:
+        source === 'path'
+          ? String.raw`C:\Tools\ffmpeg\bin\ffmpeg.exe`
+          : source === 'downloaded'
+            ? String.raw`C:\Users\me\AppData\Local\Mika\ffmpeg\ffmpeg.exe`
+            : '',
+      version: source === 'path' ? '7.1-full_build-www.gyan.dev' : source === 'downloaded' ? 'n9.0.2-39-g7adfbe40dc-20261031' : '',
+      gpl: source !== null && params.has('ffmpeg_gpl'),
+      setting: ffmpeg.setting,
+      setting_invalid: ffmpeg.setting !== '',
+      downloaded: ffmpeg.downloaded,
+      downloading: ffmpeg.downloading,
+      bytes: ffmpeg.downloaded ? 205_000_000 : 0,
+      download_mb: 161,
+    };
+  };
+  const evening = { enabled: params.has('evening'), time: '21:00' };
+  const costs = {
+    enabled: true,
+    empty: params.has('costs_empty'),
+    dayLimit: params.has('costs_empty') ? 0 : 100,
+    monthLimit: params.has('costs_empty') ? 0 : 2000,
+    currency: 'RUB',
+    currencySaved: false,
+    pauseUnattended: true,
+    manual: [] as MockPrice[],
+    pricesAt: params.has('costs_empty') ? null : '14.11 09:12',
+  };
+  const costsView = () => {
+    const over = params.has('costs_over');
+    const local = params.has('costs_free');
+    const ollama = (requests: number, units: string, blind: number) =>
+      usageLine('chat', 'qwen3:8b', requests, units, null, { provider: 'localhost:11434', free: true, blind, price: 'none' });
+    const today = costs.empty
+      ? []
+      : local
+        ? [ollama(64, '212 тыс. токенов', 1)]
+        : over
+        ? [
+            usageLine('chat', 'google/gemma-4-26b-a4b-it', 612, '2,4 млн токенов', 91.4),
+            usageLine('speech', 'fish-audio/drama-3', 150, '10,8 тыс. знаков', 11.6),
+            usageLine('transcription', 'qwen/qwen3-asr-0.6b', 31, '24 мин 40 с', 1.2),
+          ]
+        : [
+            usageLine('chat', 'google/gemma-4-26b-a4b-it', 84, '310 тыс. токенов', 9.1),
+            usageLine('speech', 'fish-audio/drama-3', 41, '2,9 тыс. знаков', 3.1),
+            usageLine('transcription', 'qwen/qwen3-asr-0.6b', 6, '4 мин 10 с', 0.2),
+          ];
+    const month = costs.empty
+      ? []
+      : local
+        ? [ollama(1480, '5,1 млн токенов', 3)]
+        : over
+        ? [
+            usageLine('chat', 'google/gemma-4-26b-a4b-it', 9480, '37,2 млн токенов', 1398),
+            usageLine('speech', 'fish-audio/drama-3', 2540, '183 тыс. знаков', 196.4),
+            usageLine('transcription', 'qwen/qwen3-asr-0.6b', 610, '8 ч 05 мин', 24.24),
+            usageLine('image', 'openai/gpt-image-1', 5, '5 шт.', 21.36),
+          ]
+        : [
+            usageLine('chat', 'google/gemma-4-26b-a4b-it', 1955, '7,2 млн токенов', 211.82),
+            usageLine('speech', 'fish-audio/drama-3', 954, '67,5 тыс. знаков', 72.16),
+            usageLine('image', 'openai/gpt-image-1', 5, '5 шт.', 21.36),
+            usageLine('transcription', 'qwen/qwen3-asr-0.6b', 140, '1 ч 37 мин', 4.66),
+          ];
+    if (params.has('costs_noprice') && !costs.empty) {
+      for (const lines of [today, month]) {
+        lines.push(
+          usageLine('vision', 'openai/gpt-4o', 9, '148 тыс. токенов', null, {
+            provider: 'api.openai.com',
+            cost: [{ currency: 'USD', cost: 0.42, text: moneyText(0.42, 'USD') }],
+          }),
+          usageLine('transcription', 'whisper-1', 3, '3 мин 05 с', null, { provider: 'api.openai.com', unpriced: 3, seconds: 185, price: 'none' }),
+          usageLine('chat', 'mistralai/mistral-nemo', 2, 'токены не сообщены', null, { blind: 2 }),
+        );
+      }
+    }
+    // A price of the user's own: the calls that waited for it get their money, as after a repricing.
+    for (const l of [...today, ...month]) {
+      const own = costs.manual.find((p) => p.provider === l.provider && p.model === l.model);
+      if (!own) continue;
+      l.price = 'manual';
+      if (l.unpriced > 0 && own.per_minute > 0) {
+        const cost = Math.round((l.seconds / 60) * own.per_minute * 100) / 100;
+        l.cost = [{ currency: own.currency, cost, text: moneyText(cost, own.currency) }];
+        l.unpriced = 0;
+      }
+    }
+    const day = '2026-11-14';
+    const reports = { today: costReport(today, day, day, costs.currency), month: costReport(month, '2026-11-01', day, costs.currency) };
+    // Only money in the main currency counts against the limits.
+    const spent = (r: { totals: { currency: string; cost: number }[] }) => r.totals.find((m) => m.currency === costs.currency)?.cost ?? 0;
+    const share = (value: number, limit: number) => (limit > 0 ? Math.round((value / limit) * 100) : 0);
+    const text = (value: number, limit: number) =>
+      limit > 0 ? `${moneyText(value, costs.currency)} из ${moneyText(limit, costs.currency)}` : moneyText(value, costs.currency);
+    const [daySpent, monthSpent] = [spent(reports.today), spent(reports.month)];
+    return {
+      enabled: costs.enabled,
+      currency: costs.currency,
+      currency_saved: costs.currencySaved,
+      currency_assumed: false,
+      day_limit: costs.dayLimit,
+      month_limit: costs.monthLimit,
+      pause_unattended: costs.pauseUnattended,
+      // The month goes before the day: it holds longer.
+      paused:
+        costs.enabled && costs.pauseUnattended
+          ? costs.monthLimit > 0 && monthSpent >= costs.monthLimit
+            ? 'month'
+            : costs.dayLimit > 0 && daySpent >= costs.dayLimit
+              ? 'day'
+              : null
+          : null,
+      budget: {
+        currency: costs.currency,
+        day_spent: daySpent,
+        day_limit: costs.dayLimit,
+        day_share: share(daySpent, costs.dayLimit),
+        month_spent: monthSpent,
+        month_limit: costs.monthLimit,
+        month_share: share(monthSpent, costs.monthLimit),
+        day_text: text(daySpent, costs.dayLimit),
+        month_text: text(monthSpent, costs.monthLimit),
+      },
+      ...reports,
+      manual: costs.manual,
+      prices_at: costs.pricesAt,
+    };
+  };
+  const tg = { voice_in: params.has('tgvoice') || params.has('tgvoice_in'), voice_reply: params.has('tgvoice') };
+  const tgView = () => ({
+    enabled: true,
+    user_id: 123456789,
+    has_token: true,
+    status: 'on',
+    voice_in: tg.voice_in,
+    voice_reply: tg.voice_reply,
+    stt_ready: !params.has('nostt'),
+    tts_ready: params.has('cloud') || params.has('drama'),
+    ffmpeg_found: ffmpeg.inPath || ffmpeg.downloaded,
+    voice_max_s: 120,
+  });
+  const hk = { custom: {} as Record<string, string>, dictation: params.has('dictation'), screenAsk: params.has('screen_ask') };
+  const HOTKEY_DEFAULTS: [string, string][] = [
+    ['chat', 'Ctrl+Alt+M'],
+    ['listen', 'Ctrl+Alt+K'],
+    ['selection', 'Ctrl+Alt+X'],
+    ['dictation', 'Ctrl+Alt+D'],
+    ['screen_ask', 'Ctrl+Alt+Q'],
+  ];
+  const hotkeyStatus = (id: string) => {
+    // With `&needs` the master switches «Микрофон» and «Экран» count: a hotkey waits for its own.
+    const waits = (master: string) => params.has('needs') && !params.has(master);
+    if (id === 'dictation') return !hk.dictation ? 'off' : waits('mic') ? 'needs' : params.has('hk_taken') ? 'taken' : 'on';
+    if (id === 'screen_ask') return !hk.screenAsk ? 'off' : waits('screen') ? 'needs' : 'on';
+    return 'on';
+  };
+  const hotkeysView = () => ({
+    hotkeys: HOTKEY_DEFAULTS.map(([id, combo]) => ({ id, combo: hk.custom[id] ?? combo, custom: id in hk.custom, status: hotkeyStatus(id) })),
+    dictation: hk.dictation,
+    screen_ask: hk.screenAsk,
+    microphone: params.has('mic'),
+    screen: params.has('screen'),
+    stt_model: !params.has('nostt'),
+  });
+  const SCREEN_ASK_WINDOW = { app: 'excel.exe', title: 'Отчёт за октябрь.xlsx — Excel', width: 1600, height: 900 };
+  // A fake window: a title bar and a table with one red cell.
+  const SCREEN_ASK_PICTURE =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="320" height="180" fill="#f4f5f7"/>' +
+    '<rect width="320" height="22" fill="#1d6f42"/><circle cx="304" cy="11" r="4" fill="#fff"/>' +
+    [0, 1, 2, 3, 4]
+      .flatMap((r) =>
+        [0, 1, 2, 3].map((c) => {
+          const fill = r === 0 ? '#d9e2ec' : r === 3 && c === 2 ? '#f28b82' : '#fff';
+          return `<rect x="${10 + c * 76}" y="${34 + r * 28}" width="72" height="24" fill="${fill}" stroke="#c5cbd3"/>`;
+        }),
+      )
+      .join('') +
+    '</svg>';
+  /** The question about the picture reaches the chat, then her answer. */
+  const screenAskReply = async (question: string) => {
+    send({ type: 'user_text', text: `Вопрос про окно программы ${SCREEN_ASK_WINDOW.app}: ${question.trim() || 'объясни, что на экране'}` });
+    setState('thinking');
+    await wait(900);
+    await say(
+      'Это таблица Excel с отчётом за октябрь: продажи по неделям и итог внизу. Красная ячейка в третьей строке значит, что неделя не добрала до плана. Остальные недели в норме, итог за месяц выше плана.',
+    );
+    setState('idle');
+  };
+  // Scenarios by event and what she is watching for, as the extensions page gets them.
+  const nowS = Math.floor(Date.now() / 1000);
+  const today = new Date().toISOString().slice(0, 10);
+  const events = {
+    enabled: !params.has('events_off'),
+    max_per_hour: 12,
+    triggers: params.has('noevents')
+      ? []
+      : [
+          {
+            id: 3,
+            name: 'Наушники',
+            event: 'audio_connected',
+            filter: 'sony',
+            idle_min: 0,
+            action: { kind: 'command', text: 'музыка' },
+            enabled: true,
+            cooldown_s: 60,
+            max_per_day: 20,
+            fired_at: nowS - 1500,
+            fired_day: today,
+            fired_count: 2,
+            fired_today: 2,
+            command_missing: false,
+            command_changed: false,
+            command_text: 'Включи плеер и поставь громкость на 30.\nЕсли плеер уже играет, ничего не трогай.',
+          },
+          {
+            id: 4,
+            name: 'После игры',
+            event: 'app_closed',
+            filter: 'game.exe',
+            idle_min: 0,
+            action: { kind: 'instruction', text: 'Верни громкость на 40 и включи уведомления' },
+            enabled: false,
+            cooldown_s: 300,
+            max_per_day: 20,
+            fired_at: 0,
+            fired_day: '',
+            fired_count: 0,
+            fired_today: 0,
+            command_missing: false,
+            command_changed: false,
+          },
+          {
+            id: 5,
+            name: 'Вернулся',
+            event: 'user_back',
+            filter: '',
+            idle_min: 15,
+            action: { kind: 'command', text: 'сводка' },
+            enabled: true,
+            cooldown_s: 7200,
+            max_per_day: 5,
+            fired_at: 0,
+            fired_day: '',
+            fired_count: 0,
+            fired_today: 0,
+            command_missing: true,
+            command_changed: false,
+          },
+        ],
+    waits: params.has('noevents')
+      ? []
+      : [
+          { id: 1, kind: 'file_ready', what: 'ubuntu.iso', since: nowS - 600, until: nowS + 3000 },
+          { id: 2, kind: 'process_exits', what: 'cargo.exe', since: nowS - 120, until: nowS + 3470 },
+        ],
+  };
+  // Background jobs, as the job board keeps them. Every change goes to the page as `bg_job_updated`.
+  const jobs = new Map<number, MockJob>();
+  /** What a folder job has done so far: shown when it is stopped halfway. */
+  const partial = new Map<number, { text: string; data: unknown }>();
+  const putJob = (job: MockJob) => {
+    jobs.set(job.id, job);
+    emit('mika://event', { type: 'bg_job_updated', job });
+    return job;
+  };
+  /** The job in its last state: the note of the work goes away, the outcome comes. */
+  const endJob = (job: MockJob, state: MockJob['state'], outcome: { text?: string; data?: unknown }) => {
+    const next: MockJob = { ...job, ...outcome, state };
+    delete next.note;
+    return putJob(next);
+  };
+  /** A recording ends well when it is stopped: the file is saved and she says so. */
+  const saveRecording = async (id: number) => {
+    const job = jobs.get(id);
+    if (!job || job.state !== 'running') return;
+    putJob({ ...job, state: 'stopping', note: 'сохраняю запись…' });
+    await wait(600);
+    endJob({ ...job, share: 100 }, 'done', {
+      text: `Запись сохранена: ${REC_FILE}, 17,5 МБ, 2:15. Запись 1 раз вставала на паузу из-за окна из слепой зоны: эти места в файл не попали.`,
+      data: { kind: 'av_files', files: [{ path: REC_FILE, bytes: 18_400_000, duration_s: 135 }] },
+    });
+    emit('mika://event', { type: 'remark', kind: 'job', text: `Готово: ${job.title}` });
+  };
+  // The recording of scenario `rec` started before the page came up: the page learns of it from `bg_jobs_list`.
+  if (scenario === 'rec') {
+    jobs.set(5, { id: 5, kind: 'screen_record', title: REC_TITLE, state: 'running', live: true, share: 0, note: '0:02 из 30:00' });
+  }
   mockIPC(
     (cmd, args) => {
       const a = (args ?? {}) as Record<string, unknown>;
@@ -139,6 +849,8 @@ export async function install(scenario: string) {
             { at: '2026-11-11T17:02:00+03:00', tool: 'run_shell', target: 'Get-ChildItem "$env:USERPROFILE\\Downloads"', risk: 'medium', decision: 'allow_always', decided_by: 'chat' },
             { at: '2026-11-11T17:04:00+03:00', tool: 'power', target: 'restart', risk: 'high', decision: 'deny', decided_by: 'button' },
             { at: '2026-11-11T17:06:00+03:00', tool: 'delete_to_trash', target: 'C:\\Users\\me\\Downloads\\old.zip', risk: 'high', decision: 'timeout', decided_by: 'timeout' },
+            { at: '2026-11-11T17:09:00+03:00', tool: 'dictation', target: '42 знаков → winword.exe', risk: 'medium', decision: 'direct', decided_by: 'hotkey' },
+            { at: '2026-11-11T17:11:00+03:00', tool: 'screen_ask', target: 'окно «Отчёт за октябрь.xlsx — Excel» (excel.exe)', risk: 'medium', decision: 'direct', decided_by: 'hotkey' },
           ];
         case 'get_general_settings':
           return {
@@ -149,19 +861,134 @@ export async function install(scenario: string) {
             data_dir: String.raw`C:\Users\me\AppData\Roaming\Mika`,
             logs_dir: String.raw`C:\Users\me\AppData\Local\Mika\logs`,
           };
+        case 'get_language':
+          return lang;
+        case 'set_language':
+          if (a.value !== 'ru' && a.value !== 'en') throw 'No such interface language: ru or en';
+          lang = a.value;
+          if (params.has('welcome')) name = lang === 'en' ? 'Mika' : 'Мика';
+          emit('mika://ui', { action: 'language_changed', lang });
+          emit('mika://ui', { action: 'settings_changed' });
+          return null;
         case 'get_tool_settings':
           return {
             web_enabled: true,
             screen_enabled: false,
             news_feed: 'https://lenta.ru/rss/news',
-            groups: ['system', 'apps', 'files', 'shell', 'web', 'notes', 'daily', 'memory', 'media', 'windows', 'screen', 'images', 'commands', 'rdp'].map(
+            groups: ['system', 'apps', 'files', 'shell', 'web', 'notes', 'daily', 'memory', 'media', 'av', 'windows', 'screen', 'images', 'commands', 'events', 'rdp'].map(
               (id) => ({ id, enabled: id !== 'rdp' }),
             ),
-            tool_count: 58,
+            tool_count: 70,
             notifications: { enabled: true, only_messengers: true, read_aloud: true },
             briefing_enabled: false,
             briefing_time: '08:30',
           };
+        case 'get_ffmpeg_status':
+          return ffmpegView();
+        case 'set_ffmpeg_path': {
+          ffmpeg.setting = String(a.value ?? '').trim();
+          // Any non-empty path counts as one without ffmpeg.exe, unless it is the one from PATH.
+          if (ffmpeg.setting === String.raw`C:\Tools\ffmpeg`) {
+            ffmpeg.setting = '';
+            ffmpeg.inPath = true;
+          }
+          return ffmpegView();
+        }
+        case 'install_ffmpeg':
+          return (async () => {
+            ffmpeg.downloading = true;
+            for (const share of [0, 12, 31, 55, 78, 96, 100]) {
+              await emit('ffmpeg-progress', share);
+              await wait(350);
+            }
+            ffmpeg.downloading = false;
+            if (params.has('ffmpeg_fail')) throw 'Контрольная сумма скачанного файла не совпала, файл удалён';
+            ffmpeg.downloaded = true;
+            return ffmpegView();
+          })();
+        case 'remove_ffmpeg':
+          ffmpeg.downloaded = false;
+          return ffmpegView();
+        case 'open_av_file':
+          return null;
+        case 'get_evening_summary':
+          return { ...evening };
+        case 'set_evening_summary':
+          evening.enabled = a.enabled === true;
+          evening.time = String(a.time ?? '');
+          return { ...evening };
+        case 'evening_summary_now':
+          return (async () => {
+            await wait(600);
+            await emit('mika://event', EVENING_REMARK);
+            return null;
+          })();
+        case 'get_costs':
+          return costsView();
+        case 'set_costs_enabled':
+          costs.enabled = a.value === true;
+          return costsView();
+        case 'set_cost_pause':
+          costs.pauseUnattended = a.value === true;
+          return costsView();
+        case 'set_cost_budget':
+          costs.dayLimit = Number(a.dayLimit) || 0;
+          costs.monthLimit = Number(a.monthLimit) || 0;
+          costs.currency = String(a.currency);
+          costs.currencySaved = true;
+          return costsView();
+        case 'set_cost_price': {
+          const price = a.price as MockPrice;
+          if (![price.input_mtok, price.output_mtok, price.per_kchar, price.per_minute, price.per_image].some((n) => n > 0)) {
+            throw 'Укажи хотя бы одну цену больше нуля';
+          }
+          costs.manual = [...costs.manual.filter((p) => !(p.provider === price.provider && p.model === price.model)), price];
+          return costsView();
+        }
+        case 'remove_cost_price':
+          costs.manual = costs.manual.filter((p) => !(p.provider === a.provider && p.model === a.model));
+          return costsView();
+        case 'refresh_cost_prices':
+          return (async () => {
+            await wait(500);
+            const now = new Date();
+            const two = (n: number) => String(n).padStart(2, '0');
+            costs.pricesAt = `${two(now.getDate())}.${two(now.getMonth() + 1)} ${two(now.getHours())}:${two(now.getMinutes())}`;
+            return costsView();
+          })();
+        case 'clear_costs':
+          costs.empty = true;
+          return costsView();
+        case 'bg_jobs_list':
+          return [...jobs.values()].filter((j) => j.state === 'queued' || j.state === 'running' || j.state === 'stopping');
+        case 'bg_job_stop': {
+          const job = jobs.get(Number(a.id));
+          if (job?.state === 'stopping') return null;
+          if (!job || (job.state !== 'queued' && job.state !== 'running')) throw 'Этого задания уже нет';
+          if (job.live) {
+            saveRecording(job.id);
+          } else if (job.state === 'queued') {
+            // A waiting job is taken off the queue at once.
+            endJob(job, 'stopped', { text: 'Остановлено.' });
+          } else {
+            putJob({ ...job, state: 'stopping' });
+            setTimeout(() => endJob(job, 'stopped', partial.get(job.id) ?? { text: 'Остановлено.' }), 600);
+          }
+          return null;
+        }
+        case 'get_research_settings':
+          return researchView();
+        case 'set_research_settings': {
+          const folder = String(a.folder ?? '').trim();
+          if (/[*?"<>|]/.test(folder)) throw 'Папка отчётов задана неверно: нужен обычный путь к папке на этом компьютере';
+          research.folder = folder;
+          research.model = String(a.model ?? '').trim();
+          research.searches = Number(a.maxSearches);
+          research.pages = Number(a.maxPages);
+          research.minutes = Number(a.maxMinutes);
+          research.tokens = Number(a.maxTokens);
+          return researchView();
+        }
         case 'get_rhythm_settings':
           return {
             rhythm: { breaks: true, break_every_min: 50, lively: true },
@@ -206,6 +1033,27 @@ export async function install(scenario: string) {
             { id: 1, due_at: Math.floor(Date.now() / 1000) + 581, text: 'Выключить чайник', kind: 'remind', repeat: 'none' },
             { id: 2, due_at: Math.floor(Date.now() / 1000) + 40000, text: 'Расскажи погоду и курс доллара', kind: 'task', repeat: 'daily' },
           ];
+        case 'get_events':
+          // A copy, as over the real bridge: the page must not hold the mock's own objects.
+          return structuredClone(events);
+        case 'set_events_enabled':
+          events.enabled = a.value === true;
+          return null;
+        case 'set_trigger_enabled': {
+          const found = events.triggers.find((tr) => tr.id === a.id);
+          if (found) found.enabled = a.enabled === true;
+          return found !== undefined;
+        }
+        case 'delete_trigger': {
+          const before = events.triggers.length;
+          events.triggers = events.triggers.filter((tr) => tr.id !== a.id);
+          return events.triggers.length < before;
+        }
+        case 'stop_wait': {
+          const before = events.waits.length;
+          events.waits = events.waits.filter((w) => w.id !== a.id);
+          return events.waits.length < before;
+        }
         case 'list_mcp':
           return [
             { name: 'files', command: 'npx', args: ['-y', '@modelcontextprotocol/server-filesystem', String.raw`C:\Data`], url: '', has_token: false, enabled: true, tools: 11, error: null },
@@ -213,7 +1061,11 @@ export async function install(scenario: string) {
             { name: 'broken', command: 'nope', args: [], url: '', has_token: false, enabled: true, tools: null, error: 'сервер «broken» закрылся' },
           ];
         case 'get_telegram':
-          return { enabled: true, user_id: 123456789, has_token: true, status: 'on' };
+          return tgView();
+        case 'set_telegram_voice':
+          tg.voice_in = a.voiceIn === true;
+          tg.voice_reply = a.voiceReply === true;
+          return tgView();
         case 'test_telegram':
           return 'mika_home_bot';
         case 'get_media_providers':
@@ -256,7 +1108,10 @@ export async function install(scenario: string) {
             brief_long: true,
             tts_expressive: params.has('drama'),
             expressive_model: params.has('drama'),
+            mood_directions: params.has('moodvoice'),
           };
+        case 'set_mood_directions':
+          return null;
         case 'save_speech_settings':
           // Whether the saved model understands speech marks, as the app decides it.
           return /drama/i.test(String(a.ttsModel ?? ''));
@@ -266,6 +1121,108 @@ export async function install(scenario: string) {
           return 'Mika 0.2.0-pre.1\nProvider: openai · https://routerai.ru/api/v1 · mistralai/mistral-nemo\n\n--- log ---\n[INFO] Mika starting';
         case 'load_picture':
           return 'data:image/svg+xml;base64,' + btoa('<svg xmlns="http://www.w3.org/2000/svg" width="320" height="200"><rect width="320" height="200" fill="#51308f"/><circle cx="160" cy="100" r="60" fill="#ff7eb6"/></svg>');
+        case 'hotkeys_get':
+          return hotkeysView();
+        case 'hotkeys_set': {
+          const combo = String(a.combo ?? '');
+          if (combo === 'Ctrl+Alt+KeyM') throw 'Это сочетание уже у действия «Открыть чат»';
+          if (combo === 'Shift+Win+KeyS') throw 'Сочетание Win+Shift+S занято другой программой, прежнее оставлено';
+          // The app stores a tidy form: `KeyJ` becomes `J`.
+          hk.custom[String(a.action)] = combo.replace(/(?:Key|Digit)(\w)$/, '$1');
+          return hotkeysView();
+        }
+        case 'hotkeys_reset':
+          delete hk.custom[String(a.action)];
+          return hotkeysView();
+        case 'hotkeys_pause':
+          return null;
+        case 'dictation_set_enabled':
+          hk.dictation = a.value === true;
+          return hotkeysView();
+        case 'screen_ask_set_enabled':
+          hk.screenAsk = a.value === true;
+          return hotkeysView();
+        case 'screen_ask_preview':
+          return 'data:image/svg+xml;base64,' + btoa(SCREEN_ASK_PICTURE);
+        case 'screen_ask_send':
+          if (params.has('screen_off')) throw 'Просмотр экрана выключен. Включи переключатель «Экран» в шапке чата.';
+          // The command answers at once; the reply comes by events.
+          screenAskReply(String(a.question ?? ''));
+          return null;
+        case 'screen_ask_listen':
+          return (async () => {
+            setState('listening');
+            await wait(1500);
+            screenAskReply('что значит красная ячейка?');
+            return true;
+          })();
+        case 'screen_ask_cancel':
+          return null;
+        case 'backup_export':
+          return (async () => {
+            // The two checks Rust makes before the save dialog opens.
+            if (a.protect === true) {
+              if ([...String(a.password ?? '')].length < 10) throw 'Пароль короче 10 знаков';
+              if (a.password !== a.repeat) throw 'Пароли не совпадают';
+            }
+            if (params.has('backup_cancel')) return null;
+            await wait(900);
+            if (params.has('backup_fail')) throw 'Файл копии не записался: на диске нет места';
+            return { path: BACKUP_FILE.path, bytes: BACKUP_FILE.bytes, encrypted: a.protect === true, keys: a.protect === true ? 5 : 0 };
+          })();
+        case 'backup_reveal':
+          return null;
+        case 'backup_import_pick': {
+          if (params.has('backup_cancel')) return null;
+          if (params.has('backup_newer')) throw 'Копия сделана более новой версией (формат 2). Обнови приложение и повтори';
+          const plain = params.has('backup_plain');
+          return { ...BACKUP_FILE, encrypted: !plain, keys: plain ? 0 : BACKUP_FILE.keys };
+        }
+        case 'backup_import_preview':
+          return (async () => {
+            await wait(900);
+            const plain = params.has('backup_plain');
+            if (params.has('backup_wrong') || (!plain && !a.password)) throw 'Пароль не подошёл';
+            if (!plain) return BACKUP_PREVIEW;
+            // A copy without a password: no keys inside, so the key of this PC would go to the address from the copy.
+            return {
+              ...BACKUP_PREVIEW,
+              file: { ...BACKUP_FILE, encrypted: false, keys: 0 },
+              categories: BACKUP_PREVIEW.categories.map((c) => (c.id === 'secrets' ? { ...c, in_file: 0, available: false, selected: false } : c)),
+              secrets: [],
+              addresses: BACKUP_PREVIEW.addresses.map((x) => ({ ...x, key_in_file: false })),
+              // The bot token of this PC would obey the owner from the copy.
+              mcp: BACKUP_PREVIEW.mcp.map((x) => ({ ...x, token_in_file: false })),
+              telegram: { ...BACKUP_PREVIEW.telegram, token_in_file: false },
+            };
+          })();
+        case 'backup_import_apply':
+          return (async () => {
+            await wait(900);
+            const ticked = (a.categories ?? []) as string[];
+            const plain = params.has('backup_plain');
+            const settings = ticked.includes('settings');
+            const failed = ticked.includes('secrets') && params.has('backup_keysfail') ? [{ kind: 'telegram', name: null }] : [];
+            const keys = ticked.includes('secrets') && !plain ? BACKUP_RESULT.keys_written - failed.length : 0;
+            // A scenario of a saved command comes back only with its command; every one that comes is off.
+            const comes = BACKUP_SCENARIOS.filter((s) => s.action.kind !== 'command' || (ticked.includes('commands') ? s.command_in_file : s.command_here));
+            const scenarios = ticked.includes('scenarios') ? comes.length : 0;
+            return {
+              ...BACKUP_RESULT,
+              restored: BACKUP_RESULT.restored
+                .filter((r) => ticked.includes(r.id) && !(r.id === 'secrets' && keys === 0) && !(r.id === 'scenarios' && scenarios === 0))
+                .map((r) => (r.id === 'secrets' ? { ...r, count: keys } : r.id === 'scenarios' ? { ...r, count: scenarios } : r)),
+              keys_written: keys,
+              keys_failed: failed,
+              switched_off: [...(settings ? BACKUP_RESULT.switched_off : []), ...(scenarios > 0 ? [{ id: 'scenarios', count: scenarios }] : [])],
+              scenarios_without_command: ticked.includes('scenarios') ? BACKUP_SCENARIOS.length - comes.length : 0,
+              docs_folders: settings ? BACKUP_RESULT.docs_folders : [],
+              restart_needed: settings || ticked.includes('history') || keys > 0,
+            };
+          })();
+        case 'backup_import_cancel':
+        case 'backup_restart':
+          return null;
         default:
           return null;
       }
@@ -330,6 +1287,22 @@ export async function install(scenario: string) {
       case 'reminder':
         send({ type: 'reminder_fired', id: 1, text: 'Выключить чайник', kind: 'remind', late_s: 0 });
         break;
+      case 'tgvoice':
+        // A voice message from Telegram looks like any message; the recognition time stands under the reply.
+        click('.iw');
+        await wait(700);
+        send({ type: 'timing', stage: 'stt', ms: 1840 });
+        send({ type: 'user_text', text: 'Какая завтра погода?' });
+        setState('thinking');
+        feel('think');
+        send({ type: 'tool_started', id: 'c1', name: 'get_weather', summary: 'Поиск погоды' });
+        await wait(400);
+        send({ type: 'tool_finished', id: 'c1', name: 'get_weather', ok: true, output: '', elapsed_ms: 400, data: WEATHER });
+        feel('neutral');
+        await say(REPLY);
+        feel('joy');
+        setState('idle');
+        break;
       case 'selection':
         emit('mika://ui', { action: 'selection', text: 'Добрый день! Прошу прислать акт сверки за октябрь до пятницы.', app: 'outlook.exe' });
         await wait(700);
@@ -374,6 +1347,346 @@ export async function install(scenario: string) {
         setState('idle');
         send({ type: 'reminder_fired', id: 1, text: 'Выключить чайник', kind: 'remind', late_s: 0 });
         break;
+      case 'events':
+        click('.iw');
+        await wait(700);
+        send({ type: 'user_text', text: 'Когда подключаю наушники — включи музыку' });
+        setState('thinking');
+        feel('think');
+        send({ type: 'tool_started', id: 'c1', name: 'trigger_create', summary: 'Создать сценарий «Наушники»' });
+        await wait(300);
+        send({ type: 'tool_finished', id: 'c1', name: 'trigger_create', ok: true, output: '', elapsed_ms: 12 });
+        feel('neutral');
+        await say('Готово. Когда подключишь наушники, включу музыку.');
+        setState('idle');
+        await wait(600);
+        // A scenario run opens like a message of the user, then goes on as any turn.
+        send({ type: 'user_text', text: '⚡ Сценарий «Наушники»: подключено звуковое устройство' });
+        setState('thinking');
+        send({ type: 'tool_started', id: 'c2', name: 'media_control', summary: 'Пауза или продолжить' });
+        await wait(300);
+        send({ type: 'tool_finished', id: 'c2', name: 'media_control', ok: true, output: '', elapsed_ms: 40 });
+        await say('Наушники на месте, включила музыку.');
+        setState('idle');
+        await wait(600);
+        send({ type: 'user_text', text: 'Скажи, когда докачается ubuntu.iso' });
+        setState('thinking');
+        send({ type: 'tool_started', id: 'c3', name: 'wait_for', summary: 'Сказать, когда «ubuntu.iso» перестанет расти' });
+        await wait(200);
+        send({ type: 'tool_finished', id: 'c3', name: 'wait_for', ok: true, output: '', elapsed_ms: 8 });
+        await say('Хорошо, слежу за файлом. Скажу, когда он докачается.');
+        setState('idle');
+        await wait(900);
+        send({ type: 'remark', kind: 'watch', text: 'Файл «ubuntu.iso» готов: больше не растёт, 4,2 ГБ.' });
+        break;
+      case 'event_confirm': {
+        if (params.has('inchat')) {
+          click('.iw');
+          await wait(700);
+        }
+        // `&long`: an instruction of the full 300 characters, to see that none of it is hidden.
+        const long = params.has('long');
+        const instruction =
+          'Поставь музыку на паузу, убавь громкость до 20, сверни все окна, включи режим «Не беспокоить», закрой вкладки с видео в браузере, ' +
+          'запиши в заметку «Перерыв» время, когда я отошёл, проверь, идёт ли сборка проекта, и скажи о ней, когда я вернусь, ' +
+          'а потом заблокируй компьютер и ничего не трогай до утра';
+        const assessment = {
+          level: 'medium',
+          summary: long ? 'Создать сценарий «Ушёл»' : 'Создать сценарий «Наушники»',
+          target: long
+            ? `Пауза 1 ч, не больше 3 раз в день. Когда: тебя нет за компьютером 15 мин. Что делать: ${instruction}.`
+            : 'Пауза 1 мин, не больше 20 раз в день. Когда: подключено звуковое устройство «sony». Что делать: команда «музыка»: Открой плеер и включи мой плейлист «Работа».',
+          reason: 'сценарий запускается сам, когда тебя может не быть рядом; его действия спросят разрешение, как обычно',
+          scope: long
+            ? 'ушел|user_away||15|instruction:поставь музыку на паузу, убавь громкость до 20, сверни все окна, включи режим «не #5d0c1f7a92b3e641|3600|3'
+            : 'наушники|audio_connected|sony|0|command:музыка#1a07cb8d7f493660|60|20',
+        };
+        send({ type: 'user_text', text: long ? 'Когда я отхожу — приведи всё в порядок' : 'Когда подключаю наушники — включи музыку' });
+        send({ type: 'tool_started', id: 'c1', name: 'trigger_create', summary: assessment.summary });
+        setState('awaiting_confirm');
+        send({ type: 'confirm_requested', id: 1, tool: 'trigger_create', assessment, allow_always: true, timeout_s: 60 });
+        break;
+      }
+      case 'av': {
+        click('.iw');
+        await wait(700);
+        send({ type: 'user_text', text: 'Сожми отпуск.mp4 до 50 МБ и расшифруй интервью' });
+        setState('thinking');
+        feel('think');
+        send({ type: 'tool_started', id: 'c1', name: 'av_info', summary: 'Сведения о «отпуск.mp4»' });
+        await wait(200);
+        send({
+          type: 'tool_finished',
+          id: 'c1',
+          name: 'av_info',
+          ok: true,
+          output: 'mp4, 12:31, 245 МБ, H.264 1920×1080, 30 к/с; AAC 48 кГц, стерео',
+          elapsed_ms: 180,
+        });
+        send({ type: 'tool_started', id: 'c2', name: 'video_compress', summary: 'Сжать «отпуск.mp4» (12:31, 245 МБ) до 50 МБ → «отпуск (сжато).mp4»' });
+        for (const share of [3, 12, 27, 42]) {
+          await wait(250);
+          send({ type: 'tool_progress', id: 'c2', share });
+        }
+        send({ type: 'tool_started', id: 'c3', name: 'av_transcribe', summary: 'Распознать речь из «интервью.m4a» (8:05, 7,4 МБ)' });
+        await wait(300);
+        send({
+          type: 'tool_finished',
+          id: 'c3',
+          name: 'av_transcribe',
+          ok: true,
+          output: '',
+          elapsed_ms: 41_300,
+          data: {
+            kind: 'av_files',
+            files: [
+              { path: String.raw`C:\Users\me\Music\интервью.txt`, bytes: 9_830 },
+              { path: String.raw`C:\Users\me\Music\интервью.srt`, bytes: 14_250 },
+            ],
+          },
+        });
+        send({ type: 'tool_started', id: 'c5', name: 'av_convert', summary: 'Звук из «концерт.webm» (1:02:03, 412 МБ) → «концерт.mp3»' });
+        await wait(200);
+        send({
+          type: 'tool_finished',
+          id: 'c5',
+          name: 'av_convert',
+          ok: true,
+          output: '',
+          elapsed_ms: 19_800,
+          data: { kind: 'av_files', files: [{ path: String.raw`C:\Users\me\Videos\концерт.mp3`, bytes: 148_900_000, duration_s: 3723.4 }] },
+        });
+        send({ type: 'tool_started', id: 'c4', name: 'video_gif', summary: 'GIF из «котик.mov», 5 с' });
+        await wait(150);
+        send({
+          type: 'tool_finished',
+          id: 'c4',
+          name: 'video_gif',
+          ok: false,
+          output: 'Ошибка: FFmpeg не найден, поэтому с файлом ничего не сделано.',
+          elapsed_ms: 4,
+          data: { kind: 'ffmpeg_missing' },
+        });
+        break;
+      }
+      case 'day':
+        click('.iw');
+        await wait(700);
+        send({ type: 'user_text', text: 'Как прошёл день?' });
+        setState('thinking');
+        feel('think');
+        send({ type: 'tool_started', id: 'c1', name: 'day_summary', summary: 'Собрать итог дня' });
+        await wait(300);
+        send({ type: 'tool_finished', id: 'c1', name: 'day_summary', ok: true, output: '', elapsed_ms: 40, data: DAY_CARD });
+        feel('neutral');
+        await say('За компьютером ты сегодня шесть часов двадцать минут, больше всего в VS Code. Закрыл три дела, был на двух встречах. Завтра в 9:30 планёрка — составить план?');
+        setState('idle');
+        await wait(600);
+        send(EVENING_REMARK);
+        break;
+      case 'costs':
+        click('.iw');
+        await wait(700);
+        send({ type: 'user_text', text: 'Сколько я сегодня потратил?' });
+        setState('thinking');
+        feel('think');
+        send({ type: 'tool_started', id: 'c1', name: 'cost_report', summary: 'Посмотреть расходы на провайдеров' });
+        await wait(300);
+        send({ type: 'tool_finished', id: 'c1', name: 'cost_report', ok: true, output: '', elapsed_ms: 12, data: COST_CARD });
+        feel('neutral');
+        await say('Сегодня ушло 12,40 ₽: почти всё на ответы модели, ещё немного на озвучку. До дневного лимита далеко.');
+        setState('idle');
+        await wait(600);
+        send({ type: 'remark', kind: 'cost', text: 'За сегодня потрачено 80,40 ₽ из 100 ₽: это 80% дневного лимита.' });
+        break;
+      case 'dictation':
+        if (params.has('blind')) {
+          send({ type: 'remark', kind: 'dictation', text: 'Диктовка: окно впереди в слепой зоне (пароли, вход, банк, оплата). Ничего не записываю и не печатаю.' });
+          break;
+        }
+        emit('mika://ui', { action: 'dictation', phase: 'listening', app: 'winword.exe' });
+        setState('listening');
+        await wait(2500);
+        emit('mika://ui', { action: 'dictation', phase: 'recognising', app: 'winword.exe' });
+        setState('thinking');
+        await wait(1200);
+        emit('mika://ui', { action: 'dictation', phase: 'typing', app: 'winword.exe' });
+        await wait(400);
+        emit('mika://ui', { action: 'dictation', phase: 'idle', app: '' });
+        setState('idle');
+        break;
+      case 'screen_ask':
+        // The page opens the chat itself.
+        emit('mika://ui', { action: 'screen_ask', ...SCREEN_ASK_WINDOW });
+        // `&gone`: the app throws the picture away after a while, the card leaves by itself.
+        if (params.has('gone')) setTimeout(() => emit('mika://ui', { action: 'screen_ask', gone: true }), 3000);
+        break;
+      case 'bgjob': {
+        click('.iw');
+        await wait(700);
+        send({ type: 'user_text', text: 'Сожми отпуск.mp4 до 50 МБ, а из концерта достань звук' });
+        setState('thinking');
+        feel('think');
+        const compress = 'Сжать «отпуск.mp4» (12:31, 245 МБ) до 50 МБ → «отпуск (сжато).mp4»';
+        const sound = 'Звук из «концерт.webm» (1:02:03, 412 МБ) → «концерт.mp3»';
+        send({ type: 'tool_started', id: 'c1', name: 'video_compress', summary: compress });
+        await wait(200);
+        // As in the app: the tool answers with the job as it was submitted, and the job has moved on by then.
+        const submitted = putJob({ id: 3, kind: 'video_compress', title: compress, state: 'running', live: false, share: 0 });
+        putJob({ ...submitted, share: 2 });
+        send({ type: 'tool_finished', id: 'c1', name: 'video_compress', ok: true, output: 'Запущено в фоне: задание №3', elapsed_ms: 40, data: { kind: 'bg_job', job: submitted } });
+        send({ type: 'tool_started', id: 'c2', name: 'av_convert', summary: sound });
+        await wait(200);
+        const waiting = putJob({ id: 4, kind: 'av_convert', title: sound, state: 'queued', live: false, share: 0 });
+        send({ type: 'tool_finished', id: 'c2', name: 'av_convert', ok: true, output: 'Запущено в фоне: задание №4', elapsed_ms: 35, data: { kind: 'bg_job', job: waiting } });
+        feel('neutral');
+        await say('Запустила в фоне, скажу, когда будет готово.');
+        setState('idle');
+        for (const share of [5, 12, 20, 29, 38, 47, 56, 65, 74, 83, 92, 100]) {
+          await wait(400);
+          const job = jobs.get(3);
+          if (job?.state !== 'running') break;
+          if (params.has('fail') && share > 38) {
+            const why = 'FFmpeg завершился с ошибкой: Conversion failed! Недописанный файл удалён';
+            endJob(job, 'failed', { text: why });
+            send({ type: 'remark', kind: 'job', text: `Не получилось: ${compress}. ${why}` });
+            break;
+          }
+          putJob({ ...job, share });
+        }
+        const first = jobs.get(3);
+        if (first?.state === 'running') {
+          endJob(first, 'done', {
+            text: String.raw`Готово: C:\Users\me\Videos\отпуск (сжато).mp4, 48,7 МБ (было 245 МБ), 12:31, H.264 1280×720.`,
+            data: { kind: 'av_files', files: [{ path: String.raw`C:\Users\me\Videos\отпуск (сжато).mp4`, bytes: 51_066_000, duration_s: 751.2 }] },
+          });
+          send({ type: 'remark', kind: 'job', text: `Готово: ${compress}` });
+        }
+        // The queue moves on: the second job starts and stays at work, so «Стоп» can be tried on it.
+        const next = jobs.get(4);
+        if (next?.state === 'queued') putJob({ ...next, state: 'running' });
+        for (const share of [6, 15, 24, 33]) {
+          await wait(400);
+          const job = jobs.get(4);
+          if (job?.state !== 'running') break;
+          putJob({ ...job, share });
+        }
+        break;
+      }
+      case 'folder': {
+        click('.iw');
+        await wait(700);
+        send({ type: 'user_text', text: JOB_ASKS.folderask.user });
+        setState('thinking');
+        feel('think');
+        send({ type: 'tool_started', id: 'c1', name: 'av_folder', summary: FOLDER_TITLE });
+        await wait(200);
+        const submitted = putJob({ id: 4, kind: 'av_folder', title: FOLDER_TITLE, state: 'running', live: false, share: 0, note: '1 из 12: день1.mp4' });
+        send({ type: 'tool_finished', id: 'c1', name: 'av_folder', ok: true, output: 'Запущено в фоне: задание №4', elapsed_ms: 60, data: { kind: 'bg_job', job: submitted } });
+        feel('neutral');
+        await say('Запустила в фоне: двенадцать видео, скажу, когда закончу.');
+        setState('idle');
+        // The seventh file fails: it is skipped and named at the end.
+        const made: { path: string; bytes: number; duration_s: number }[] = [];
+        for (let i = 1; i <= 12; i += 1) {
+          await wait(500);
+          const job = jobs.get(4);
+          if (job?.state !== 'running') break;
+          if (i !== 7) made.push({ path: `${FOLDER_OUT}\\день${i}.mp4`, bytes: 38_000_000 + i * 1_300_000, duration_s: 205 + i * 6 });
+          partial.set(4, { text: `Готово ${made.length} из 12: результаты в ${FOLDER_OUT}.`, data: { kind: 'av_files', files: [...made] } });
+          if (i < 12) putJob({ ...job, share: Math.floor((i * 100) / 12), note: `${i + 1} из 12: день${i + 1}.mp4` });
+        }
+        const last = jobs.get(4);
+        if (last?.state === 'running') {
+          endJob({ ...last, share: 100 }, 'done', {
+            text: `Готово 11 из 12: результаты в ${FOLDER_OUT}. Не получилось: день7.mp4 — FFmpeg завершился с ошибкой: Invalid data found when processing input`,
+            data: { kind: 'av_files', files: made },
+          });
+          send({ type: 'remark', kind: 'job', text: `Готово: ${FOLDER_TITLE}` });
+        }
+        break;
+      }
+      case 'rec':
+        // The recording runs already (see `bg_jobs_list`): the red dot on the island, the card in the chat.
+        if (params.has('inchat')) {
+          click('.iw');
+          await wait(700);
+        }
+        // Rust sends the time once a second, or why the recording stands still; the card itself counts nothing.
+        for (let tick = 1, recorded = 2; jobs.get(5)?.state === 'running'; tick += 1) {
+          await wait(1000);
+          const job = jobs.get(5);
+          if (job?.state !== 'running') break;
+          // A window with a password came to the front for two seconds.
+          const paused = tick === 4 || tick === 5;
+          if (!paused) recorded += 1;
+          if (params.has('done') && recorded > 7) {
+            await saveRecording(5);
+            break;
+          }
+          putJob({ ...job, share: Math.floor(recorded / 18), note: paused ? 'пауза: на экране окно из слепой зоны' : `${clock(recorded)} из 30:00` });
+        }
+        break;
+      case 'folderask':
+      case 'recask': {
+        if (params.has('inchat')) {
+          click('.iw');
+          await wait(700);
+        }
+        const ask = scenario === 'recask' && params.has('ofwindow') ? REC_WINDOW_ASK : JOB_ASKS[scenario];
+        send({ type: 'user_text', text: ask.user });
+        send({ type: 'tool_started', id: 'c1', name: ask.tool, summary: ask.assessment.summary });
+        setState('awaiting_confirm');
+        if (ask.assessment.level === 'high') feel('worry');
+        send({ type: 'confirm_requested', id: 1, tool: ask.tool, assessment: ask.assessment, allow_always: ask.assessment.level !== 'high', timeout_s: 60 });
+        break;
+      }
+      case 'research': {
+        click('.iw');
+        await wait(700);
+        send({ type: 'user_text', text: `Разберись, ${RESEARCH_QUESTION.charAt(0).toLowerCase()}${RESEARCH_QUESTION.slice(1)}` });
+        setState('thinking');
+        feel('think');
+        send({ type: 'tool_started', id: 'r1', name: 'deep_search', summary: `Глубокий поиск: «${RESEARCH_QUESTION}»` });
+        for (const share of [5, 13, 25, 40, 62, 85, 96]) {
+          await wait(350);
+          send({ type: 'tool_progress', id: 'r1', share });
+        }
+        // `&fail` is read only here.
+        if (params.has('fail')) {
+          send({
+            type: 'tool_finished',
+            id: 'r1',
+            name: 'deep_search',
+            ok: false,
+            output: 'Ошибка: поиск ничего не нашёл: поисковик не вернул результатов',
+            elapsed_ms: 9100,
+          });
+          await say('Поиск ничего не вернул: похоже, поисковик просит проверку. Попробуем чуть позже?');
+          feel('worry');
+          setState('idle');
+          break;
+        }
+        const report = params.has('partial') ? { ...RESEARCH_REPORT, limits: ['time'], sources: 3 } : RESEARCH_REPORT;
+        send({ type: 'tool_finished', id: 'r1', name: 'deep_search', ok: true, output: '', elapsed_ms: 143000, data: report });
+        await say('Готово. Коротко: для дома 120 м² «воздух-вода» дешевле в установке, а «грунт-вода» экономнее в морозы. Отчёт со ссылками лежит в «Документы\\Mika\\Research».');
+        feel('joy');
+        setState('idle');
+        break;
+      }
+      case 'research_ask': {
+        if (params.has('inchat')) {
+          click('.iw');
+          await wait(700);
+        }
+        const assessment = researchAssessment(params.has('high'));
+        send({ type: 'user_text', text: `Разберись, ${RESEARCH_QUESTION.charAt(0).toLowerCase()}${RESEARCH_QUESTION.slice(1)}` });
+        send({ type: 'tool_started', id: 'r1', name: 'deep_search', summary: assessment.summary });
+        setState('awaiting_confirm');
+        if (assessment.level === 'high') feel('worry');
+        send({ type: 'confirm_requested', id: 1, tool: 'deep_search', assessment, allow_always: assessment.level !== 'high', timeout_s: 60 });
+        break;
+      }
       case 'confirm':
       case 'high':
       case 'long': {
@@ -395,7 +1708,7 @@ export async function install(scenario: string) {
         click('.cbar .ib:nth-last-child(2)');
         await wait(500);
         if (params.get('page')) {
-          const pages = ['persona', 'providers', 'permissions', 'tools', 'memory', 'extensions', 'voice', 'island', 'general'];
+          const pages = ['persona', 'providers', 'permissions', 'tools', 'memory', 'extensions', 'voice', 'island', 'hotkeys', 'costs', 'general'];
           click(`.side nav button:nth-child(${pages.indexOf(params.get('page')!) + 1})`);
         }
         break;

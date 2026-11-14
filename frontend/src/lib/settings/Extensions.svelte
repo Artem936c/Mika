@@ -2,8 +2,9 @@
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import Icon from '../Icon.svelte';
+  import Events from './Events.svelte';
   import Switch from '../Switch.svelte';
-  import { isMessageKey, t } from '../i18n';
+  import { dateLocale, isMessageKey, t } from '../i18n';
 
   interface Command {
     id: number;
@@ -32,6 +33,12 @@
     user_id: number;
     has_token: boolean;
     status: string;
+    voice_in: boolean;
+    voice_reply: boolean;
+    stt_ready: boolean;
+    tts_ready: boolean;
+    ffmpeg_found: boolean;
+    voice_max_s: number;
   }
 
   let commands = $state<Command[]>([]);
@@ -118,6 +125,16 @@
     if (await run('save_telegram', { enabled, userId, token: tgToken ? tgToken : null })) tgToken = '';
   }
 
+  // Both voice switches go together; the bridge reads them at every message.
+  async function setTgVoice(voiceIn: boolean, voiceReply: boolean) {
+    try {
+      tg = await invoke<Telegram>('set_telegram_voice', { voiceIn, voiceReply });
+      error = '';
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   async function checkTelegram() {
     if (!tg) return;
     await saveTelegram(tg.enabled);
@@ -131,7 +148,7 @@
   }
 
   function when(dueAt: number): string {
-    return new Date(dueAt * 1000).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+    return new Date(dueAt * 1000).toLocaleString(dateLocale(), { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
   }
 
   function repeatLabel(r: Reminder['repeat']): string {
@@ -173,6 +190,7 @@
     <button class="ib" title={t('ext.schedule_cancel')} aria-label={t('ext.schedule_cancel')} onclick={() => run('cancel_reminder', { id: r.id })}><Icon name="x" size={14} /></button>
   </div>
 {/each}
+<Events />
 
 <div class="lbl">{t('ext.mcp')}</div>
 <p class="hint">{t('ext.mcp_sub')}</p>
@@ -212,6 +230,18 @@
       <button class="bt" onclick={checkTelegram}>{t('ext.tg_check')}</button>
       {#if tgNote}<span class="ok">{tgNote}</span>{/if}
     </div>
+  </div>
+  <div class="voice">
+    <Switch checked={tg.voice_in} title={t('ext.tg_voice_in')} sub={t('ext.tg_voice_in_sub', { minutes: Math.round(tg.voice_max_s / 60) })} onchange={(v) => setTgVoice(v, tg!.voice_reply)} />
+    {#if tg.voice_in}
+      {#if !tg.stt_ready}<p class="warn">{t('ext.tg_voice_no_stt')}</p>{/if}
+      <Switch checked={tg.voice_reply} title={t('ext.tg_voice_reply')} sub={t('ext.tg_voice_reply_sub')} onchange={(v) => setTgVoice(true, v)} />
+      {#if tg.voice_reply && !tg.tts_ready}
+        <p class="warn">{t('ext.tg_voice_no_tts')}</p>
+      {:else if tg.voice_reply && !tg.ffmpeg_found}
+        <p class="hint">{t('ext.tg_voice_no_ffmpeg')}</p>
+      {/if}
+    {/if}
   </div>
 {/if}
 {#if error}<p class="err">{error}</p>{/if}
@@ -317,6 +347,20 @@
   .ok {
     font-size: 12.5px;
     color: var(--ok);
+  }
+  /* The two voice switches of Telegram and the notes under them. */
+  .voice {
+    display: grid;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .voice .hint {
+    margin: 0 2px;
+  }
+  .warn {
+    margin: 0 2px;
+    font-size: 12.5px;
+    color: var(--warn);
   }
   .err {
     margin: 12px 2px 0;

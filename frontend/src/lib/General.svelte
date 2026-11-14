@@ -1,7 +1,9 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
+  import LanguagePicker from './LanguagePicker.svelte';
   import Switch from './Switch.svelte';
+  import Backup from './settings/Backup.svelte';
   import { t } from './i18n';
 
   let { name }: { name: string } = $props();
@@ -130,6 +132,7 @@
 </script>
 
 {#if g}
+  <LanguagePicker {name} />
   <Switch
     checked={g.autostart}
     title={t('general.autostart')}
@@ -182,6 +185,8 @@
     </div>
     {#if report}<pre>{report}</pre>{/if}
   </div>
+
+  <Backup {name} />
 
   <div class="danger">
     <p>{t('general.wipe_text')}</p>

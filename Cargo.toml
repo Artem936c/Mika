@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 publish = false
 
@@ -35,7 +35,7 @@ tauri-build = { version = "2", features = [] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-notification = "2"
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect"] }
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_UI_Controls_Dialogs", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 windows = { version = "0.62", features = [
     "Data_Pdf",
     "Devices_Radios",
@@ -56,6 +56,7 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
+    "Win32_Media_MediaFoundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_Storage_Xps",
@@ -66,12 +67,15 @@ windows = { version = "0.62", features = [
     "Win32_System_Memory",
     "Win32_System_Variant",
     "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemInformation",
     "Win32_System_Shutdown",
     "Win32_System_Threading",
     "Win32_UI_Accessibility",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
 winreg = "0.56"
@@ -81,5 +85,6 @@ windows-collections = "0.3"
 sha2 = "0.10"
 png = "0.17"
 flate2 = "1"
+ring = "0.17"
 arboard = { version = "3", default-features = false }
 sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }

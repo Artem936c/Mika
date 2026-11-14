@@ -6,6 +6,7 @@
 //! endpoint: `GET /audio/voices` is asked, and well-known model families have a
 //! built-in list.
 
+use mika_core::costs::UnitPrices;
 use mika_core::secrets::Secret;
 use serde::Serialize;
 use serde_json::Value;
@@ -56,6 +57,9 @@ pub struct ModelInfo {
     pub prices: Vec<Price>,
     /// The model takes tool calls: an agent needs that.
     pub tools: bool,
+    /// Prices per one unit, for counting what a call cost. Not for the settings pages.
+    #[serde(skip)]
+    pub unit: UnitPrices,
 }
 
 fn strings(v: Option<&Value>) -> Vec<String> {
@@ -121,6 +125,57 @@ fn prices(m: &Value) -> Vec<Price> {
         .collect()
 }
 
+/// Prices of a model per ONE unit, from `pricing` and `pricing_units` of a
+/// `/models` entry, for counting what a call cost. A zero price is kept: the
+/// model is free. A negative one (OpenRouter writes `-1` for "depends") is not
+/// a price.
+pub fn unit_prices(m: &Value) -> UnitPrices {
+    let Some(p) = m.get("pricing").and_then(Value::as_object) else {
+        return UnitPrices::default();
+    };
+    let units = m.get("pricing_units").and_then(Value::as_object);
+    let value = |key: &str| {
+        p.get(key)
+            .and_then(number)
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    };
+    // The price under `key`, when it is counted per `unit`.
+    let per = |key: &str, usual: &str, unit: &str| {
+        let named = units
+            .and_then(|u| u.get(key))
+            .and_then(Value::as_str)
+            .unwrap_or(usual);
+        value(key).filter(|_| named == unit)
+    };
+    let outputs = strings(
+        m.get("architecture")
+            .and_then(|a| a.get("output_modalities")),
+    );
+    let makes = |what: &str| outputs.iter().any(|o| o == what);
+
+    let mut out = UnitPrices {
+        second: per("seconds", "second", "second"),
+        image: per("image_output", "image", "image"),
+        request: per("request", "request", "request").filter(|v| *v > 0.0),
+        ..Default::default()
+    };
+    let prompt = value("prompt");
+    if makes("speech")
+        && prompt.is_some_and(|v| v > 0.0)
+        && value("completion").unwrap_or(0.0) == 0.0
+    {
+        // RouterAI bills such a speech model per character of the input text.
+        out.chars = prompt;
+    } else if !(makes("transcription") && out.second.is_some()) {
+        // A recognition model billed by the second repeats that number under
+        // `prompt`: it is not a token price.
+        out.input = per("prompt", "token", "token");
+        out.output = per("completion", "token", "token");
+        out.cached = per("input_cache_read", "token", "token");
+    }
+    out
+}
+
 /// Models from a `/models` answer of any of the known shapes.
 pub fn parse_models(v: &Value) -> Vec<ModelInfo> {
     let list = v
@@ -164,6 +219,7 @@ pub fn parse_models(v: &Value) -> Vec<ModelInfo> {
                 tools: strings(m.get("supported_parameters"))
                     .iter()
                     .any(|p| p == "tools"),
+                unit: unit_prices(m),
                 name,
                 id,
             })
@@ -289,17 +345,7 @@ pub fn known_voices(model: &str) -> Option<&'static [&'static str]> {
 
 /// Currency sign of a provider's prices, when it is known by its address.
 pub fn currency(base_url: &str) -> &'static str {
-    let b = base_url.to_lowercase();
-    if b.contains("routerai.ru") {
-        "₽"
-    } else if b.contains("openrouter.ai")
-        || b.contains("api.openai.com")
-        || b.contains("anthropic.com")
-    {
-        "$"
-    } else {
-        ""
-    }
+    mika_core::costs::currency_sign(mika_core::costs::currency_code(base_url))
 }
 
 async fn get_json(url: &str, key: Option<&Secret>, anthropic: bool) -> Result<Value, String> {
@@ -501,5 +547,164 @@ mod tests {
         assert!(known_voices("qwen/qwen3-asr").is_none());
         assert_eq!(currency("https://routerai.ru/api/v1"), "₽");
         assert_eq!(currency("http://localhost:11434/v1"), "");
+    }
+
+    /// Entries of RouterAI's `/models` as it answered on 2026-11-14.
+    fn priced(entry: Value) -> UnitPrices {
+        unit_prices(&entry)
+    }
+
+    #[test]
+    fn unit_prices_of_chat_models_are_per_token() {
+        let p = priced(json!({
+            "id": "openai/gpt-oss-20b",
+            "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+            "pricing": {"prompt": 2.68e-06, "completion": "3.97e-06", "input_cache_read": 6.7e-07,
+                        "request": 0, "image_output": -1},
+            "pricing_units": {"prompt": "token", "completion": "token",
+                              "input_cache_read": "token", "request": "request"}
+        }));
+        assert_eq!(
+            p,
+            UnitPrices {
+                input: Some(2.68e-06),
+                output: Some(3.97e-06),
+                cached: Some(6.7e-07),
+                ..Default::default()
+            }
+        );
+        // Without `pricing_units` the usual unit of each key is taken.
+        let p = priced(json!({"pricing": {"prompt": 1e-6, "completion": 2e-6, "request": 0.01}}));
+        assert_eq!(
+            (p.input, p.output, p.request),
+            (Some(1e-6), Some(2e-6), Some(0.01))
+        );
+        assert!(priced(json!({"id": "gpt-4o-mini"})).is_empty());
+        assert!(priced(json!({"pricing": "по запросу"})).is_empty());
+    }
+
+    #[test]
+    fn a_zero_price_is_kept_and_a_negative_one_is_not_a_price() {
+        let free = priced(json!({"pricing": {"prompt": "0", "completion": 0}}));
+        assert_eq!((free.input, free.output), (Some(0.0), Some(0.0)));
+        assert!(!free.is_empty(), "a free model has a price: zero");
+        // OpenRouter's router model: the price depends on where the request goes.
+        let auto = priced(json!({"pricing": {"prompt": "-1", "completion": "-1", "request": -1}}));
+        assert!(auto.is_empty());
+    }
+
+    #[test]
+    fn unit_prices_of_speech_models_are_per_character_or_per_token() {
+        // 33 of 37 speech models: a price under `prompt`, nothing for the output.
+        let drama = priced(json!({
+            "id": "fish-audio/drama-3",
+            "architecture": {"input_modalities": ["text"], "output_modalities": ["speech"]},
+            "pricing": {"prompt": 0.0013, "completion": 0},
+            "pricing_units": {"prompt": "token", "completion": "token"}
+        }));
+        assert_eq!(
+            drama,
+            UnitPrices {
+                chars: Some(0.0013),
+                ..Default::default()
+            }
+        );
+        // Gemini TTS is billed by the tokens of the text and of the sound.
+        let gemini = priced(json!({
+            "id": "google/gemini-3.8-flash-lite-tts",
+            "architecture": {"input_modalities": ["text"], "output_modalities": ["speech"]},
+            "pricing": {"prompt": "0.00005", "completion": 0.0006}
+        }));
+        assert_eq!(
+            gemini,
+            UnitPrices {
+                input: Some(0.00005),
+                output: Some(0.0006),
+                ..Default::default()
+            }
+        );
+        // One speech model is billed by the second of sound: characters do not price it.
+        let by_second = priced(json!({
+            "architecture": {"output_modalities": ["speech"]},
+            "pricing": {"seconds": 0.002, "prompt": 0, "completion": 0},
+            "pricing_units": {"seconds": "second"}
+        }));
+        assert_eq!(by_second.chars, None);
+        assert_eq!(by_second.second, Some(0.002));
+    }
+
+    #[test]
+    fn unit_prices_of_recognition_models_are_per_second() {
+        let asr = priced(json!({
+            "id": "qwen/qwen3-asr-0.6b",
+            "architecture": {"input_modalities": ["audio"], "output_modalities": ["transcription"]},
+            "pricing": {"seconds": 0.00036, "prompt": 0.00036, "completion": 0.0},
+            "pricing_units": {"seconds": "second", "prompt": "token", "completion": "token"}
+        }));
+        assert_eq!(
+            asr,
+            UnitPrices {
+                second: Some(0.00036),
+                ..Default::default()
+            }
+        );
+        // Three recognition models are billed by tokens.
+        let by_tokens = priced(json!({
+            "architecture": {"input_modalities": ["audio"], "output_modalities": ["transcription"]},
+            "pricing": {"prompt": 2.5e-6, "completion": 1e-5}
+        }));
+        assert_eq!(
+            (by_tokens.input, by_tokens.output, by_tokens.second),
+            (Some(2.5e-6), Some(1e-5), None)
+        );
+    }
+
+    #[test]
+    fn unit_prices_of_pictures_are_per_picture_only_when_the_unit_says_so() {
+        let flux = priced(json!({
+            "id": "black-forest-labs/flux.2-klein-4b",
+            "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["image"]},
+            "pricing": {"image_output": 0.37},
+            "pricing_units": {"image_output": "image"}
+        }));
+        assert_eq!(
+            flux,
+            UnitPrices {
+                image: Some(0.37),
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            priced(json!({"pricing": {"image_output": 0.37}})).image,
+            Some(0.37)
+        );
+        // A picture counted in tokens cannot be priced by the piece.
+        let by_tokens = priced(json!({
+            "architecture": {"output_modalities": ["image", "text"]},
+            "pricing": {"prompt": 3e-7, "completion": 2.5e-6, "image_output": 3e-5},
+            "pricing_units": {"prompt": "token", "completion": "token", "image_output": "token"}
+        }));
+        assert_eq!(by_tokens.image, None);
+        assert_eq!(
+            (by_tokens.input, by_tokens.output),
+            (Some(3e-7), Some(2.5e-6))
+        );
+    }
+
+    #[test]
+    fn the_settings_pages_do_not_see_the_unit_prices() {
+        let ms = parse_models(&routerai());
+        let chat = ms.iter().find(|m| m.id == "openai/gpt-oss-20b").unwrap();
+        assert_eq!(chat.unit.input, Some(2.68e-06));
+        let asr = ms.iter().find(|m| m.id == "qwen/qwen3-asr-0.6b").unwrap();
+        assert_eq!(asr.unit.second, Some(0.00036));
+        let json = serde_json::to_value(chat).unwrap();
+        assert!(json.get("unit").is_none(), "{json}");
+        assert!(json.get("prices").is_some());
+        let bare = ms
+            .iter()
+            .find(|m| m.id == "google/gemma-4-26b-a4b-it")
+            .unwrap();
+        assert!(bare.unit.is_empty());
     }
 }

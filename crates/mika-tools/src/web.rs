@@ -154,6 +154,11 @@ pub struct WebSearchTool {
     pub enabled: Arc<AtomicBool>,
 }
 
+/// Address of the DuckDuckGo HTML page with the results for `query`.
+pub(crate) fn search_url(query: &str) -> String {
+    format!("https://html.duckduckgo.com/html/?q={}", url_encode(query))
+}
+
 /// (title, url, snippet) from the DuckDuckGo HTML page.
 pub fn parse_duckduckgo(html: &str) -> Vec<(String, String, String)> {
     static LINK: OnceLock<Regex> = OnceLock::new();
@@ -212,14 +217,7 @@ impl Tool for WebSearchTool {
     ) -> Result<ToolOutput, ToolError> {
         ensure_enabled(&self.enabled)?;
         let q = arg_str(&args, "query")?;
-        let html = self
-            .http
-            .get(&format!(
-                "https://html.duckduckgo.com/html/?q={}",
-                url_encode(q)
-            ))
-            .await
-            .map_err(failed)?;
+        let html = self.http.get(&search_url(q)).await.map_err(failed)?;
         let results = parse_duckduckgo(&html);
         if results.is_empty() {
             return Err(failed(

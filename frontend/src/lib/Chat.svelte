@@ -1,11 +1,19 @@
 <script lang="ts">
   import { tick } from 'svelte';
   import Avatar from './Avatar.svelte';
+  import AvFilesCard from './AvFilesCard.svelte';
+  import BgJobCard from './BgJobCard.svelte';
   import { dragRegion, toggleMaximize } from './drag';
   import ConfirmCard from './ConfirmCard.svelte';
+  import CostCard from './CostCard.svelte';
+  import DayCard from './DayCard.svelte';
+  import FfmpegCard from './FfmpegCard.svelte';
   import Icon from './Icon.svelte';
   import ImageCard from './ImageCard.svelte';
+  import ResearchCard from './ResearchCard.svelte';
   import SelectionCard from './SelectionCard.svelte';
+  import ScreenAskCard from './ScreenAskCard.svelte';
+  import type { ScreenAsk } from './hotkeys';
   import type { Selection } from './selection';
   import TaskPanel from './TaskPanel.svelte';
   import type { TaskView } from './task';
@@ -46,6 +54,8 @@
     onselection = () => {},
     onselectionpaste = async () => {},
     onselectionclose = () => {},
+    screenAsk = null,
+    onscreenaskclose = () => {},
   }: {
     items: ChatItem[];
     status: AssistantState;
@@ -86,6 +96,9 @@
     onselection?: (action: string) => void;
     onselectionpaste?: () => Promise<void>;
     onselectionclose?: () => void;
+    /** A picture of a window that waits for the user's question. */
+    screenAsk?: ScreenAsk | null;
+    onscreenaskclose?: () => void;
   } = $props();
 
   let draft = $state('');
@@ -93,9 +106,16 @@
   let input: HTMLTextAreaElement | undefined = $state();
   const busy = $derived(status !== 'idle');
 
+  // What makes the list longer at its end: a new row, more text in the last one, a card or a mark under it.
+  // A row that only redraws itself must not pull the list down: a background job reports every second,
+  // and the user may be reading further up.
+  const tail = $derived.by(() => {
+    const last = items[items.length - 1];
+    return [items.length, last?.kind, last?.text.length, last?.data?.kind, last?.pending, last?.done].join('|');
+  });
+
   $effect(() => {
-    void items.length;
-    void items[items.length - 1]?.text;
+    void tail;
     void pending;
     tick().then(() => list?.scrollTo({ top: list.scrollHeight }));
   });
@@ -204,12 +224,28 @@
               {:else}
                 <span class="what">{it.text}</span>
               {/if}
+              {#if it.pending && it.progress !== undefined}
+                <span class="prog" role="progressbar" aria-valuenow={it.progress} aria-valuemin={0} aria-valuemax={100}><i style:width="{it.progress}%"></i></span>
+                <span class="ms">{it.progress}%</span>
+              {/if}
               {#if it.ms !== undefined}<span class="ms">· {t('chat.seconds', { value: formatSeconds(it.ms) })}</span>{/if}
             </div>
             {#if it.data?.kind === 'weather'}
               <WeatherCard data={it.data} />
             {:else if it.data?.kind === 'image'}
               <ImageCard path={it.data.path} />
+            {:else if it.data?.kind === 'day_summary'}
+              <DayCard data={it.data} />
+            {:else if it.data?.kind === 'cost_report'}
+              <CostCard data={it.data} />
+            {:else if it.data?.kind === 'av_files'}
+              <AvFilesCard files={it.data.files} />
+            {:else if it.data?.kind === 'bg_job'}
+              <BgJobCard job={it.data.job} />
+            {:else if it.data?.kind === 'ffmpeg_missing'}
+              <FfmpegCard />
+            {:else if it.data?.kind === 'research_report'}
+              <ResearchCard data={it.data} />
             {/if}
           {:else if it.kind === 'timing'}
             {#if it.done && it.timings}
@@ -236,6 +272,9 @@
     {/if}
     {#if selection}
       <SelectionCard {selection} {busy} onaction={onselection} onpaste={onselectionpaste} onclose={onselectionclose} />
+    {/if}
+    {#if screenAsk}
+      <ScreenAskCard ask={screenAsk} {busy} {mic} listening={status === 'listening'} onclose={onscreenaskclose} />
     {/if}
 
     <div class="comp">
@@ -484,6 +523,21 @@
     height: 100%;
     border-radius: 2px;
     background: linear-gradient(90deg, var(--v), var(--p));
+  }
+  .prog {
+    flex: none;
+    width: 70px;
+    height: 3px;
+    border-radius: 2px;
+    background: rgba(255, 255, 255, 0.12);
+    overflow: hidden;
+  }
+  .prog i {
+    display: block;
+    height: 100%;
+    border-radius: 2px;
+    background: linear-gradient(90deg, var(--v), var(--c));
+    transition: width 0.3s;
   }
   .err {
     display: flex;

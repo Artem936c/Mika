@@ -7,8 +7,12 @@ pub mod browser;
 pub mod calendar;
 pub mod cliphist;
 pub mod commands;
+pub mod costs;
+pub mod day;
 pub mod devices;
+pub mod direct;
 pub mod docs;
+pub mod ffmpeg;
 pub mod files;
 pub mod focus;
 pub mod image;
@@ -18,8 +22,10 @@ pub mod memory;
 pub mod messenger;
 pub mod notes;
 pub mod notify;
+pub mod observe;
 pub mod rdp;
 pub mod reminders;
+pub mod research;
 pub mod screen;
 pub mod search;
 pub mod shell;
@@ -51,7 +57,7 @@ pub use sys::{Http, Shared, ToolEnv};
 /// is not sent to the model at all, which also keeps requests to small models short.
 pub const GROUPS: &[&str] = &[
     "system", "apps", "files", "shell", "web", "browser", "notes", "daily", "memory", "media",
-    "windows", "screen", "images", "commands", "rdp",
+    "av", "windows", "screen", "images", "commands", "events", "rdp",
 ];
 
 /// Executable name of this program, lower case: `mika.exe`.
@@ -83,6 +89,10 @@ const HINTS: &[(&str, &str)] = &[
     ("get_news", "новости"),
     ("get_weather", "погода"),
     ("web_search", "найти свежие сведения в интернете"),
+    (
+        "deep_search",
+        "разобраться в сложном вопросе по нескольким источникам, сравнить варианты, собрать обзор со ссылками: «исследуй», «изучи», «глубокий поиск»",
+    ),
     ("get_time", "который час, какое число, какой день недели"),
     ("volume", "громкость, звук"),
     (
@@ -144,6 +154,14 @@ const HINTS: &[(&str, &str)] = &[
         "встречи, созвоны, события в календаре, что сегодня по расписанию",
     ),
     (
+        "day_summary",
+        "как прошёл день, итог дня, что сделано сегодня или вчера, план на завтра",
+    ),
+    (
+        "cost_report",
+        "сколько потрачено на модели и голос, расходы, бюджет",
+    ),
+    (
         "docs_search",
         "вопрос по своим документам: договор, инструкция, что написано в файлах",
     ),
@@ -155,6 +173,54 @@ const HINTS: &[(&str, &str)] = &[
         "chat_watch",
         "отвечать кому-то в Telegram за пользователя, следить за перепиской",
     ),
+    (
+        "trigger_create",
+        "делать что-то само при событии: подключили наушники, запустили или закрыли программу, подключились по RDP, отошёл или вернулся",
+    ),
+    ("trigger_list", "какие есть сценарии по событию"),
+    (
+        "wait_for",
+        "сказать, когда что-то случится: скачается файл, закончится сборка или программа, в окне появится надпись",
+    ),
+    ("wait_list", "за чем ты сейчас следишь"),
+    ("av_info", "видео- или аудиофайл: длительность, размер, кодеки"),
+    (
+        "av_convert",
+        "перевести видео или звук в другой формат, вытащить звук из видео",
+    ),
+    (
+        "video_compress",
+        "сжать видео, уменьшить размер файла или разрешение",
+    ),
+    ("av_cut", "вырезать кусок видео или звука"),
+    ("av_join", "склеить несколько видео или звуковых файлов"),
+    ("video_gif", "сделать GIF из видео"),
+    ("video_rotate", "повернуть видео"),
+    ("av_speed", "ускорить или замедлить видео или звук"),
+    (
+        "audio_process",
+        "громкость, шум, тишина по краям, выровнять звук в файле",
+    ),
+    ("video_subtitles", "вшить субтитры в видео"),
+    (
+        "av_transcribe",
+        "расшифровать речь из видео или записи в текст, сделать субтитры",
+    ),
+    ("video_describe", "что происходит в видеофайле"),
+    (
+        "av_folder",
+        "сделать одно и то же со всеми видео или звуковыми файлами папки: перевести, сжать, обработать звук, расшифровать",
+    ),
+    (
+        "screen_record",
+        "записать видео с экрана или окна, со звуком компьютера",
+    ),
+    ("screen_record_stop", "остановить запись экрана"),
+    (
+        "bg_jobs",
+        "как идёт фоновая работа с видео и звуком, что в очереди",
+    ),
+    ("bg_job_stop", "остановить фоновое задание"),
 ];
 
 /// Paragraph for the system prompt: requests and the registered tools that serve them.
@@ -314,6 +380,9 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
             http: env.http.clone(),
             enabled: web.clone(),
         }));
+        reg.register(Arc::new(research::DeepSearchTool(
+            research::ResearchEnv::new(env),
+        )));
         reg.register(Arc::new(web::WeatherTool {
             http: env.http.clone(),
             enabled: web.clone(),
@@ -349,6 +418,10 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
         reg.register(Arc::new(calendar::CalendarTool(
             env.shared.calendar.clone(),
         )));
+        reg.register(Arc::new(day::DaySummaryTool(day::DayEnv::new(env))));
+        reg.register(Arc::new(costs::CostReportTool(
+            mika_core::costs::installed_or(env.db.clone()),
+        )));
     }
 
     if on("memory") {
@@ -362,6 +435,84 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
     if on("media") {
         reg.register(Arc::new(media::MediaControlTool(env.media.clone())));
         reg.register(Arc::new(media::NowPlayingTool(env.media.clone())));
+    }
+
+    if on("av") {
+        let av = ffmpeg::AvEnv::new(env);
+        // Long calls of these nine answer at once and go on as background jobs.
+        reg.register(Arc::new(ffmpeg::AvInfoTool(av.clone())));
+        reg.register(Arc::new(ffmpeg::in_background(
+            ffmpeg::AvConvertTool(av.clone()),
+            &av,
+        )));
+        reg.register(Arc::new(ffmpeg::in_background(
+            ffmpeg::VideoCompressTool(av.clone()),
+            &av,
+        )));
+        reg.register(Arc::new(ffmpeg::in_background(
+            ffmpeg::AvCutTool(av.clone()),
+            &av,
+        )));
+        reg.register(Arc::new(ffmpeg::in_background(
+            ffmpeg::AvJoinTool(av.clone()),
+            &av,
+        )));
+        reg.register(Arc::new(ffmpeg::VideoGifTool(av.clone())));
+        reg.register(Arc::new(ffmpeg::in_background(
+            ffmpeg::VideoRotateTool(av.clone()),
+            &av,
+        )));
+        reg.register(Arc::new(ffmpeg::in_background(
+            ffmpeg::AvSpeedTool(av.clone()),
+            &av,
+        )));
+        reg.register(Arc::new(ffmpeg::in_background(
+            ffmpeg::AudioProcessTool(av.clone()),
+            &av,
+        )));
+        reg.register(Arc::new(ffmpeg::in_background(
+            ffmpeg::VideoSubtitlesTool(av.clone()),
+            &av,
+        )));
+        reg.register(Arc::new(ffmpeg::in_background(
+            ffmpeg::AvTranscribeTool(av.clone()),
+            &av,
+        )));
+        reg.register(Arc::new(ffmpeg::VideoDescribeTool(av.clone())));
+        reg.register(Arc::new(ffmpeg::AvFolderTool::new(av.clone())));
+        reg.register(Arc::new(ffmpeg::ScreenRecordTool {
+            av: av.clone(),
+            ui: ui_env.clone(),
+            screen_on: env.shared.screen_enabled.clone(),
+            probe: env.probe.clone(),
+        }));
+        reg.register(Arc::new(ffmpeg::ScreenRecordStopTool(av)));
+        reg.register(Arc::new(mika_core::bgjobs::BgJobsTool(
+            env.shared.jobs.clone(),
+        )));
+        reg.register(Arc::new(mika_core::bgjobs::BgJobStopTool(
+            env.shared.jobs.clone(),
+        )));
+    }
+
+    if on("events") {
+        let triggers = env.shared.triggers.clone();
+        reg.register(Arc::new(observe::TriggerCreateTool {
+            store: triggers.clone(),
+            commands: CommandStore::new(env.db.clone()),
+        }));
+        reg.register(Arc::new(observe::TriggerListTool(triggers.clone())));
+        reg.register(Arc::new(observe::TriggerDeleteTool(triggers)));
+        let waits = env.shared.waits.clone();
+        reg.register(Arc::new(observe::WaitForTool(observe::WaitEnv {
+            waits: waits.clone(),
+            sensors: env.sensors.clone(),
+            ui: ui_env.clone(),
+            windows_on: on("windows"),
+            user_profile: profile.clone(),
+        })));
+        reg.register(Arc::new(observe::WaitListTool(waits.clone())));
+        reg.register(Arc::new(observe::WaitStopTool(waits)));
     }
 
     if on("windows") {
@@ -424,7 +575,7 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register_all(&mut reg, &env, &[]);
         let specs = reg.specs();
-        assert_eq!(specs.len(), 82);
+        assert_eq!(specs.len(), 108);
         for s in specs {
             assert_eq!(s.parameters["type"], "object", "{}", s.name);
             assert!(!s.description.is_empty());
@@ -470,5 +621,54 @@ mod tests {
         register_all(&mut reg, &env, &["windows".into(), "screen".into()]);
         assert!(reg.get("ui_click").is_none() && reg.get("screen_look").is_none());
         assert!(reg.get("arrange_window").is_some());
+    }
+
+    #[test]
+    fn the_events_group_has_six_tools_and_reads_windows_only_with_the_window_group() {
+        use mika_core::tools::ToolError;
+        use serde_json::json;
+
+        const EVENTS: [&str; 6] = [
+            "trigger_create",
+            "trigger_list",
+            "trigger_delete",
+            "wait_for",
+            "wait_list",
+            "wait_stop",
+        ];
+        let (env, f) = testing::env();
+        let all = reg_with(&env, &[]);
+        assert!(EVENTS.iter().all(|t| all.get(t).is_some()));
+        let without = reg_with(&env, &["events"]);
+        assert!(EVENTS.iter().all(|t| without.get(t).is_none()));
+        assert_eq!(all.len() - without.len(), EVENTS.len());
+
+        // A watch of a window is a way to read it: off with the window tools.
+        *f.windows.lock() = vec![sys::WindowInfo {
+            id: 7,
+            title: "Установка".into(),
+            process: "setup.exe".into(),
+        }];
+        let phrase = json!({"what": "window_text", "window": "setup", "text": "Готово"});
+        assert!(reg_with(&env, &[])
+            .get("wait_for")
+            .unwrap()
+            .assess(&phrase)
+            .is_ok());
+        let wait = reg_with(&env, &["windows"]).get("wait_for").unwrap();
+        assert!(matches!(
+            wait.assess(&phrase),
+            Err(ToolError::Failed(why)) if why.contains("Управление окнами")
+        ));
+        assert!(wait
+            .assess(&json!({"what": "file_ready", "path": "a.zip"}))
+            .is_ok());
+    }
+
+    fn reg_with(env: &ToolEnv, off: &[&str]) -> ToolRegistry {
+        let off: Vec<String> = off.iter().map(|g| g.to_string()).collect();
+        let mut reg = ToolRegistry::new();
+        register_all(&mut reg, env, &off);
+        reg
     }
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { alwaysTitle, confirmHead, reducePending, secondsLeft, type Pending } from './confirm';
+import { alwaysTitle, confirmHead, reducePending, secondsLeft, untranslated, type Pending } from './confirm';
 import { isMessageKey } from './i18n';
 
 const assessment = { level: 'medium', summary: 'Открыть', target: 'notepad', reason: 'запуск', scope: 'notepad' };
@@ -62,5 +62,18 @@ describe('card texts', () => {
     expect(alwaysTitle(pending('low', true))).toBe('confirm.always_title');
     expect(alwaysTitle(pending('high', false))).toBe('confirm.always_high');
     expect(alwaysTitle(pending('medium', false))).toBe('confirm.always_wide');
+  });
+
+  it('says that a Russian description is not translated, in the English interface only', () => {
+    const russian = reducePending(null, req, 0) as Pending;
+    expect(untranslated(russian, 'en')).toBe(true);
+    expect(untranslated(russian, 'ru')).toBe(false);
+    // The reason alone is enough: the user reads it before deciding.
+    const mixed: Pending = { ...russian, assessment: { ...assessment, level: 'medium', summary: 'Open', reason: 'запуск' } };
+    expect(untranslated(mixed, 'en')).toBe(true);
+    // Nothing to warn about once the texts are English; a Russian path in the target is not a description.
+    const english: Pending = { ...russian, assessment: { ...assessment, level: 'medium', summary: 'Open', target: 'Блокнот', reason: 'starts a program' } };
+    expect(untranslated(english, 'en')).toBe(false);
+    expect(isMessageKey('confirm.untranslated')).toBe(true);
   });
 });

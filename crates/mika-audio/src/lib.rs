@@ -2,7 +2,9 @@
 //! spoken phrase is recorded from the microphone for recognition. The wake
 //! phrase is heard on this computer, by Vosk or by the recognizer of Windows.
 
+pub mod lead;
 pub mod mic;
+pub mod sound_capture;
 pub mod speech;
 pub mod vosk;
 pub mod wake;

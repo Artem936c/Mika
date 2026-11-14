@@ -3,10 +3,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use mika_core::daylog::{self, DayLog};
 use mika_core::gate::Approval;
 use mika_core::llm::ToolSpec;
 use mika_core::schedule::parse_date;
-use mika_core::storage::rusqlite::params;
+use mika_core::storage::rusqlite::{params, OptionalExtension};
 use mika_core::storage::{now, Db};
 use mika_core::tools::{
     arg_str, arg_str_opt, spec, Assessment, RiskLevel, Tool, ToolError, ToolOutput,
@@ -193,12 +194,27 @@ impl Tool for TodoDoneTool {
         _c: CancellationToken,
     ) -> Result<ToolOutput, ToolError> {
         let id = id_arg(&args)?;
+        // What the todo was before: only one that was open goes into the day log.
+        let before: Option<(String, bool)> = self
+            .0
+            .with(|c| {
+                c.query_row("SELECT text, done FROM todos WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get::<_, i64>(1)? != 0))
+                })
+                .optional()
+            })
+            .map_err(db_err)?;
         let n = self
             .0
             .with(|c| c.execute("UPDATE todos SET done = 1 WHERE id = ?1", [id]))
             .map_err(db_err)?;
         if n == 0 {
             return Err(failed(format!("нет дела №{id}")));
+        }
+        if let Some((text, false)) = before {
+            if let Err(e) = DayLog(self.0.clone()).add(daylog::TODO_DONE, &text, 0) {
+                log::warn!("done todo not written to the day log: {e}");
+            }
         }
         Ok(ToolOutput::new(format!("Дело №{id} выполнено.")))
     }
@@ -302,6 +318,42 @@ mod tests {
             .await
             .is_err());
         assert!(run(&TodoDoneTool(db), json!({"id": 9})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_todo_done_goes_into_the_day_log_once() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        run(
+            &TodoAddTool(db.clone()),
+            json!({"text": " Оплатить интернет "}),
+        )
+        .await
+        .unwrap();
+        let today = chrono::Local::now().date_naive();
+        let done = || -> Vec<String> {
+            DayLog(db.clone())
+                .day(today)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == daylog::TODO_DONE)
+                .map(|e| e.text)
+                .collect()
+        };
+        assert!(done().is_empty());
+        run(&TodoDoneTool(db.clone()), json!({"id": 1}))
+            .await
+            .unwrap();
+        assert_eq!(done(), ["Оплатить интернет"]);
+        // Marked again: still done, nothing new in the log.
+        run(&TodoDoneTool(db.clone()), json!({"id": 1}))
+            .await
+            .unwrap();
+        assert_eq!(done().len(), 1);
+        // A todo that is not there writes nothing.
+        assert!(run(&TodoDoneTool(db.clone()), json!({"id": 9}))
+            .await
+            .is_err());
+        assert_eq!(done().len(), 1);
     }
 
     #[test]

@@ -268,7 +268,7 @@ fn mostly_utf8(bytes: &[u8]) -> bool {
 
 /// Text of a plain file. A file that is not UTF-8 is read as Windows-1251:
 /// that is how Russian Excel and 1C save CSV and text.
-fn plain_text(bytes: &[u8]) -> Option<String> {
+pub(crate) fn plain_text(bytes: &[u8]) -> Option<String> {
     let text = crate::search::read_text(bytes)?;
     if bytes.starts_with(&[0xFF, 0xFE])
         || bytes.starts_with(&[0xEF, 0xBB, 0xBF])

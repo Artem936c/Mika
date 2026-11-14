@@ -99,6 +99,25 @@ pub trait Windows: Send + Sync {
     fn to_monitor(&self, _id: u64, _n: usize) -> Result<(), String> {
         Err("перенос между мониторами здесь недоступен".into())
     }
+    /// Where the window is, physical pixels; `None` when it is minimized,
+    /// hidden or closed.
+    fn bounds(&self, _id: u64) -> Option<Rect> {
+        None
+    }
+    /// Whole areas of the monitors (not work areas), the main one first, then
+    /// left to right.
+    fn monitor_bounds(&self) -> Vec<Rect> {
+        Vec::new()
+    }
+    /// Every window that is on the screen now, with its title and its place:
+    /// main windows and the dialogs they own alike, in front or under other
+    /// windows. Minimized and hidden ones are left out.
+    fn on_screen(&self) -> Vec<(String, Rect)> {
+        self.list()
+            .into_iter()
+            .filter_map(|w| self.bounds(w.id).map(|r| (w.title, r)))
+            .collect()
+    }
 }
 
 /// Screen rectangle in physical pixels.
@@ -142,6 +161,12 @@ pub trait Ui: Send + Sync {
     /// no text this way and needs focus plus typing.
     fn set_text(&self, window: u64, n: u32, text: &str) -> Result<bool, String>;
     fn focus(&self, window: u64, n: u32) -> Result<(), String>;
+    /// Whether the keyboard focus is in a password field. `None` when it
+    /// cannot be told (no answer in time, an error): the caller must then
+    /// treat the field as one it may not type into.
+    fn focused_password(&self) -> Option<bool> {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +184,10 @@ pub trait Input: Send + Sync {
     fn click(&self, x: i32, y: i32, button: MouseButton, double: bool) -> Result<(), String>;
     /// Positive `lines` scroll down.
     fn wheel(&self, x: i32, y: i32, lines: i32) -> Result<(), String>;
+    /// Whether Ctrl, Alt, Shift or Win is held now.
+    fn modifiers_down(&self) -> bool {
+        false
+    }
 }
 
 /// One screenshot.
@@ -202,7 +231,7 @@ pub trait Screen: Send + Sync {
     }
 }
 
-pub use mika_core::llm::{ImageGen, Vision};
+pub use mika_core::llm::{ImageGen, SpeechSegment, SpeechToText, TextModel, Vision};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaAction {
@@ -326,6 +355,57 @@ pub trait Runner: Send + Sync {
         timeout: Duration,
         cancel: CancellationToken,
     ) -> Result<RunOutput, String>;
+
+    /// Like `run`, in the folder `cwd`, and gives every line of the output to
+    /// `on_stdout` as it comes. Keeps only the tail of long output.
+    async fn run_streaming(
+        &self,
+        program: &str,
+        args: &[String],
+        _cwd: Option<&Path>,
+        timeout: Duration,
+        cancel: CancellationToken,
+        on_stdout: &(dyn for<'l> Fn(&'l str) + Send + Sync),
+    ) -> Result<RunOutput, String> {
+        let out = self.run(program, args, timeout, cancel).await?;
+        for line in out.stdout.lines() {
+            on_stdout(line);
+        }
+        Ok(out)
+    }
+
+    /// Like `run_streaming`, for a program that is told when to finish: when `quit` fires,
+    /// `q` is written to its input and it gets `quit_wait` to end by itself, then it is killed.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_controlled(
+        &self,
+        program: &str,
+        args: &[String],
+        cwd: Option<&Path>,
+        timeout: Duration,
+        cancel: CancellationToken,
+        quit: CancellationToken,
+        _quit_wait: Duration,
+        on_stdout: &(dyn for<'l> Fn(&'l str) + Send + Sync),
+    ) -> Result<RunOutput, String> {
+        // Without an input to write to, the run is just left when asked to finish.
+        tokio::select! {
+            r = self.run_streaming(program, args, cwd, timeout, cancel, on_stdout) => r,
+            _ = quit.cancelled() => Ok(RunOutput {
+                code: Some(0),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Blocks the calling thread until the program ends or `timeout` passes.
+    /// For a quick look at a file from a synchronous risk check.
+    fn run_blocking(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<RunOutput, String>;
 }
 
 #[async_trait]
@@ -382,6 +462,8 @@ pub struct ToolEnv {
     pub media: Arc<dyn Media>,
     pub radios: Arc<dyn Radios>,
     pub browser: Arc<dyn Browser>,
+    /// What the watcher of events and "wait and tell" asks the system.
+    pub sensors: Arc<dyn crate::observe::Sensors>,
     pub db: Arc<Db>,
     /// `%USERPROFILE%`.
     pub user_profile: String,
@@ -419,4 +501,25 @@ pub struct Shared {
     pub calendar: crate::calendar::CalendarState,
     /// Pieces of the user's documents.
     pub docs: crate::docs::DocIndex,
+    /// `tools.ffmpeg_path` from the config, read at every call.
+    pub ffmpeg_path: Arc<RwLock<String>>,
+    /// Speech recognition, the same as for the microphone.
+    pub stt: Arc<dyn SpeechToText>,
+    /// Files the video and sound tools made: only these open from the chat card.
+    pub av_outputs: crate::ffmpeg::Outputs,
+    /// Scenarios by event: the one store of the process.
+    pub triggers: mika_core::triggers::TriggerStore,
+    /// What she was asked to watch and tell about.
+    pub waits: crate::observe::Waits,
+    /// Background jobs: long work with video and sound, a screen recording.
+    pub jobs: mika_core::bgjobs::JobBoard,
+    /// What a screen recording needs from the application.
+    pub rec: crate::ffmpeg::RecordDeps,
+    /// A model for tools that need plain text; it gets no tools.
+    pub text_model: Arc<dyn TextModel>,
+    /// `[research]` from the config, read at every call.
+    pub research: Arc<RwLock<mika_core::config::ResearchConfig>>,
+    /// When deep searches ran in this run of the app. It lives here, not in
+    /// the tool: the registry is rebuilt, and the record must outlive it.
+    pub research_runs: Arc<crate::research::ResearchRuns>,
 }

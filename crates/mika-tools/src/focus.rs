@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use mika_core::daylog::{self, DayLog};
 use mika_core::gate::Approval;
 use mika_core::llm::ToolSpec;
 use mika_core::tools::{arg_str, spec, Assessment, RiskLevel, Tool, ToolError, ToolOutput};
@@ -23,6 +24,10 @@ struct Inner {
     /// Unix seconds when focus ends.
     until: Option<i64>,
     held: Vec<String>,
+    /// Unix seconds when the running session began.
+    since: Option<i64>,
+    /// Where a finished session is written for the summary of the day.
+    log: Option<DayLog>,
 }
 
 /// Focus state shared by the tool, the notification reader and the rhythm loop.
@@ -30,21 +35,54 @@ struct Inner {
 pub struct Focus(Arc<Mutex<Inner>>);
 
 impl Focus {
+    /// Writes every finished session into the day log (decision 0028).
+    pub fn with_log(self, log: DayLog) -> Self {
+        self.0.lock().log = Some(log);
+        self
+    }
+
     /// Starts focus, or moves the end of the running one. What waited is kept:
     /// a focus that ran out but was not summed up yet goes on with it, and it
     /// is listed when this one ends.
     pub fn start(&self, minutes: u64, at: i64) -> i64 {
         let until = at + minutes.clamp(1, MAX_MINUTES) as i64 * 60;
-        self.0.lock().until = Some(until);
+        let mut s = self.0.lock();
+        s.until = Some(until);
+        // An extension, and a focus that ran out but was not summed up yet,
+        // keep their start: it is one session.
+        if s.since.is_none() {
+            s.since = Some(at);
+        }
         until
     }
 
     /// Ends focus now. Returns the notifications that waited, or `None` when
     /// there was no focus.
     pub fn stop(&self) -> Option<Vec<String>> {
-        let mut s = self.0.lock();
-        s.until.take()?;
-        Some(std::mem::take(&mut s.held))
+        self.end(chrono::Local::now().timestamp())
+    }
+
+    /// Ends the session at `at`, or at its planned end when that came first,
+    /// and writes its length into the day log.
+    fn end(&self, at: i64) -> Option<Vec<String>> {
+        let (held, ended, since, log) = {
+            let mut s = self.0.lock();
+            let until = s.until.take()?;
+            let ended = at.min(until);
+            (
+                std::mem::take(&mut s.held),
+                ended,
+                s.since.take().unwrap_or(ended),
+                s.log.clone(),
+            )
+        };
+        if let Some(log) = log {
+            let minutes = (((ended - since).max(0) + 59) / 60).max(1);
+            if let Err(e) = log.add_at(ended, daylog::FOCUS, "", minutes) {
+                log::warn!("focus session not written to the day log: {e}");
+            }
+        }
+        Some(held)
     }
 
     pub fn active(&self, at: i64) -> bool {
@@ -61,7 +99,7 @@ impl Focus {
     pub fn expired(&self, at: i64) -> Option<Vec<String>> {
         let ended = self.0.lock().until.is_some_and(|u| u <= at);
         if ended {
-            self.stop()
+            self.end(at)
         } else {
             None
         }
@@ -271,6 +309,77 @@ mod tests {
         assert!(aloud.contains('…') && !aloud.contains(&long), "{aloud}");
         assert!(aloud.chars().count() < 3 * SPOKEN_CHARS + 100);
         assert_eq!(spoken_summary(&[], false), summary(&[]));
+    }
+
+    /// A focus with a day log over a base in memory.
+    fn logged() -> (Focus, DayLog) {
+        let log = DayLog(Arc::new(mika_core::storage::Db::open_in_memory().unwrap()));
+        (Focus::default().with_log(log.clone()), log)
+    }
+
+    /// The focus entries of the local day of `at`: (unix seconds, minutes).
+    fn sessions(log: &DayLog, at: i64) -> Vec<(i64, i64)> {
+        use chrono::TimeZone;
+        let day = chrono::Local
+            .timestamp_opt(at, 0)
+            .earliest()
+            .unwrap()
+            .date_naive();
+        log.day(day)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == daylog::FOCUS)
+            .map(|e| (e.at, e.amount))
+            .collect()
+    }
+
+    #[test]
+    fn a_session_that_runs_out_is_written_once_with_its_minutes() {
+        let (f, log) = logged();
+        // Noon of some day: the hour around it is one local day everywhere.
+        let t = now() / 86_400 * 86_400 + 43_200;
+        f.start(10, t);
+        assert_eq!(f.expired(t + 599), None);
+        assert!(sessions(&log, t).is_empty(), "nothing while it runs");
+        // The loop notices a few seconds late: the session ended at its time.
+        assert!(f.expired(t + 607).is_some());
+        assert_eq!(sessions(&log, t), [(t + 600, 10)]);
+        assert_eq!(f.expired(t + 700), None);
+        assert_eq!(f.stop(), None);
+        assert_eq!(sessions(&log, t).len(), 1);
+    }
+
+    #[test]
+    fn an_extended_session_is_one_entry_from_its_first_start() {
+        let (f, log) = logged();
+        let t = now() / 86_400 * 86_400 + 43_200;
+        f.start(10, t);
+        // «Продли ещё на 20 минут» after 200 seconds.
+        assert_eq!(f.start(20, t + 200), t + 1400);
+        assert!(f.expired(t + 1400).is_some());
+        assert_eq!(sessions(&log, t), [(t + 1400, 24)]);
+        // Ran out, started again before the loop summed it up: still one session.
+        f.start(5, t + 2000);
+        assert!(!f.active(t + 2400));
+        f.start(5, t + 2400);
+        assert!(f.expired(t + 2700).is_some());
+        assert_eq!(sessions(&log, t), [(t + 1400, 24), (t + 2700, 12)]);
+    }
+
+    #[test]
+    fn a_session_stopped_early_is_written_with_the_time_it_ran() {
+        let (f, log) = logged();
+        // Began almost five minutes ago, planned for twenty-five.
+        let began = now() - 290;
+        f.start(25, began);
+        assert!(f.stop().is_some());
+        let written = sessions(&log, now());
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].1, 5);
+        // A session shorter than a minute counts as one.
+        f.start(25, now());
+        f.stop();
+        assert_eq!(sessions(&log, now())[1].1, 1);
     }
 
     #[tokio::test]

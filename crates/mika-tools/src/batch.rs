@@ -268,7 +268,7 @@ pub fn checked_path(raw: &str, profile: &str) -> Result<PathBuf, ToolError> {
 }
 
 /// `name (2).ext` next to `path` when `path` is taken.
-pub fn free_name(path: &Path) -> PathBuf {
+pub(crate) fn free_name(path: &Path) -> PathBuf {
     if !path.exists() {
         return path.to_path_buf();
     }

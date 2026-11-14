@@ -1,10 +1,21 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod backup;
+mod bgjobs;
 mod bridge;
 mod catalog;
+mod costs;
+mod dayend;
+mod events_page;
 mod everyday;
+mod ffmpeg_get;
+mod file_dialog;
+mod hotkey_actions;
+mod hotkeys;
+mod lang;
 mod platform;
+mod research;
 mod rhythm;
 mod selection;
 mod settings;
@@ -38,9 +49,22 @@ fn spawn_notifier(app: tauri::AppHandle, bus: EventBus, ctx: Arc<app::Ctx>) {
                         log::warn!("notification failed: {e}");
                     }
                 }
+                // What she was asked to watch for: the user may be in another program by now.
+                Ok(Event::Remark { text, kind }) if kind == mika_core::triggers::REMARK_WATCH => {
+                    let title = ctx.config.lock().assistant.name.clone();
+                    if let Err(e) = app.notification().builder().title(title).body(text).show() {
+                        log::warn!("notification failed: {e}");
+                    }
+                }
                 Ok(Event::StateChanged { to, .. }) => {
                     let name = ctx.config.lock().assistant.name.clone();
                     tray::show_state(&app, &name, to);
+                }
+                Ok(Event::BgJobUpdated { job }) if job.live => {
+                    // The board, not the event, says whether a recording runs: an event can be late.
+                    let on = bgjobs::recording(&ctx.jobs).is_some();
+                    let name = ctx.config.lock().assistant.name.clone();
+                    tray::set_recording(&app, &name, ctx.state(), on);
                 }
                 Ok(Event::UiTarget { x, y, w, h }) => {
                     // First, before the frame waits for the main thread.
@@ -112,7 +136,7 @@ fn main() {
     let background = ctx.clone();
 
     tauri::Builder::default()
-        .plugin(tray::global_shortcut_plugin())
+        .plugin(hotkeys::plugin())
         .plugin(tauri_plugin_notification::init())
         .manage(state)
         .manage(ctx)
@@ -142,6 +166,8 @@ fn main() {
             bridge::set_web_enabled,
             bridge::focus_island,
             bridge::get_general_settings,
+            lang::get_language,
+            lang::set_language,
             bridge::set_autostart,
             bridge::open_folder,
             bridge::wipe_all_data,
@@ -154,6 +180,11 @@ fn main() {
             settings::set_tool_group,
             settings::set_screen_enabled,
             settings::set_news_feed,
+            settings::get_ffmpeg_status,
+            settings::set_ffmpeg_path,
+            settings::install_ffmpeg,
+            settings::remove_ffmpeg,
+            settings::open_av_file,
             settings::get_island_settings,
             settings::set_island_settings,
             settings::set_island_monitor,
@@ -176,6 +207,7 @@ fn main() {
             settings::get_telegram,
             settings::save_telegram,
             settings::test_telegram,
+            settings::set_telegram_voice,
             settings::get_media_providers,
             settings::save_media_providers,
             settings::load_picture,
@@ -185,6 +217,7 @@ fn main() {
             settings::set_voice,
             settings::test_voice,
             settings::set_tts_cache,
+            settings::set_mood_directions,
             settings::clear_speech_cache,
             settings::install_vosk,
             settings::set_follow_up,
@@ -213,12 +246,49 @@ fn main() {
             settings::set_wake,
             settings::finish_onboarding,
             settings::get_update_info,
+            research::get_research_settings,
+            research::set_research_settings,
             settings::save_update_settings,
+            bgjobs::bg_jobs_list,
+            bgjobs::bg_job_stop,
             settings::check_update,
+            backup::backup_export,
+            backup::backup_reveal,
+            backup::backup_import_pick,
+            backup::backup_import_preview,
+            backup::backup_import_apply,
+            backup::backup_import_cancel,
+            backup::backup_restart,
             settings::install_update,
+            events_page::get_events,
+            events_page::set_events_enabled,
+            events_page::set_trigger_enabled,
+            events_page::delete_trigger,
+            events_page::stop_wait,
             selection::selection_action,
             selection::selection_paste,
+            hotkeys::hotkeys_get,
+            hotkeys::hotkeys_set,
+            hotkeys::hotkeys_reset,
+            hotkeys::hotkeys_pause,
+            hotkey_actions::dictation_set_enabled,
+            hotkey_actions::screen_ask_set_enabled,
+            hotkey_actions::screen_ask_preview,
+            hotkey_actions::screen_ask_send,
+            hotkey_actions::screen_ask_listen,
+            hotkey_actions::screen_ask_cancel,
             selection::selection_clear,
+            costs::get_costs,
+            costs::set_costs_enabled,
+            costs::set_cost_budget,
+            costs::set_cost_pause,
+            costs::set_cost_price,
+            costs::remove_cost_price,
+            costs::refresh_cost_prices,
+            costs::clear_costs,
+            dayend::get_evening_summary,
+            dayend::set_evening_summary,
+            dayend::evening_summary_now,
         ])
         .setup(move |app| {
             let island = app
@@ -245,9 +315,7 @@ fn main() {
                 window::set_desktop_avatar(app.handle(), true)?;
             }
             tray::install(app.handle(), &name)?;
-            tray::register_shortcut(app.handle());
-            tray::register_listen_shortcut(app.handle());
-            tray::register_selection_shortcut(app.handle());
+            hotkeys::register_all(app.handle(), &background);
             let _ = background.app.set(app.handle().clone());
             let _ = background.emotion.set(emotion_now.clone());
             background.start_background();
@@ -267,6 +335,11 @@ fn main() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let tauri::RunEvent::Exit = event {
+                // Background jobs are stopped, a recording is saved and half-written
+                // files are removed before the process ends. This waits for them,
+                // so from here on nothing asks this thread to redraw the tray.
+                tray::closing();
+                app.state::<Arc<crate::app::Ctx>>().shutdown_media();
                 // Programs quietened for her voice get their sound back.
                 app.state::<Arc<crate::app::Ctx>>().restore_media();
             }

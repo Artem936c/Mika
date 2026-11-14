@@ -21,7 +21,7 @@ use crate::ui::UiEnv;
 use crate::util::{failed, truncate};
 
 /// Longer side of a picture sent to the vision model, pixels.
-const VISION_MAX_SIDE: u32 = 1600;
+pub(crate) const VISION_MAX_SIDE: u32 = 1600;
 
 pub const SCREEN_DISABLED: &str =
     "Просмотр экрана выключен. Его включает пользователь переключателем «Экран» в шапке чата.";

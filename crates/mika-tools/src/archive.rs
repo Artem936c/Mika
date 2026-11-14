@@ -39,7 +39,7 @@ async fn tar(
 }
 
 /// The riskier of two assessments, with a common summary and target.
-fn pair(a: Assessment, b: Assessment, summary: &str, target: String) -> Assessment {
+pub(crate) fn pair(a: Assessment, b: Assessment, summary: &str, target: String) -> Assessment {
     let (level, reason) = if b.level > a.level {
         (b.level, b.reason)
     } else {

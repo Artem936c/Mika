@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use mika_core::emotion::Emotion;
 use mika_core::events::{Event, EventBus};
 use mika_core::marks::{
-    code_open, in_code_block_line, strip_marks, tokens, tokens_raw, MarkFilter, Token,
+    code_open, in_code_block_line, is_direction, strip_marks, tokens, tokens_raw, MarkFilter, Token,
 };
 use mika_core::schedule::ReminderKind;
 use mika_core::state::AssistantState;
@@ -55,7 +55,7 @@ pub trait Voice: Send + Sync {
     }
     fn stop(&self);
     fn voices(&self) -> Vec<VoiceInfo>;
-    /// Picks the voice by name (empty: a Russian one if installed) and the rate, 0.5..=2.0.
+    /// Picks the voice by name (empty: one of the language she replies in, if installed) and the rate, 0.5..=2.0.
     fn configure(&self, voice: &str, rate: f32);
     /// With a remote synthesizer the sound of each sentence comes from it; a sentence
     /// it fails on is read by the local voice. `None` returns to the local voice.
@@ -70,10 +70,18 @@ pub trait Voice: Send + Sync {
     /// Pitch and pace in percent for each new sentence of the local voice, so
     /// her tone follows her mood. `None`: always the usual voice.
     fn set_tone(&self, _tone: Option<ToneSource>) {}
+    /// The direction a remote synthesizer gets before a sentence that has no
+    /// voice marks of its own. `None`: never any. A voice that wraps another
+    /// must pass it on.
+    fn set_direction(&self, _direction: Option<DirectionSource>) {}
 }
 
 /// Pitch and pace in percent of the usual, asked for each sentence.
 pub type ToneSource = Arc<dyn Fn() -> (i8, i8) + Send + Sync>;
+
+/// Her mood as a direction for a voice that performs marks, asked for each
+/// sentence (decision 0029). `None`: no direction now.
+pub type DirectionSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 /// SSML that says `text` with the pitch and pace changed by these percents.
 pub fn prosody_ssml(text: &str, language: &str, (pitch, rate): (i8, i8)) -> String {
@@ -868,6 +876,10 @@ impl Voice for Retold {
     fn set_tone(&self, tone: Option<ToneSource>) {
         self.inner.set_tone(tone);
     }
+
+    fn set_direction(&self, direction: Option<DirectionSource>) {
+        self.inner.set_direction(direction);
+    }
 }
 
 /// What she says instead of a long reply when no retelling came: its first
@@ -924,6 +936,108 @@ fn take_words(marked: &str, n: usize) -> String {
         kept.push(token);
     }
     clean_marked_for_speech(&render(&kept))
+}
+
+/// `text` with `direction` put before it as `[direction] `, when its first
+/// line has words and no voice mark of its own (no direction, no tag).
+/// A `direction` that does not fit `marks::is_direction` is ignored.
+pub fn with_direction(text: &str, direction: Option<&str>) -> String {
+    let Some(direction) = direction.map(str::trim).filter(|d| is_direction(d)) else {
+        return text.to_string();
+    };
+    let first = tokens(text.lines().next().unwrap_or_default());
+    let own = first
+        .iter()
+        .any(|t| matches!(t, Token::Direction(_) | Token::Open(_) | Token::Close(_)));
+    let words = first
+        .iter()
+        .any(|t| matches!(t, Token::Text(s) if s.chars().any(char::is_alphanumeric)));
+    if own || !words {
+        return text.to_string();
+    }
+    format!("[{direction}] {text}")
+}
+
+/// Longest voice message, characters of its words: about half a minute.
+pub const VOICE_NOTE_CHARS: usize = 500;
+/// Most characters of voice marks one voice message carries besides its
+/// words. Marks are not heard, but the synthesizer is paid for them: without
+/// a limit a reply of three words could order thousands of characters.
+pub const VOICE_NOTE_MARKS: usize = 250;
+/// Said last in a voice message that leaves part of the reply out.
+pub const VOICE_NOTE_TAIL: &str = "Остальное в тексте.";
+
+/// A reply as one text for one voice message (decision 0029). With
+/// `spoken` it is the copy with voice marks: they stay, balanced, each
+/// phrase on its own line. `None` when there are no words to say.
+///
+/// A short reply is said whole. A long one gives the whole phrases that fit
+/// into `VOICE_NOTE_CHARS` and `VOICE_NOTE_TAIL`; a first phrase longer than
+/// the limit is cut to it. The marks have a limit too, `VOICE_NOTE_MARKS`:
+/// a phrase whose marks would pass it is said by its words alone.
+/// `direction` leads the first line when that line has no mark of its own.
+pub fn voice_note(text: &str, spoken: Option<&str>, direction: Option<&str>) -> Option<String> {
+    let marked = spoken.is_some();
+    let mut phrases = splitter(marked);
+    let mut split = phrases.push(spoken.unwrap_or(text));
+    split.extend(phrases.finish());
+    // Each phrase as it is said and as its words are counted.
+    let ready = split.iter().filter_map(|phrase| {
+        if marked {
+            marked_speech(phrase)
+        } else {
+            let said = clean_for_speech(phrase);
+            said.chars()
+                .any(char::is_alphanumeric)
+                .then(|| (said.clone(), said))
+        }
+    });
+    // The words of a phrase alone, safe for a voice that performs marks.
+    let unmarked = |visible: &str| -> String { visible.chars().filter_map(defuse).collect() };
+    let mut taken: Vec<String> = Vec::new();
+    let mut chars = 0;
+    // Characters of marks taken so far. The synthesizer is paid for all it
+    // gets, so the marks have a limit of their own: a phrase that would pass
+    // it is said without them.
+    let mut marks = 0;
+    let mut left_out = false;
+    for (said, visible) in ready {
+        let len = visible.chars().count();
+        if chars + len > VOICE_NOTE_CHARS {
+            left_out = true;
+            if taken.is_empty() {
+                let cut: String = if marked {
+                    let cut = take_words(&said, VOICE_NOTE_CHARS);
+                    if cut.chars().count() > VOICE_NOTE_CHARS + VOICE_NOTE_MARKS {
+                        unmarked(&visible).chars().take(VOICE_NOTE_CHARS).collect()
+                    } else {
+                        cut
+                    }
+                } else {
+                    said.chars().take(VOICE_NOTE_CHARS).collect()
+                };
+                taken.extend(Some(cut).filter(|c| !c.trim().is_empty()));
+            }
+            break;
+        }
+        chars += len;
+        let own = said.chars().count().saturating_sub(len);
+        if marks + own > VOICE_NOTE_MARKS {
+            taken.push(unmarked(&visible));
+        } else {
+            marks += own;
+            taken.push(said);
+        }
+    }
+    if taken.is_empty() {
+        return None;
+    }
+    if left_out {
+        taken.push(VOICE_NOTE_TAIL.into());
+    }
+    // A direction ends with its line, as it does with a request for each phrase.
+    let joined = taken.join(if marked { "\n" } else { " " });
+    Some(with_direction(&joined, direction))
 }
 
 /// The reply being spoken and what is known about it so far.
@@ -2413,5 +2527,314 @@ mod tests {
         assert!(marked.starts_with("<soft>тишина"), "{marked}");
         assert!(marked.ends_with("</soft> Подробности в чате."), "{marked}");
         assert_eq!(strip_marks(&marked), plain);
+    }
+
+    #[test]
+    fn a_mood_direction_leads_a_phrase_without_marks_of_its_own() {
+        let sad = Some("sad, quietly");
+        assert_eq!(
+            with_direction("Ну вот, всё готово.", sad),
+            "[sad, quietly] Ну вот, всё готово."
+        );
+        // A direction of its own, wherever it stands in the line.
+        assert_eq!(with_direction("[sigh] Ну вот.", sad), "[sigh] Ну вот.");
+        assert_eq!(
+            with_direction("Ну вот. [sigh] Да.", sad),
+            "Ну вот. [sigh] Да."
+        );
+        // A tag, opened or only closed here.
+        assert_eq!(
+            with_direction("<whisper>Тихо.</whisper>", sad),
+            "<whisper>Тихо.</whisper>"
+        );
+        assert_eq!(
+            with_direction("Иди без меня.</whisper> Пока.", sad),
+            "Иди без меня.</whisper> Пока."
+        );
+        // Brackets that are no direction are words of the text.
+        assert_eq!(
+            with_direction("Смотри (1) тут.", sad),
+            "[sad, quietly] Смотри (1) тут."
+        );
+        assert_eq!(
+            with_direction("Смотри [1] тут.", sad),
+            "[sad, quietly] Смотри [1] тут."
+        );
+        // Only the first line is looked at, and only it gets the direction.
+        assert_eq!(
+            with_direction("Первая строка.\n[sigh] Вторая строка.", sad),
+            "[sad, quietly] Первая строка.\n[sigh] Вторая строка."
+        );
+        assert_eq!(
+            with_direction("[sigh] Первая строка.\nВторая строка.", sad),
+            "[sigh] Первая строка.\nВторая строка."
+        );
+        // A first line without words gets none.
+        for silent in ["", "...", "\nВторая строка.", " — "] {
+            assert_eq!(with_direction(silent, sad), silent, "{silent:?}");
+        }
+        // No direction, or one the voice would read aloud.
+        assert_eq!(with_direction("Ну вот.", None), "Ну вот.");
+        for bad in ["level 2", "a", "", "  ", "sad]", "файл.txt", "sad\nquietly"] {
+            assert_eq!(with_direction("Ну вот.", Some(bad)), "Ну вот.", "{bad:?}");
+        }
+        assert_eq!(
+            with_direction("Ну вот.", Some("  sad, quietly ")),
+            "[sad, quietly] Ну вот."
+        );
+    }
+
+    #[test]
+    fn every_mood_direction_is_read_back_as_a_direction() {
+        for emotion in Emotion::ALL {
+            let Some(direction) = emotion.direction() else {
+                continue;
+            };
+            let said = with_direction("Привет, как дела?", Some(direction));
+            let read = tokens(&said);
+            assert_eq!(read[0], Token::Direction(direction.to_string()), "{said}");
+            assert_eq!(read.len(), 2, "{said}");
+            // The words are the same, and nothing of the direction is shown.
+            assert_eq!(strip_marks(&said).trim(), "Привет, как дела?");
+            // Said twice, it is not added twice.
+            assert_eq!(with_direction(&said, Some(direction)), said);
+        }
+    }
+
+    #[test]
+    fn a_short_reply_is_one_voice_note_whole() {
+        assert_eq!(
+            voice_note("Завтра ясно, до плюс пяти. Зонт не нужен.", None, None).as_deref(),
+            Some("Завтра ясно, до плюс пяти. Зонт не нужен.")
+        );
+        // Markdown, links and emoji are not said; the lines become one.
+        assert_eq!(
+            voice_note(
+                "**Готово!** Файл `a.txt` тут: https://ya.ru/x?y=1 😀\n\n# Итог\nВсё на месте.",
+                None,
+                None
+            )
+            .as_deref(),
+            Some("Готово! Файл a.txt тут: ссылка Итог Всё на месте.")
+        );
+        // No words: nothing to say, so nothing is ordered.
+        for silent in ["", "  \n ", "😀 🎉", "```\n```", "...", "—"] {
+            assert_eq!(voice_note(silent, None, None), None, "{silent:?}");
+        }
+        assert_eq!(voice_note("Ответ.", Some("[sigh]"), None), None);
+        assert_eq!(
+            voice_note("Ответ.", Some("<whisper></whisper> 🎉"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_long_reply_gives_its_first_whole_phrases_and_points_to_the_text() {
+        let phrase = "Это предложение про погоду на завтра.";
+        let len = phrase.chars().count();
+        let reply = vec![phrase; 30].join(" ");
+        let fit = VOICE_NOTE_CHARS / len;
+        assert!(fit > 3 && fit < 30);
+        let mut expected = vec![phrase; fit];
+        expected.push(VOICE_NOTE_TAIL);
+        assert_eq!(
+            voice_note(&reply, None, None).as_deref(),
+            Some(expected.join(" ").as_str())
+        );
+        // A reply of exactly the limit is said whole, without the tail.
+        let exact = format!("{}.", "я".repeat(VOICE_NOTE_CHARS - 1));
+        assert_eq!(voice_note(&exact, None, None), Some(exact.clone()));
+
+        // One phrase longer than the limit is cut to it.
+        let endless = format!("{} конец.", "а".repeat(600));
+        assert_eq!(
+            voice_note(&endless, None, None),
+            Some(format!(
+                "{} {VOICE_NOTE_TAIL}",
+                "а".repeat(VOICE_NOTE_CHARS)
+            ))
+        );
+    }
+
+    #[test]
+    fn a_marked_voice_note_keeps_its_marks_balanced_and_a_phrase_per_line() {
+        let shown = "Иди без меня, я справлюсь. Я догоню тебя потом. Пока!";
+        let spoken =
+            "[sigh] <whisper>Иди без меня, я справлюсь. Я догоню тебя потом.</whisper> Пока!";
+        assert_eq!(
+            voice_note(shown, Some(spoken), None).as_deref(),
+            Some(
+                "[sigh] <whisper>Иди без меня, я справлюсь.</whisper>\n\
+<whisper>Я догоню тебя потом.</whisper>\n\
+Пока!"
+            )
+        );
+        // The text between the marks is cleaned as for the speaker.
+        assert_eq!(
+            voice_note(
+                "x",
+                Some("[softly] **Готово!** Смотри https://ya.ru/x 😀"),
+                None
+            )
+            .as_deref(),
+            Some("[softly] Готово! Смотри ссылка")
+        );
+
+        // A long one: whole phrases by the count of their words, then the tail.
+        let phrase = "<soft>Это предложение про погоду на завтра.</soft>";
+        let words = "Это предложение про погоду на завтра.".chars().count();
+        let spoken = vec![phrase; 30].join(" ");
+        let fit = VOICE_NOTE_CHARS / words;
+        let mut expected = vec![phrase; fit];
+        expected.push(VOICE_NOTE_TAIL);
+        let note = voice_note("x", Some(&spoken), None).unwrap();
+        assert_eq!(note, expected.join("\n"));
+        assert_eq!(
+            note.matches("<soft>").count(),
+            note.matches("</soft>").count()
+        );
+
+        // One marked phrase longer than the limit is cut by its words, its tag closed.
+        let endless = format!("<soft>{} конец.</soft>", "а".repeat(600));
+        assert_eq!(
+            voice_note("x", Some(&endless), None),
+            Some(format!(
+                "<soft>{}</soft>\n{VOICE_NOTE_TAIL}",
+                "а".repeat(VOICE_NOTE_CHARS)
+            ))
+        );
+    }
+
+    #[test]
+    fn the_marks_of_a_voice_note_have_a_limit_of_their_own() {
+        let direction = "[softly, with a long and heavy sigh] ";
+        // Three words under thousands of characters of marks: the words alone.
+        let heavy = format!("{}Да.", direction.repeat(300));
+        assert!(heavy.chars().count() > 10_000);
+        assert_eq!(
+            voice_note("Да.", Some(&heavy), None).as_deref(),
+            Some("Да.")
+        );
+
+        // Many short phrases, each with a direction: the first keep theirs,
+        // the rest are said plainly, and nothing of the words is lost.
+        let many = format!("{direction}Вот так вот. ").repeat(30);
+        let note = voice_note("x", Some(&many), None).unwrap();
+        let kept = note.matches("[softly").count();
+        assert_eq!(kept, VOICE_NOTE_MARKS / direction.chars().count());
+        assert_eq!(note.matches("Вот так вот.").count(), 30);
+        assert!(
+            note.chars().count() <= VOICE_NOTE_CHARS + VOICE_NOTE_MARKS + 30,
+            "{}",
+            note.chars().count()
+        );
+
+        // One endless phrase whose marks alone pass the limit: its words, cut.
+        let endless = format!("{}{} конец.", direction.repeat(40), "а".repeat(600));
+        assert_eq!(
+            voice_note("x", Some(&endless), None),
+            Some(format!(
+                "{}\n{VOICE_NOTE_TAIL}",
+                "а".repeat(VOICE_NOTE_CHARS)
+            ))
+        );
+
+        // Words that only look like a mark stay harmless without the marks.
+        let tricky = format!("{}Смотри [1] и <2>.", direction.repeat(40));
+        assert_eq!(
+            voice_note("x", Some(&tricky), None).as_deref(),
+            Some("Смотри (1) и 2.")
+        );
+    }
+
+    #[test]
+    fn the_mood_direction_leads_the_first_line_of_a_voice_note() {
+        let joy = Some("cheerful, with a smile");
+        assert_eq!(
+            voice_note("Ну вот. Всё готово, смотри.", None, joy).as_deref(),
+            Some("[cheerful, with a smile] Ну вот. Всё готово, смотри.")
+        );
+        // A first line the model marked itself keeps its own direction.
+        assert_eq!(
+            voice_note("x", Some("[sigh] Ну вот, всё готово."), joy).as_deref(),
+            Some("[sigh] Ну вот, всё готово.")
+        );
+        // Only the first line gets it.
+        assert_eq!(
+            voice_note(
+                "x",
+                Some("Ну вот, всё готово. [sigh] Смотри сам, пожалуйста."),
+                joy
+            )
+            .as_deref(),
+            Some("[cheerful, with a smile] Ну вот, всё готово.\n[sigh] Смотри сам, пожалуйста.")
+        );
+        // Nothing to say stays nothing.
+        assert_eq!(voice_note("😀", None, joy), None);
+    }
+
+    /// A voice that only remembers the direction source it was given.
+    #[derive(Default)]
+    struct DirectedVoice {
+        direction: Mutex<Option<DirectionSource>>,
+    }
+
+    impl Voice for DirectedVoice {
+        fn speak(&self, _text: &str) {}
+        fn stop(&self) {}
+        fn voices(&self) -> Vec<VoiceInfo> {
+            Vec::new()
+        }
+        fn configure(&self, _voice: &str, _rate: f32) {}
+        fn set_direction(&self, direction: Option<DirectionSource>) {
+            *self.direction.lock() = direction;
+        }
+    }
+
+    #[test]
+    fn a_wrapped_voice_passes_the_direction_source_on() {
+        let inner = Arc::new(DirectedVoice::default());
+        let voice = SpeakerSwitch::new(true).wrap(inner.clone());
+        voice.set_direction(Some(Arc::new(|| Some("sad, quietly".to_string()))));
+        let got = inner.direction.lock().clone().expect("passed on");
+        assert_eq!(got().as_deref(), Some("sad, quietly"));
+        voice.set_direction(None);
+        assert!(inner.direction.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_speaker_itself_adds_no_direction() {
+        // The direction is the business of the voice that asks the remote
+        // synthesizer: what the speaker hands over is the same as before.
+        let bus = EventBus::new(64);
+        let inner = Arc::new(FakeVoice::default());
+        let voice = SpeakerSwitch::new(true).wrap(inner.clone());
+        voice.set_direction(Some(Arc::new(|| Some("sad, quietly".to_string()))));
+        let job = tokio::spawn(run_speaker(bus.clone(), voice, SpeakerSwitch::new(true)));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        bus.publish(marked_text(
+            "Хорошо, договорились на завтра. До встречи утром!",
+            "[warmly] Хорошо, договорились на завтра. <soft>До встречи утром!</soft> [sigh]",
+        ));
+        bus.publish(Event::AssistantText {
+            text: "Завтра ясно.".into(),
+            spoken: None,
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        job.abort();
+        assert_eq!(
+            *inner.marked.lock(),
+            [
+                pair(
+                    "[warmly] Хорошо, договорились на завтра.",
+                    "Хорошо, договорились на завтра."
+                ),
+                pair(
+                    "[warmly] <soft>До встречи утром!</soft>",
+                    "До встречи утром!"
+                ),
+            ]
+        );
+        assert_eq!(*inner.said.lock(), ["Завтра ясно."]);
     }
 }

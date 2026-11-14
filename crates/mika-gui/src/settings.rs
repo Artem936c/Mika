@@ -336,6 +336,134 @@ pub fn set_news_feed(ctx: CtxState<'_>, value: String) -> Result<(), String> {
     ctx.save_config()
 }
 
+// ---- ffmpeg ----
+
+/// Which FFmpeg the video and sound tools would run now, and the downloaded copy.
+#[derive(serde::Serialize)]
+pub struct FfmpegView {
+    found: bool,
+    /// `settings`, `path` or `downloaded`.
+    source: Option<&'static str>,
+    /// ffmpeg.exe that runs, or empty.
+    path: String,
+    version: String,
+    /// The build is GPL: Mika still runs it only as a separate program.
+    gpl: bool,
+    setting: String,
+    /// The saved path holds no ffmpeg.exe with ffprobe.exe next to it.
+    setting_invalid: bool,
+    downloaded: bool,
+    downloading: bool,
+    bytes: u64,
+    download_mb: u32,
+}
+
+/// Looks on disk and asks `ffmpeg -version`, off the async threads.
+async fn ffmpeg_view(ctx: &Ctx) -> Result<FfmpegView, String> {
+    let setting = ctx.config.lock().tools.ffmpeg_path.clone();
+    tauri::async_runtime::spawn_blocking(move || ffmpeg_view_now(setting))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn ffmpeg_view_now(setting: String) -> FfmpegView {
+    let status = mika_tools::ffmpeg::status(&setting);
+    let version = status
+        .paths
+        .as_ref()
+        .and_then(|p| match mika_tools::ffmpeg::version(p) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                log::warn!("ffmpeg -version failed: {e}");
+                None
+            }
+        });
+    FfmpegView {
+        found: status.paths.is_some(),
+        source: status.paths.as_ref().map(|p| p.source.as_str()),
+        path: status
+            .paths
+            .as_ref()
+            .map(|p| p.ffmpeg.display().to_string())
+            .unwrap_or_default(),
+        version: version
+            .as_ref()
+            .map(|v| v.version.clone())
+            .unwrap_or_default(),
+        gpl: version.is_some_and(|v| v.gpl),
+        setting,
+        setting_invalid: status.setting_invalid,
+        downloaded: crate::ffmpeg_get::installed(),
+        downloading: crate::ffmpeg_get::downloading(),
+        bytes: crate::ffmpeg_get::size(),
+        download_mb: crate::ffmpeg_get::DOWNLOAD_MB,
+    }
+}
+
+#[tauri::command]
+pub async fn get_ffmpeg_status(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<FfmpegView, String> {
+    ffmpeg_view(&ctx).await
+}
+
+/// Saves the path to the user's own FFmpeg. A path without ffmpeg.exe is kept
+/// and shown as such: the tools search PATH and the downloaded copy meanwhile.
+#[tauri::command]
+pub async fn set_ffmpeg_path(
+    ctx: tauri::State<'_, Arc<Ctx>>,
+    value: String,
+) -> Result<FfmpegView, String> {
+    let value = value.trim().to_string();
+    ctx.config.lock().tools.ffmpeg_path = value.clone();
+    *ctx.ffmpeg_path.write() = value;
+    ctx.save_config()?;
+    ffmpeg_view(&ctx).await
+}
+
+/// Downloads FFmpeg on the user's press, in the settings or on the chat card.
+/// Progress goes to the window as `ffmpeg-progress` with the share done.
+#[tauri::command]
+pub async fn install_ffmpeg(
+    app: AppHandle,
+    ctx: tauri::State<'_, Arc<Ctx>>,
+) -> Result<FfmpegView, String> {
+    use tauri::Emitter;
+    let last = std::sync::atomic::AtomicU8::new(u8::MAX);
+    crate::ffmpeg_get::install(move |share| {
+        if last.swap(share, std::sync::atomic::Ordering::Relaxed) != share {
+            let _ = app.emit("ffmpeg-progress", share);
+        }
+    })
+    .await?;
+    ffmpeg_view(&ctx).await
+}
+
+/// Deletes the copy Mika downloaded; the user's own FFmpeg stays.
+#[tauri::command]
+pub async fn remove_ffmpeg(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<FfmpegView, String> {
+    tauri::async_runtime::spawn_blocking(crate::ffmpeg_get::remove)
+        .await
+        .map_err(|e| e.to_string())??;
+    ffmpeg_view(&ctx).await
+}
+
+/// Opens a file a video or sound tool wrote, or shows it in its folder. Other
+/// paths are refused: the window cannot open arbitrary files through this.
+#[tauri::command]
+pub fn open_av_file(ctx: CtxState<'_>, path: String, reveal: bool) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    let p = std::path::PathBuf::from(&path);
+    if !ctx.av_outputs.contains(&p) || !p.is_file() {
+        return Err(crate::strings::tr("error.av_file"));
+    }
+    let mut explorer = std::process::Command::new("explorer.exe");
+    if reveal {
+        explorer.raw_arg(format!("/select,\"{}\"", p.display()));
+    } else {
+        explorer.arg(&p);
+    }
+    explorer.spawn().map(|_| ()).map_err(|e| e.to_string())
+}
+
 // ---- island ----
 
 #[derive(serde::Serialize)]
@@ -715,17 +843,54 @@ pub struct TelegramView {
     has_token: bool,
     /// off, on, no_token, no_owner.
     status: String,
+    /// Voice messages are recognised and run as commands (decision 0029).
+    voice_in: bool,
+    /// A voice message is answered with a voice message too.
+    voice_reply: bool,
+    /// A recognition model is set.
+    stt_ready: bool,
+    /// The provider speaks and has a speech model: a voice reply can be made.
+    tts_ready: bool,
+    /// FFmpeg is found: sound that comes as WAV still becomes a voice message.
+    ffmpeg_found: bool,
+    /// Longest voice message taken, seconds.
+    voice_max_s: u32,
+}
+
+/// The Telegram block of the settings as the window shows it.
+fn telegram_view(
+    config: &mika_core::config::Config,
+    has_token: bool,
+    status: String,
+    ffmpeg_found: bool,
+) -> TelegramView {
+    TelegramView {
+        enabled: config.telegram.enabled,
+        user_id: config.telegram.user_id,
+        has_token,
+        status,
+        voice_in: config.telegram.voice_in,
+        voice_reply: config.telegram.voice_reply,
+        stt_ready: !config.voice.stt_model.trim().is_empty(),
+        tts_ready: config.voice.provider_speaks(),
+        ffmpeg_found,
+        voice_max_s: mika_providers::telegram::voice::VOICE_MAX_S,
+    }
+}
+
+/// The view from what is saved now. Looks for FFmpeg on disk: file stats only.
+fn telegram_view_now(ctx: &Ctx) -> TelegramView {
+    let has_token = has_secret(ctx, TELEGRAM_SECRET_KEY);
+    let status = ctx.telegram_status.lock().clone();
+    let ffmpeg_setting = ctx.ffmpeg_path.read().clone();
+    let ffmpeg_found = mika_tools::ffmpeg::locate(&ffmpeg_setting).is_some();
+    let config = ctx.config.lock();
+    telegram_view(&config, has_token, status, ffmpeg_found)
 }
 
 #[tauri::command]
 pub fn get_telegram(ctx: CtxState<'_>) -> TelegramView {
-    let c = ctx.config.lock().telegram.clone();
-    TelegramView {
-        enabled: c.enabled,
-        user_id: c.user_id,
-        has_token: has_secret(&ctx, TELEGRAM_SECRET_KEY),
-        status: ctx.telegram_status.lock().clone(),
-    }
+    telegram_view_now(&ctx)
 }
 
 #[tauri::command]
@@ -745,6 +910,23 @@ pub fn save_telegram(
     let ctx: &Arc<Ctx> = &ctx;
     ctx.restart_telegram();
     Ok(ctx.telegram_status.lock().clone())
+}
+
+/// Voice messages in Telegram: taken or not, answered by voice or not
+/// (decision 0029). The bridge reads both at every message, so it is not restarted.
+#[tauri::command]
+pub fn set_telegram_voice(
+    ctx: CtxState<'_>,
+    voice_in: bool,
+    voice_reply: bool,
+) -> Result<TelegramView, String> {
+    {
+        let mut c = ctx.config.lock();
+        c.telegram.voice_in = voice_in;
+        c.telegram.voice_reply = voice_reply;
+    }
+    ctx.save_config()?;
+    Ok(telegram_view_now(&ctx))
 }
 
 /// Name of the bot behind the stored token.
@@ -893,6 +1075,8 @@ pub struct VoiceSettings {
     tts_expressive: bool,
     /// The saved speech model performs voice marks, like Drama 3.
     expressive_model: bool,
+    /// The switch of the direction by her mood (decision 0029).
+    mood_directions: bool,
 }
 
 /// A long reply retold briefly aloud, or read out whole.
@@ -908,6 +1092,14 @@ pub fn set_brief_speech(ctx: CtxState<'_>, value: bool) -> Result<(), String> {
 #[tauri::command]
 pub fn set_expressive_speech(ctx: CtxState<'_>, value: bool) -> Result<(), String> {
     ctx.config.lock().voice.tts_expressive = value;
+    ctx.save_config()
+}
+
+/// A phrase without marks of its own gets a direction by her mood
+/// (decision 0029). The voice reads the setting at every sentence.
+#[tauri::command]
+pub fn set_mood_directions(ctx: CtxState<'_>, value: bool) -> Result<(), String> {
+    ctx.config.lock().voice.mood_directions = value;
     ctx.save_config()
 }
 
@@ -955,9 +1147,7 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
         speak_replies: c.speak_replies,
         voice: c.voice,
         rate: c.rate,
-        has_russian: voices
-            .iter()
-            .any(|v| v.language.to_lowercase().starts_with("ru")),
+        has_russian: mika_audio::win::pick(&voices, "").is_some(),
         voices,
         tts: c.tts,
         tts_model: c.tts_model,
@@ -987,6 +1177,7 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
         brief_long: c.brief_long,
         tts_expressive: c.tts_expressive,
         expressive_model: marks_model,
+        mood_directions: c.mood_directions,
     })
 }
 
@@ -1099,6 +1290,8 @@ pub fn save_speech_settings(
     };
     ctx.set_input_device(&input_device);
     ctx.save_config()?;
+    // The automatic Windows voice follows the speech language (decision 0035).
+    crate::lang::pick_voice(&ctx);
     ctx.apply_voice_engine();
     Ok(marks_model)
 }
@@ -1423,5 +1616,78 @@ mod tests {
         };
         assert_eq!(marked, format!("[sigh] {}", "ё".repeat(293)));
         assert_eq!(plain, "ё".repeat(293));
+    }
+
+    #[test]
+    fn the_telegram_view_of_fresh_settings_has_voice_off() {
+        let config = mika_core::config::Config::default();
+        let view = telegram_view(&config, false, "off".into(), false);
+        assert!(!view.enabled && !view.has_token);
+        assert_eq!(view.user_id, 0);
+        assert_eq!(view.status, "off");
+        assert!(!view.voice_in && !view.voice_reply);
+        assert!(!view.stt_ready && !view.tts_ready && !view.ffmpeg_found);
+        assert_eq!(view.voice_max_s, 120);
+    }
+
+    #[test]
+    fn the_telegram_view_tells_what_voice_messages_can_use() {
+        let mut config = mika_core::config::Config::default();
+        config.telegram.enabled = true;
+        config.telegram.user_id = 123_456_789;
+        config.voice.stt_model = "qwen/qwen3-asr-0.6b".into();
+        // The window reads exactly these names.
+        assert_eq!(
+            serde_json::to_value(telegram_view(&config, true, "on".into(), false)).unwrap(),
+            serde_json::json!({
+                "enabled": true,
+                "user_id": 123_456_789,
+                "has_token": true,
+                "status": "on",
+                "voice_in": false,
+                "voice_reply": false,
+                "stt_ready": true,
+                "tts_ready": false,
+                "ffmpeg_found": false,
+                "voice_max_s": 120,
+            })
+        );
+
+        config.telegram.voice_in = true;
+        config.telegram.voice_reply = true;
+        config.voice.tts = TtsEngine::Provider;
+        config.voice.tts_model = "fish-audio/drama-3".into();
+        let view = telegram_view(&config, true, "on".into(), true);
+        assert!(view.voice_in && view.voice_reply);
+        assert!(view.stt_ready && view.tts_ready && view.ffmpeg_found);
+
+        // The switches are shown as saved, whatever the voice can do.
+        config.voice.tts = TtsEngine::Windows;
+        let view = telegram_view(&config, true, "on".into(), true);
+        assert!(view.voice_in && view.voice_reply && !view.tts_ready);
+        // A provider voice without a model makes no voice message either.
+        config.voice.tts = TtsEngine::Provider;
+        config.voice.tts_model = "  ".into();
+        config.voice.stt_model = " ".into();
+        let view = telegram_view(&config, true, "on".into(), true);
+        assert!(!view.tts_ready && !view.stt_ready);
+    }
+
+    #[test]
+    fn the_texts_of_the_telegram_voice_switches_name_the_real_limits() {
+        use mika_providers::telegram::voice::VOICE_FRESH_S;
+        let taken = crate::strings::tr("ext.tg_voice_in_sub");
+        assert!(
+            taken.contains(&format!("больше {} минут назад", VOICE_FRESH_S / 60)),
+            "{taken}"
+        );
+        let said = crate::strings::tr("ext.tg_voice_reply_sub");
+        assert!(
+            said.contains(&format!(
+                "не больше {} знаков",
+                mika_audio::speech::VOICE_NOTE_CHARS
+            )),
+            "{said}"
+        );
     }
 }

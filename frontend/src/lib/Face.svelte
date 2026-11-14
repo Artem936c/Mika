@@ -6,8 +6,10 @@
   import Icon from './Icon.svelte';
   import type { Emotion } from './avatar';
   import { countdown, speakWords, toolLabel } from './chat';
+  import type { DictationPhase } from './hotkeys';
   import { t } from './i18n';
   import { stateLabel, type AssistantState } from './island';
+  import { dateLocale } from './locale.svelte';
 
   let {
     status,
@@ -20,6 +22,7 @@
     weather = null,
     timer = null,
     track = null,
+    dictation = null,
     onspeak,
   }: {
     status: AssistantState;
@@ -38,6 +41,8 @@
     timer?: { due_at: number; text: string } | null;
     /** What plays now in the user's player. */
     track?: { title: string; artist: string } | null;
+    /** Where a dictation into another program is; null when none runs. */
+    dictation?: DictationPhase | null;
     onspeak: (v: boolean) => void;
   } = $props();
 
@@ -46,7 +51,7 @@
   onMount(() => {
     const tick = () => {
       now = Date.now();
-      clock = new Date(now).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+      clock = new Date(now).toLocaleTimeString(dateLocale(), { hour: '2-digit', minute: '2-digit' });
     };
     tick();
     const id = setInterval(tick, 1000);
@@ -84,12 +89,12 @@
   <div class="rowl">
     <Avatar view="head" {emotion} size={36} />
     <Bars count={26} />
-    <span class="end">{t(stateLabel('listening'))}</span>
+    <span class="end">{t(dictation ? 'dictation.island' : stateLabel('listening'))}</span>
   </div>
 {:else if status === 'thinking'}
   <div class="rowl">
     <Avatar view="head" {emotion} size={36} />
-    <span class="shim">{work || t('face.thinking')}</span>
+    <span class="shim">{work || t(dictation === 'typing' ? 'dictation.typing' : dictation ? 'dictation.recognising' : 'face.thinking')}</span>
     <span class="grow"></span>
     {#if tool}
       <span class="tool"><Icon name="wrench" size={12} />{t(toolLabel(tool))}</span>

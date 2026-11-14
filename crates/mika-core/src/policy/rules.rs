@@ -152,10 +152,22 @@ impl RuleStore {
     }
 
     /// A matching deny wins over a matching allow.
+    ///
+    /// A deny is a pattern: its `*` matches anything. An allow covers only
+    /// the very scope it was given for, letter case aside: the rule `*`
+    /// covers the calls whose own scope is `*`, and never the calls of a
+    /// tool that names what it touches (a folder sent to paid recognition, a
+    /// scenario with its limits). No such rule is made here (`forever_block`),
+    /// but a backup from elsewhere can bring one, and a permanent allow must
+    /// never cover more than the question it was given for showed.
     pub fn find(&self, tool: &str, scope: &str) -> Result<Option<RuleDecision>, PolicyError> {
+        let covers = |r: &Rule| match r.decision {
+            RuleDecision::Deny => pattern_matches(&r.pattern, scope),
+            RuleDecision::Allow => r.pattern.to_lowercase() == scope.to_lowercase(),
+        };
         let mut found = None;
         for r in self.list()?.into_iter().filter(|r| r.tool == tool) {
-            if pattern_matches(&r.pattern, scope) {
+            if covers(&r) {
                 if r.decision == RuleDecision::Deny {
                     return Ok(Some(RuleDecision::Deny));
                 }
@@ -244,8 +256,10 @@ mod tests {
     #[test]
     fn deny_beats_allow() {
         let s = store();
-        s.add("run_shell", "*", RuleDecision::Allow, RiskLevel::Medium)
-            .unwrap();
+        for scope in ["get-process -name x", "whoami"] {
+            s.add("run_shell", scope, RuleDecision::Allow, RiskLevel::Medium)
+                .unwrap();
+        }
         // Written as a deny, so wildcards are allowed.
         s.add(
             "run_shell",
@@ -261,6 +275,52 @@ mod tests {
         assert_eq!(
             s.find("run_shell", "whoami").unwrap(),
             Some(RuleDecision::Allow)
+        );
+    }
+
+    #[test]
+    fn an_allow_covers_only_the_scope_it_was_given_for() {
+        let s = store();
+        // A tool without a scope of its own: every call has the scope `*`.
+        s.add("get_time", "*", RuleDecision::Allow, RiskLevel::Low)
+            .unwrap();
+        assert_eq!(s.find("get_time", "*").unwrap(), Some(RuleDecision::Allow));
+        // A rule `*` that came from elsewhere (a backup) for tools that name
+        // what they touch. Here it cannot even be made: the scope of a whole
+        // folder holds a `*` on purpose.
+        s.db.with(|c| {
+            c.execute_batch(
+                "INSERT INTO rules (tool, pattern, decision, created_at) VALUES
+                    ('av_folder', '*', 'allow', 'd'),
+                    ('trigger_create', '*', 'allow', 'd'),
+                    ('write_file', 'c:/users/me/*', 'allow', 'd');",
+            )
+        })
+        .unwrap();
+        for (tool, scope) in [
+            ("av_folder", r"transcribe:c:\\videos\\*"),
+            ("av_folder", "compress:c:/videos"),
+            (
+                "trigger_create",
+                "morning|app_started|code.exe|0123456789abcdef|60|20",
+            ),
+            ("write_file", "c:/users/me/notes.txt"),
+            ("write_file", "c:/users/me/"),
+        ] {
+            assert_eq!(s.find(tool, scope).unwrap(), None, "{tool} {scope}");
+        }
+        // An allow with a `*` inside covers the scope that is that very text
+        // and nothing else; the letter case does not matter, as before.
+        assert_eq!(
+            s.find("write_file", "C:/Users/Me/*").unwrap(),
+            Some(RuleDecision::Allow)
+        );
+        // A deny stays a pattern.
+        s.add("av_folder", "*", RuleDecision::Deny, RiskLevel::Medium)
+            .unwrap();
+        assert_eq!(
+            s.find("av_folder", "compress:c:/videos").unwrap(),
+            Some(RuleDecision::Deny)
         );
     }
 

@@ -93,6 +93,22 @@ impl Emotion {
         })
     }
 
+    /// The mood as a direction for a voice that performs marks (decision 0029).
+    /// Every value fits `marks::is_direction`.
+    pub fn direction(self) -> Option<&'static str> {
+        Some(match self {
+            Emotion::Neutral | Emotion::Think => return None,
+            Emotion::Joy => "cheerful, with a smile",
+            Emotion::Wink => "playful, teasing",
+            Emotion::Surprise => "surprised, lively",
+            Emotion::Shy => "shy, softly",
+            Emotion::Sad => "sad, quietly",
+            Emotion::Sleepy => "sleepy, slowly",
+            Emotion::Worry => "worried, serious",
+            Emotion::Angry => "annoyed, firmly",
+        })
+    }
+
     /// Slot name from a reply tag: the English slot name or its Russian word, any case.
     pub fn from_tag(tag: &str) -> Option<Emotion> {
         let t = tag.trim().to_lowercase();
@@ -539,6 +555,37 @@ mod tests {
         for e in Emotion::ALL {
             let (pitch, rate) = e.prosody();
             assert!(pitch.abs() <= 20 && rate.abs() <= 20, "{e:?}");
+        }
+    }
+
+    #[test]
+    fn every_mood_has_a_direction_the_voice_reads_as_one() {
+        use crate::marks::{is_direction, tokens, Token, MAX_DIRECTION};
+        assert_eq!(Emotion::Neutral.direction(), None);
+        assert_eq!(Emotion::Think.direction(), None);
+        let mut seen = Vec::new();
+        for e in Emotion::ALL {
+            let Some(d) = e.direction() else {
+                assert!(matches!(e, Emotion::Neutral | Emotion::Think), "{e:?}");
+                continue;
+            };
+            assert!(is_direction(d), "{d}");
+            // The settings text promises at most 25 characters per phrase.
+            assert!(d.chars().count() + 3 <= 25, "{d}");
+            assert!(d.chars().count() <= MAX_DIRECTION);
+            // The parser of decision 0026 reads it as a direction, not as text.
+            let read = tokens(&format!("[{d}] Привет"));
+            assert_eq!(read[0], Token::Direction(d.to_string()), "{d}");
+            assert_eq!(read[1], Token::Text(" Привет".into()), "{d}");
+            // Not an emotion tag: the face is not changed by her own direction.
+            assert!(Emotion::from_tag(d).is_none(), "{d}");
+            assert!(!seen.contains(&d), "{d} twice");
+            seen.push(d);
+        }
+        assert_eq!(seen.len(), 8);
+        // A mood with a tone line has a direction and the other way round.
+        for e in Emotion::ALL {
+            assert_eq!(e.direction().is_some(), e.tone_line().is_some(), "{e:?}");
         }
     }
 

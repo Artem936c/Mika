@@ -3,14 +3,18 @@
   // looks or goes online stays off until the user turns it on here or later.
   import { invoke } from '@tauri-apps/api/core';
   import Avatar from './Avatar.svelte';
+  import LanguagePicker from './LanguagePicker.svelte';
   import Switch from './Switch.svelte';
   import { dragRegion } from './drag';
   import { t } from './i18n';
+  import Backup from './settings/Backup.svelte';
   import Providers from './settings/Providers.svelte';
 
   let { name, ondone }: { name: string; ondone: () => void } = $props();
 
   let step = $state(0);
+  // «I have a copy from another PC»: the restore block instead of the steps.
+  let restoring = $state(false);
   let web = $state(false);
   let screen = $state(false);
   let mic = $state(false);
@@ -71,10 +75,17 @@
       <li class:on={step === 0}>{t('welcome.step_provider')}</li>
       <li class:on={step === 1}>{t('welcome.step_privacy')}</li>
     </ol>
+    <LanguagePicker {name} compact />
   </aside>
 
   <section class="page">
-    {#if step === 0}
+    {#if restoring}
+      <h3 use:dragRegion>{t('backup.title')}</h3>
+      <Backup {name} mode="import" />
+      <div class="nav">
+        <button class="link" onclick={() => (restoring = false)}>{t('backup.welcome_back')}</button>
+      </div>
+    {:else if step === 0}
       <h3 use:dragRegion>{t('welcome.step_provider')}</h3>
       <p class="lead">{t('welcome.provider_lead')}</p>
       <Providers />
@@ -86,7 +97,7 @@
         <Switch checked={screen} title={t('tools.screen')} sub={t('tools.screen_sub')} onchange={setScreen} />
         <Switch checked={mic} title={t('voice.mic')} sub={t('welcome.mic_sub')} onchange={setMic} />
         {#if mic}
-          <Switch checked={wake} title={t('voice.wake', { name })} sub={t('voice.wake_sub')} onchange={setWake} />
+          <Switch checked={wake} title={t('voice.wake', { name })} sub={t('voice.wake_sub', { name })} onchange={setWake} />
           <div class="row">
             <button class="bt" onclick={testMic} disabled={listening}>{t(listening ? 'welcome.say' : 'voice.mic_test')}</button>
             {#if heard}<span class="ok">{t('voice.heard', { text: heard })}</span>{/if}
@@ -94,17 +105,20 @@
         {/if}
       </div>
     {/if}
-    {#if note}<p class="err">{note}</p>{/if}
-    <div class="nav">
-      {#if step > 0}<button class="bt" onclick={() => (step -= 1)}>{t('welcome.back')}</button>{/if}
-      <span class="grow"></span>
-      <button class="link" onclick={finish}>{t('welcome.skip')}</button>
-      {#if step === 0}
-        <button class="bt pri" onclick={() => (step = 1)}>{t('welcome.next')}</button>
-      {:else}
-        <button class="bt pri" onclick={finish}>{t('welcome.done')}</button>
-      {/if}
-    </div>
+    {#if !restoring}
+      {#if note}<p class="err">{note}</p>{/if}
+      <div class="nav">
+        {#if step > 0}<button class="bt" onclick={() => (step -= 1)}>{t('welcome.back')}</button>{/if}
+        {#if step === 0}<button class="link" onclick={() => (restoring = true)}>{t('backup.welcome_link')}</button>{/if}
+        <span class="grow"></span>
+        <button class="link" onclick={finish}>{t('welcome.skip')}</button>
+        {#if step === 0}
+          <button class="bt pri" onclick={() => (step = 1)}>{t('welcome.next')}</button>
+        {:else}
+          <button class="bt pri" onclick={finish}>{t('welcome.done')}</button>
+        {/if}
+      </div>
+    {/if}
   </section>
 </div>
 

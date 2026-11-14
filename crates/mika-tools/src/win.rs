@@ -6,6 +6,7 @@ mod clipboard;
 mod http;
 mod input;
 mod launcher;
+pub mod locale;
 mod media;
 pub mod pdf;
 mod power;
@@ -14,6 +15,7 @@ mod radio;
 mod rdp;
 mod runner;
 mod screen;
+mod sensors;
 mod trash;
 mod uia;
 mod wnd;
@@ -52,6 +54,7 @@ impl ToolEnv {
             browser: Arc::new(browser::CdpBrowser::new(
                 mika_core::paths::data_dir().join("browser"),
             )),
+            sensors: Arc::new(sensors::WinSensors::new()),
             db,
             user_profile,
             shared,

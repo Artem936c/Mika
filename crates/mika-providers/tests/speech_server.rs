@@ -221,6 +221,57 @@ async fn provider_error_is_reported_without_the_key() {
 }
 
 #[tokio::test]
+async fn phrase_times_are_asked_and_a_refusal_means_none() {
+    let (base, request) = serve(
+        "200 OK",
+        "application/json",
+        r#"{"text":"Раз. Два.","segments":[{"start":0.0,"end":1.2,"text":" Раз."},{"start":"1.2","end":"2.5","text":"Два."}]}"#.into(),
+    )
+    .await;
+    let l = live(&base, |c| c.voice.stt_model = "whisper-1".into());
+    let segments = l
+        .transcribe_segments(b"RIFFfakewav")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(segments.len(), 2);
+    assert_eq!(
+        (segments[1].start, segments[1].text.as_str()),
+        (1.2, "Два.")
+    );
+    let req = request.await.unwrap();
+    assert!(contains(
+        &req,
+        "name=\"response_format\"\r\n\r\nverbose_json"
+    ));
+    assert!(contains(
+        &req,
+        "name=\"timestamp_granularities[]\"\r\n\r\nsegment"
+    ));
+
+    let (base, _request) = serve(
+        "400 Bad Request",
+        "application/json",
+        r#"{"error":{"message":"response_format verbose_json is not supported for this model"}}"#
+            .into(),
+    )
+    .await;
+    let l = live(&base, |c| c.voice.stt_model = "qwen/qwen3-asr-0.6b".into());
+    assert_eq!(l.transcribe_segments(b"RIFFfakewav").await, Ok(None));
+
+    let (base, _request) = serve(
+        "401 Unauthorized",
+        "application/json",
+        r#"{"error":{"message":"bad key sk-speech-secret"}}"#.into(),
+    )
+    .await;
+    let l = live(&base, |c| c.voice.stt_model = "whisper-1".into());
+    let err = l.transcribe_segments(b"RIFFfakewav").await.unwrap_err();
+    assert!(err.contains("распознавание ответило 401"), "{err}");
+    assert!(!err.contains("sk-speech-secret"), "{err}");
+}
+
+#[tokio::test]
 async fn nothing_is_sent_without_a_model() {
     let l = live("http://127.0.0.1:1/v1", |_| {});
     assert!(l.transcribe(b"x").await.unwrap_err().contains("не задана"));

@@ -106,6 +106,44 @@ const MIGRATIONS: &[&str] = &[
         embedding BLOB
     );
     CREATE INDEX doc_chunks_path ON doc_chunks(path);",
+    "CREATE TABLE cost_usage (
+        day TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        priced INTEGER NOT NULL,
+        currency TEXT NOT NULL,
+        requests INTEGER NOT NULL DEFAULT 0,
+        blind INTEGER NOT NULL DEFAULT 0,
+        tokens_in INTEGER NOT NULL DEFAULT 0,
+        tokens_cached INTEGER NOT NULL DEFAULT 0,
+        tokens_out INTEGER NOT NULL DEFAULT 0,
+        chars INTEGER NOT NULL DEFAULT 0,
+        seconds REAL NOT NULL DEFAULT 0,
+        images INTEGER NOT NULL DEFAULT 0,
+        cost REAL NOT NULL DEFAULT 0,
+        PRIMARY KEY (day, kind, provider, model, priced, currency)
+    );
+    CREATE TABLE cost_prices (
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        prices TEXT NOT NULL,
+        fetched_at INTEGER NOT NULL,
+        PRIMARY KEY (provider, model)
+    );
+    CREATE TABLE cost_alerts (
+        period TEXT PRIMARY KEY,
+        level INTEGER NOT NULL
+    );
+    CREATE TABLE day_log (
+        id INTEGER PRIMARY KEY,
+        at INTEGER NOT NULL,
+        day TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        text TEXT NOT NULL,
+        amount INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX day_log_day ON day_log(day, id);",
 ];
 
 /// Conversations put aside by "new conversation" get this prefix.
@@ -145,6 +183,12 @@ impl Db {
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> Result<T, DbError> {
         Ok(f(&self.conn.lock())?)
+    }
+
+    /// Like `with`, for callers with their own error type. The lock is not
+    /// re-entrant: never call `with` or `with_conn` inside the closure.
+    pub fn with_conn<T, E>(&self, f: impl FnOnce(&Connection) -> Result<T, E>) -> Result<T, E> {
+        f(&self.conn.lock())
     }
 
     pub fn append_message(&self, conversation: &str, msg: &ChatMessage) -> Result<(), DbError> {
@@ -327,5 +371,22 @@ mod tests {
             .append_message("c", &ChatMessage::user("x"))
             .unwrap();
         assert_eq!(Db::open(&p).unwrap().load_messages("c").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cost_and_day_log_tables_exist() {
+        let db = Db::open_in_memory().unwrap();
+        for table in ["cost_usage", "cost_prices", "cost_alerts", "day_log"] {
+            let n: i64 = db
+                .with(|c| {
+                    c.query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                        [table],
+                        |r| r.get(0),
+                    )
+                })
+                .unwrap();
+            assert_eq!(n, 1, "{table}");
+        }
     }
 }

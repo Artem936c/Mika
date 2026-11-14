@@ -47,8 +47,11 @@ pub enum Step {
 }
 
 /// Reads the SSE body in a task and exposes the chunks as a stream.
-/// Dropping the stream stops the task. A body that ends before `Step::Finished`
-/// is reported as a network error, because the answer was cut.
+/// Dropping the stream stops the task at once, also while the provider is
+/// silent or sends only events that give no chunk (reasoning, pings): the
+/// connection closes and the provider stops generating. A body that ends
+/// before `Step::Finished` is reported as a network error, because the answer
+/// was cut.
 pub fn sse_stream<H>(resp: reqwest::Response, key: Option<Secret>, mut handler: H) -> LlmStream
 where
     H: FnMut(SseEvent, &mut Vec<LlmChunk>) -> Result<Step, LlmError> + Send + 'static,
@@ -59,7 +62,12 @@ where
         let mut parser = SseParser::new();
         let mut out = Vec::new();
         loop {
-            let bytes = match body.next().await {
+            let next = tokio::select! {
+                // Nobody reads the answer any more.
+                _ = tx.closed() => return,
+                next = body.next() => next,
+            };
+            let bytes = match next {
                 Some(Ok(b)) => b,
                 Some(Err(e)) => {
                     let _ = tx.send(Err(network_error(e, key.as_ref()))).await;

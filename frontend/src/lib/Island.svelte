@@ -1,12 +1,14 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
   import { dragRegion } from './drag';
+  import { t } from './i18n';
   import type { IslandShape } from './island';
 
   let {
     shape,
     tone = 'none',
     movable = true,
+    recording = false,
     onclick,
     children,
   }: {
@@ -15,6 +17,8 @@
     movable?: boolean;
     /** `glow`: listening or thinking. `warn`: a question is open. `danger`: the question is about a high-risk action. */
     tone?: 'none' | 'glow' | 'warn' | 'danger';
+    /** The screen is being recorded: a red dot on the edge, whatever the island shows. */
+    recording?: boolean;
     onclick?: (e: MouseEvent) => void;
     children: Snippet;
   } = $props();
@@ -34,6 +38,9 @@
   <div class="island">
     {@render children()}
   </div>
+  {#if recording}
+    <span class="rec" role="img" title={t('rec.island_title')} aria-label={t('rec.island_title')}></span>
+  {/if}
 </div>
 
 <style>
@@ -114,8 +121,29 @@
     pointer-events: none;
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
   }
+  /* Screen recording: sits on the top edge near the right corner, over any content. */
+  .rec {
+    position: absolute;
+    top: -4px;
+    right: 24px;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: rgb(255, 59, 48);
+    box-shadow:
+      0 0 0 2px var(--island),
+      0 0 10px rgba(255, 59, 48, 0.8);
+    animation: rec 1.4s ease-in-out infinite;
+  }
+  @keyframes rec {
+    50% {
+      opacity: 0.45;
+      scale: 0.8;
+    }
+  }
   @media (prefers-reduced-motion: reduce) {
-    .ring {
+    .ring,
+    .rec {
       animation: none;
     }
   }

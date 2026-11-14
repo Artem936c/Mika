@@ -31,8 +31,9 @@ impl Renderer {
             self.in_reply = false;
             return out;
         }
-        // Only the speaker needs to know where a step of a reply begins.
-        if let Event::StepStarted = event {
+        // Only the speaker needs to know where a step of a reply begins;
+        // progress of a tool is for the chat's bar.
+        if let Event::StepStarted | Event::ToolProgress { .. } = event {
             return String::new();
         }
         let line = match event {
@@ -99,10 +100,20 @@ impl Renderer {
                     task.steps.len()
                 )
             }
+            Event::BgJobUpdated { job } => format!(
+                "[job] №{} {} {}% {}",
+                job.id,
+                job.state.as_str(),
+                job.share,
+                job.title
+            ),
             Event::EmotionCue { emotion } | Event::EmotionChanged { emotion } => {
                 format!("[emotion] {}", emotion.as_str())
             }
-            Event::AssistantDelta { .. } | Event::AssistantText { .. } | Event::StepStarted => {
+            Event::AssistantDelta { .. }
+            | Event::AssistantText { .. }
+            | Event::StepStarted
+            | Event::ToolProgress { .. } => {
                 unreachable!()
             }
         };
@@ -147,6 +158,24 @@ mod tests {
                 message: "x".into()
             }),
             "[error] x\n"
+        );
+        assert_eq!(
+            r.render(&Event::BgJobUpdated {
+                job: mika_core::bgjobs::JobView {
+                    id: 3,
+                    kind: "video_compress".into(),
+                    title: "Сжать «отпуск.mp4»".into(),
+                    state: mika_core::bgjobs::JobState::Running,
+                    live: false,
+                    share: 42,
+                    note: String::new(),
+                    text: String::new(),
+                    data: None,
+                    silent: false,
+                    remote: false,
+                }
+            }),
+            "[job] №3 running 42% Сжать «отпуск.mp4»\n"
         );
     }
 

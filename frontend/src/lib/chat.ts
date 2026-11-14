@@ -1,7 +1,10 @@
 // Chat items folded from bus events. Pure functions.
 
+import { listJobs, newestJob, parseJob, type JobView, type JobsSeen } from './bgjobs';
 import type { MessageKey } from './i18n';
+import { dateLocale } from './locale.svelte';
 import { TASK_TOOLS } from './task';
+import { costCard, dayCard, type CostReportData, type DaySummaryData } from './costs';
 
 export interface ChatItem {
   kind: 'user' | 'assistant' | 'tool' | 'error' | 'reminder' | 'timing';
@@ -20,6 +23,8 @@ export interface ChatItem {
   timings?: Timings;
   /** A timing row is drawn only once its reply has ended. */
   done?: boolean;
+  /** Share done of a running tool, 0..100, when the tool reports it. */
+  progress?: number;
 }
 
 /** Stages of a reply: speech to text, first piece of the answer, first sound. */
@@ -77,9 +82,55 @@ export interface ImageData {
   path: string;
 }
 
-export type CardData = WeatherData | VolumeData | ImageData;
+/** One file a video or sound tool wrote. */
+export interface AvFile {
+  path: string;
+  bytes: number;
+  /** Absent for text files: a transcript or subtitles. */
+  duration_s?: number;
+}
+
+/** Files a video or sound tool wrote. */
+export interface AvFilesData {
+  kind: 'av_files';
+  files: AvFile[];
+}
+
+/** A video or sound tool found no FFmpeg: the card offers to download it. */
+export interface FfmpegMissingData {
+  kind: 'ffmpeg_missing';
+}
+
+/** A background job: work that went on after the tool answered, or a screen recording. */
+export interface BgJobData {
+  kind: 'bg_job';
+  job: JobView;
+}
+
+/** The report of a deep search. */
+export interface ResearchReportData {
+  kind: 'research_report';
+  path: string;
+  title: string;
+  sources: number;
+  unread: number;
+  unsourced: number;
+  llm_calls: number;
+  tokens: number;
+  seconds: number;
+  /** Limits that cut the work short. */
+  limits: ('time' | 'tokens')[];
+}
+
+export type CardData = WeatherData | VolumeData | ImageData | AvFilesData | FfmpegMissingData | CostReportData | DaySummaryData | BgJobData | ResearchReportData;
 
 const num = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+function avFile(v: unknown): AvFile | null {
+  const f = obj(v);
+  if (!f || typeof f.path !== 'string' || !f.path || !num(f.bytes) || f.bytes < 0) return null;
+  return num(f.duration_s) && f.duration_s >= 0 ? { path: f.path, bytes: f.bytes, duration_s: f.duration_s } : { path: f.path, bytes: f.bytes };
+}
 
 function isWeatherDay(v: unknown): v is WeatherDay {
   const d = obj(v);
@@ -93,8 +144,40 @@ export function cardData(v: unknown): CardData | undefined {
   if (d.kind === 'volume' && num(d.level) && num(d.was)) {
     return { kind: 'volume', level: d.level, was: d.was };
   }
+  if (d.kind === 'cost_report') return costCard(d);
+  if (d.kind === 'day_summary') return dayCard(d);
   if (d.kind === 'image' && typeof d.path === 'string' && d.path) {
     return { kind: 'image', path: d.path };
+  }
+  if (d.kind === 'av_files' && Array.isArray(d.files)) {
+    const files = d.files.map(avFile);
+    if (files.length === 0 || files.some((f) => f === null)) return undefined;
+    return { kind: 'av_files', files: files as AvFile[] };
+  }
+  if (d.kind === 'bg_job') {
+    const job = parseJob(d.job);
+    return job ? { kind: 'bg_job', job } : undefined;
+  }
+  if (d.kind === 'ffmpeg_missing') {
+    return { kind: 'ffmpeg_missing' };
+  }
+  if (d.kind === 'research_report') {
+    const count = (v: unknown): v is number => num(v) && v >= 0;
+    if (typeof d.path !== 'string' || !d.path || typeof d.title !== 'string') return undefined;
+    if (!count(d.sources) || !count(d.llm_calls) || !count(d.tokens) || !count(d.seconds)) return undefined;
+    const limits = Array.isArray(d.limits) ? d.limits.filter((l): l is 'time' | 'tokens' => l === 'time' || l === 'tokens') : [];
+    return {
+      kind: 'research_report',
+      path: d.path,
+      title: d.title,
+      sources: d.sources,
+      unread: count(d.unread) ? d.unread : 0,
+      unsourced: count(d.unsourced) ? d.unsourced : 0,
+      llm_calls: d.llm_calls,
+      tokens: d.tokens,
+      seconds: d.seconds,
+      limits,
+    };
   }
   if (
     d.kind === 'weather' &&
@@ -121,6 +204,12 @@ function str(v: unknown): string | null {
 
 function finishStreaming(items: ChatItem[]): ChatItem[] {
   return items.map((it) => (it.kind === 'assistant' && it.pending ? { ...it, pending: false } : it));
+}
+
+/** The card of a finished tool: a failed one keeps only the offer to download FFmpeg. */
+function finishedCard(ok: boolean, data: unknown): CardData | undefined {
+  const card = cardData(data);
+  return ok || card?.kind === 'ffmpeg_missing' ? card : undefined;
 }
 
 export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
@@ -189,12 +278,37 @@ export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
       const ok = e.ok === true;
       const ms = typeof e.elapsed_ms === 'number' ? e.elapsed_ms : undefined;
       const idx = items.findIndex((it) => it.kind === 'tool' && it.id === id);
+      const data = finishedCard(ok, e.data);
       if (idx < 0) {
-        return [...items, { kind: 'tool', id, name, text: str(e.output) ?? name, ok, ms, data: ok ? cardData(e.data) : undefined }];
+        return [...items, { kind: 'tool', id, name, text: str(e.output) ?? name, ok, ms, data }];
       }
       const next = items.slice();
-      next[idx] = { ...next[idx], ok, ms, pending: false, data: ok ? cardData(e.data) : undefined };
+      next[idx] = { ...next[idx], ok, ms, pending: false, data, progress: undefined };
       return next;
+    }
+    case 'tool_progress': {
+      const id = str(e.id);
+      if (id === null || !num(e.share)) return items;
+      const idx = items.findIndex((it) => it.kind === 'tool' && it.id === id && it.pending);
+      if (idx < 0) return items;
+      const progress = Math.max(0, Math.min(100, Math.round(e.share)));
+      if (items[idx].progress === progress) return items;
+      const next = items.slice();
+      next[idx] = { ...next[idx], progress };
+      return next;
+    }
+    case 'bg_job_updated': {
+      // The whole state of a job: the card of that job is redrawn where it stands.
+      const job = parseJob(e.job);
+      if (!job) return items;
+      const data: BgJobData = { kind: 'bg_job', job };
+      let found = false;
+      const next = items.map((it) => {
+        if (it.kind !== 'tool' || it.data?.kind !== 'bg_job' || it.data.job.id !== job.id) return it;
+        found = true;
+        return { ...it, data };
+      });
+      return found ? next : items;
     }
     case 'state_changed':
       // A stopped reply never gets its final text: the cursor must not blink on.
@@ -279,6 +393,8 @@ const TOOL_GROUPS: Record<string, MessageKey> = {
   chat_watch: 'tool.message',
   focus_mode: 'tool.todo',
   calendar_events: 'tool.reminder',
+  day_summary: 'tool.day',
+  cost_report: 'tool.costs',
   screen_time: 'tool.system',
   clipboard_history: 'tool.clipboard',
   docs_search: 'tool.files',
@@ -293,6 +409,7 @@ const TOOL_GROUPS: Record<string, MessageKey> = {
   open_url: 'tool.web',
   fetch_page: 'tool.web',
   web_search: 'tool.search',
+  deep_search: 'tool.search',
   get_weather: 'tool.weather',
   get_time: 'tool.time',
   archive_create: 'tool.files',
@@ -328,12 +445,58 @@ const TOOL_GROUPS: Record<string, MessageKey> = {
   command_save: 'tool.command',
   command_list: 'tool.command',
   command_delete: 'tool.command',
+  trigger_create: 'tool.events',
+  trigger_list: 'tool.events',
+  trigger_delete: 'tool.events',
+  wait_for: 'tool.events',
+  wait_list: 'tool.events',
+  wait_stop: 'tool.events',
+  av_info: 'tool.av',
+  av_convert: 'tool.av',
+  video_compress: 'tool.av',
+  av_cut: 'tool.av',
+  av_join: 'tool.av',
+  video_gif: 'tool.av',
+  video_rotate: 'tool.av',
+  av_speed: 'tool.av',
+  audio_process: 'tool.av',
+  video_subtitles: 'tool.av',
+  av_transcribe: 'tool.av',
+  video_describe: 'tool.av',
+  av_folder: 'tool.av',
+  screen_record: 'tool.av',
+  screen_record_stop: 'tool.av',
+  bg_jobs: 'tool.av',
+  bg_job_stop: 'tool.av',
 };
 
 /** Short label of the tool group for the pill in the "thinking" island. */
 export function toolLabel(name: string): MessageKey {
   if (name.startsWith('mcp_')) return 'tool.extension';
   return Object.prototype.hasOwnProperty.call(TOOL_GROUPS, name) ? TOOL_GROUPS[name] : 'tool.other';
+}
+
+/** Megabytes of a file for a card: `48,7`, `245`, `0,3`. The unit comes from the locale file. */
+export function megabytes(bytes: number): string {
+  const mb = Math.max(0, bytes) / (1024 * 1024);
+  const digits = mb >= 100 ? 0 : 1;
+  return mb.toFixed(digits).replace('.', ',');
+}
+
+/** Length of a recording: `0:07`, `12:31`, `1:02:03`. */
+export function clock(seconds: number): string {
+  const total = Math.max(0, Math.round(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const two = (n: number) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${two(m)}:${two(s)}` : `${m}:${two(s)}`;
+}
+
+/** File name from a full Windows path. */
+export function baseName(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] ?? path;
 }
 
 /** Time left until `dueAt` (unix seconds): `9:41`, `1:05:00`, or nothing when it is over a day away. */
@@ -351,7 +514,7 @@ export function countdown(dueAt: number, nowMs: number): string {
 export function weekdayShort(date: string): string {
   const d = new Date(`${date}T12:00:00`);
   if (Number.isNaN(d.getTime())) return '';
-  const w = d.toLocaleDateString('ru-RU', { weekday: 'short' });
+  const w = d.toLocaleDateString(dateLocale(), { weekday: 'short' });
   return w.charAt(0).toUpperCase() + w.slice(1);
 }
 
@@ -370,6 +533,35 @@ export function fromHistory(history: unknown): ChatItem[] {
     .map(obj)
     .filter((h): h is Record<string, unknown> => !!h && (h.role === 'user' || h.role === 'assistant') && typeof h.text === 'string')
     .map((h) => ({ kind: h.role as 'user' | 'assistant', text: h.text as string }));
+}
+
+const hasJobCard = (items: ChatItem[], id: number) => items.some((it) => it.data?.kind === 'bg_job' && it.data.job.id === id);
+
+/** One finished tool row with a job card for every job of the list `bg_jobs_list` returns. */
+export function fromJobs(jobs: unknown): ChatItem[] {
+  return listJobs(jobs).map((job) => ({ kind: 'tool', id: `bgjob-${job.id}`, name: job.kind, text: job.title, ok: true, data: { kind: 'bg_job', job } }));
+}
+
+/** The chat with cards for the jobs of the list that have none yet: for a chat drawn anew while jobs run. */
+export function addJobs(items: ChatItem[], jobs: unknown): ChatItem[] {
+  const rows = fromJobs(jobs).filter((row) => row.data?.kind === 'bg_job' && !hasJobCard(items, row.data.job.id));
+  return rows.length > 0 ? [...items, ...rows] : items;
+}
+
+/**
+ * Job cards take the newer state of their job when an event told about it before
+ * the card came: the tool answers with the job as it was when it started.
+ */
+export function refreshJobs(items: ChatItem[], seen: JobsSeen): ChatItem[] {
+  let next: ChatItem[] | null = null;
+  items.forEach((it, i) => {
+    if (it.data?.kind !== 'bg_job') return;
+    const job = newestJob(it.data.job, seen);
+    if (job === it.data.job) return;
+    next ??= items.slice();
+    next[i] = { ...it, data: { kind: 'bg_job', job } };
+  });
+  return next ?? items;
 }
 
 export interface Segment {

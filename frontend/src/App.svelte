@@ -9,12 +9,26 @@
   import Settings from './lib/Settings.svelte';
   import Welcome from './lib/Welcome.svelte';
   import { isEmotion, reduceEmotion, type Emotion } from './lib/avatar';
-  import { fromHistory, reduceChat, type ChatItem } from './lib/chat';
-  import { reducePending, type Pending } from './lib/confirm';
+  import { listJobs, recordingOf, reduceJobsSeen, reduceRecording, type JobsSeen } from './lib/bgjobs';
+  import { addJobs, fromHistory, reduceChat, refreshJobs, type ChatItem } from './lib/chat';
+  import { reducePending, showsWhole, untranslated, type Pending } from './lib/confirm';
   import { selectionFrom, type Selection } from './lib/selection';
+  import {
+    dictationFrom,
+    hotkeyNoticeOf,
+    screenAskFrom,
+    screenAskGone,
+    screenAskLands,
+    showsNotice,
+    type DictationView,
+    type ScreenAsk,
+  } from './lib/hotkeys';
+  import { t } from './lib/i18n';
+  import { lang } from './lib/locale.svelte';
   import { reduceTask, type TaskView } from './lib/task';
   import {
     ISLAND_SHAPES,
+    confirmShape,
     noticeOf,
     opensChat,
     rectForShape,
@@ -75,19 +89,29 @@
   let tool = $state('');
   let pending = $state<Pending | null>(null);
   let selection = $state<Selection | null>(null);
+  let dictation = $state<DictationView | null>(null);
+  let screenAsk = $state<ScreenAsk | null>(null);
+  /** The notice answers a hotkey: it is shown at once, also while she is busy. */
+  let noticeUrgent = $state(false);
+  const noticing = $derived(showsNotice(current, notice, noticeUrgent));
   let task = $state<TaskView | null>(null);
   let needsSetup = $state(false);
+  /** Id of the screen recording that runs now. */
+  let recording = $state<number | null>(null);
+  /** Newest state of every background job the events told about. */
+  let jobsSeen: JobsSeen = {};
 
   // The state can say "awaiting" a moment before the question itself arrives.
   const faceState: AssistantState = $derived(
-    current === 'awaiting_confirm' ? 'thinking' : current === 'idle' && notice ? 'speaking' : current,
+    current === 'awaiting_confirm' ? 'thinking' : noticing ? 'speaking' : current,
+  );
+  // The island with the open question: as tall as its target needs, and by one
+  // more line when the card says that the description is still in Russian.
+  const asking: IslandShape | null = $derived(
+    pending ? confirmShape(pending.assessment.target, showsWhole(pending.tool), untranslated(pending, lang())) : null,
   );
   const shape: IslandShape = $derived(
-    view === 'island'
-      ? pending
-        ? ISLAND_SHAPES.awaiting_confirm
-        : ISLAND_SHAPES[faceState]
-      : viewShape(view, current, avatarInIsland),
+    view === 'island' ? (asking ?? ISLAND_SHAPES[faceState]) : viewShape(view, current, avatarInIsland),
   );
   const tone = $derived(
     pending
@@ -143,6 +167,18 @@
     }
   }
 
+  /** Cards for the background jobs that still run: the chat is drawn anew at start and after «new chat». */
+  async function loadJobs() {
+    try {
+      const list = listJobs(await invoke<unknown>('bg_jobs_list'), jobsSeen);
+      items = addJobs(items, list);
+      // What the events said since is newer than the list.
+      if (recording === null) recording = recordingOf(list);
+    } catch {
+      // Without the list the cards are missing; the jobs themselves go on.
+    }
+  }
+
   // Click-through rectangle follows the shape: union during the transition, then the new one (decision 0001).
   let lastShape: IslandShape | null = null;
   let settleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -162,6 +198,10 @@
     items = reduceChat(items, payload);
     pending = reducePending(pending, payload, Date.now());
     task = reduceTask(task, payload);
+    recording = reduceRecording(recording, payload);
+    // A job card comes with the answer of its tool, and an event of the job can be here before it.
+    jobsSeen = reduceJobsSeen(jobsSeen, payload);
+    items = refreshJobs(items, jobsSeen);
     const e = payload as { type?: string; text?: string; summary?: string; name?: string };
     if (e?.type === 'user_text') reply = '';
     if (e?.type === 'assistant_delta' && typeof e.text === 'string') reply += e.text;
@@ -177,11 +217,14 @@
     const noticed = noticeOf(payload);
     if (noticed !== null) {
       notice = noticed;
+      noticeUrgent = hotkeyNoticeOf(payload) !== null;
       clearTimeout(noticeTimer);
       noticeTimer = setTimeout(() => (notice = ''), NOTICE_MS);
     }
     if (e?.type === 'reminder_fired') loadIdle();
     if (e?.type === 'user_text') notice = '';
+    // A dictation never outlives the state it ran in, whatever became of its last message.
+    if (e?.type === 'state_changed' && current === 'idle') dictation = null;
   }
 
   async function loadUi() {
@@ -228,7 +271,9 @@
     invoke<unknown>('get_emotion').then((e) => {
       if (isEmotion(e)) emotion = e;
     });
-    invoke<unknown>('get_history').then((h) => (items = fromHistory(h)));
+    invoke<unknown>('get_history')
+      .then((h) => (items = fromHistory(h)))
+      .then(loadJobs);
     invoke<{ id: number; tool: string; assessment: unknown; allow_always: boolean } | null>('get_pending_confirm').then((p) => {
       if (p) pending = reducePending(null, { type: 'confirm_requested', ...p, timeout_s: 60 }, Date.now());
     });
@@ -245,6 +290,24 @@
         selection = picked;
         openPanel();
       }
+      const dictated = dictationFrom(e.payload);
+      if (dictated !== undefined) dictation = dictated;
+      const asked = screenAskFrom(e.payload);
+      if (asked && screenAskLands(view, needsSetup) === 'chat') {
+        screenAsk = asked;
+        // From the settings too: the card lives in the chat.
+        view = 'chat';
+      } else if (asked) {
+        // No chat to show the card in: the picture is not kept waiting unseen.
+        screenAsk = null;
+        invoke('screen_ask_cancel');
+        notice = t('screen_ask.err_setup');
+        noticeUrgent = true;
+        clearTimeout(noticeTimer);
+        noticeTimer = setTimeout(() => (notice = ''), NOTICE_MS);
+      }
+      // The app threw the picture away (five minutes, the screen switch or the action off).
+      if (screenAskGone(e.payload)) screenAsk = null;
       if (e.payload?.action === 'settings_changed') loadUi();
     }).then((u) => (unlistenUi = u));
 
@@ -321,8 +384,11 @@
       await invoke('stop');
       await invoke('clear_history');
       items = [];
+      loadJobs();
       reply = '';
       task = null;
+      screenAsk = null;
+      invoke('screen_ask_cancel');
     }}
     ontaskhide={() => (task = null)}
     onpoke={() => invoke('poke_avatar')}
@@ -338,11 +404,17 @@
       selection = null;
       invoke('selection_clear');
     }}
+    {screenAsk}
+    onscreenaskclose={() => (screenAsk = null)}
   />
 {/snippet}
 
 {#if windowed}
   <div class="win">
+    {#if recording !== null}
+      <!-- Without the island its red dot is drawn on the edge of the window, over whatever it shows. -->
+      <span class="winrec" role="img" title={t('rec.island_title')} aria-label={t('rec.island_title')}></span>
+    {/if}
     {#if view === 'welcome'}
       {@render welcomePanel()}
     {:else if view === 'settings'}
@@ -356,7 +428,7 @@
     <div class="edge {edge}" aria-hidden="true" onpointerdown={(e) => resizeFrom(edge, e)}></div>
   {/each}
 {:else}
-<Island {shape} {tone} movable={view === 'island'} onclick={onIslandClick}>
+<Island {shape} {tone} movable={view === 'island'} recording={recording !== null} onclick={onIslandClick}>
   {#if view === 'welcome'}
     <div class="layer" style={size(shape)} in:layerIn out:layerOut>
       {@render welcomePanel()}
@@ -369,8 +441,8 @@
     <div class="layer" style={size(shape)} in:layerIn out:layerOut>
       {@render chatPanel()}
     </div>
-  {:else if pending}
-    <div class="layer" style={size(ISLAND_SHAPES.awaiting_confirm)} in:layerIn out:layerOut>
+  {:else if pending && asking}
+    <div class="layer" style={size(asking)} in:layerIn out:layerOut>
       <ConfirmCard {pending} onanswer={answer} />
     </div>
   {:else}
@@ -379,7 +451,7 @@
         <Face
           status={faceState}
           {name}
-          reply={current === 'idle' && notice ? notice : reply}
+          reply={noticing ? notice : reply}
           {work}
           {tool}
           {emotion}
@@ -387,6 +459,7 @@
           weather={idle.weather}
           timer={idle.reminder}
           track={idle.track}
+          dictation={dictation?.phase ?? null}
           onspeak={setSpeak}
         />
       </div>
@@ -406,6 +479,33 @@
     border-radius: 14px;
     border: 1px solid var(--line2);
     background: var(--island);
+  }
+  /* Screen recording in the ordinary window: the dot of the island, on the top edge. */
+  .winrec {
+    position: absolute;
+    z-index: 5;
+    top: 5px;
+    left: 50%;
+    width: 9px;
+    height: 9px;
+    margin-left: -4.5px;
+    border-radius: 50%;
+    background: rgb(255, 59, 48);
+    box-shadow:
+      0 0 0 2px var(--island),
+      0 0 10px rgba(255, 59, 48, 0.8);
+    animation: winrec 1.4s ease-in-out infinite;
+  }
+  @keyframes winrec {
+    50% {
+      opacity: 0.45;
+      scale: 0.8;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .winrec {
+      animation: none;
+    }
   }
   .edge {
     position: fixed;

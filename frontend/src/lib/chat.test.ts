@@ -1,11 +1,18 @@
 import { describe, expect, it } from 'vitest';
+import type { JobView } from './bgjobs';
 import {
+  addJobs,
+  baseName,
   cardData,
+  clock,
   countdown,
   formatSeconds,
   fromHistory,
+  fromJobs,
   inlineMarkup,
+  megabytes,
   reduceChat,
+  refreshJobs,
   speakWords,
   tailWords,
   toolLabel,
@@ -232,6 +239,221 @@ describe('cardData', () => {
     ]);
     expect(items.map((it) => it.data)).toEqual([{ kind: 'volume', level: 40, was: 60 }, undefined, undefined]);
   });
+
+  it('accepts files of video and sound tools, with or without a length', () => {
+    const data = {
+      kind: 'av_files',
+      files: [
+        { path: 'C:\\v\\x (сжато).mp4', bytes: 52428800, duration_s: 75.2 },
+        { path: 'C:\\v\\x.srt', bytes: 1200 },
+      ],
+    };
+    expect(cardData(data)).toEqual(data);
+    expect(cardData({ kind: 'av_files', files: [{ path: 'C:\\a.mp3', bytes: 10, duration_s: 'long' }] })).toEqual({
+      kind: 'av_files',
+      files: [{ path: 'C:\\a.mp3', bytes: 10 }],
+    });
+  });
+
+  it('rejects broken files cards', () => {
+    expect(cardData({ kind: 'av_files', files: [] })).toBeUndefined();
+    expect(cardData({ kind: 'av_files', files: 'C:\\a.mp4' })).toBeUndefined();
+    expect(cardData({ kind: 'av_files', files: [{ path: '', bytes: 1 }] })).toBeUndefined();
+    expect(cardData({ kind: 'av_files', files: [{ path: 'C:\\a.mp4' }] })).toBeUndefined();
+    expect(cardData({ kind: 'av_files', files: [{ path: 'C:\\a.mp4', bytes: 1 }, null] })).toBeUndefined();
+  });
+
+  it('accepts the missing FFmpeg card', () => {
+    expect(cardData({ kind: 'ffmpeg_missing' })).toEqual({ kind: 'ffmpeg_missing' });
+  });
+
+  it('a failed tool keeps only the missing FFmpeg card', () => {
+    const files = { kind: 'av_files', files: [{ path: 'C:\\a.mp4', bytes: 1 }] };
+    const items = run([
+      { type: 'tool_started', id: 'c1', name: 'video_gif', summary: 'GIF' },
+      { type: 'tool_finished', id: 'c1', name: 'video_gif', ok: false, output: 'x', elapsed_ms: 3, data: { kind: 'ffmpeg_missing' } },
+      { type: 'tool_started', id: 'c2', name: 'av_cut', summary: 'Cut' },
+      { type: 'tool_finished', id: 'c2', name: 'av_cut', ok: false, output: 'x', elapsed_ms: 3, data: files },
+      { type: 'tool_finished', id: 'c3', name: 'av_join', ok: false, output: 'x', elapsed_ms: 3, data: { kind: 'ffmpeg_missing' } },
+      { type: 'tool_started', id: 'c4', name: 'av_cut', summary: 'Cut' },
+      { type: 'tool_finished', id: 'c4', name: 'av_cut', ok: true, output: 'x', elapsed_ms: 3, data: files },
+    ]);
+    expect(items.map((it) => it.data)).toEqual([{ kind: 'ffmpeg_missing' }, undefined, { kind: 'ffmpeg_missing' }, files]);
+  });
+});
+
+describe('tool_progress', () => {
+  it('sets the share on the running row with that id', () => {
+    const items = run([
+      { type: 'tool_started', id: 'c1', name: 'video_compress', summary: 'Сжать' },
+      { type: 'tool_started', id: 'c2', name: 'av_cut', summary: 'Вырезать' },
+      { type: 'tool_progress', id: 'c1', share: 42 },
+    ]);
+    expect(items.map((it) => it.progress)).toEqual([42, undefined]);
+  });
+
+  it('clamps and rounds the share', () => {
+    const start = run([{ type: 'tool_started', id: 'c1', name: 'av_speed', summary: 'x' }]);
+    expect(run([{ type: 'tool_progress', id: 'c1', share: 140 }], start)[0].progress).toBe(100);
+    expect(run([{ type: 'tool_progress', id: 'c1', share: 33.6 }], start)[0].progress).toBe(34);
+  });
+
+  it('ignores unknown ids, finished rows and broken shares', () => {
+    const start = run([
+      { type: 'tool_started', id: 'c1', name: 'av_cut', summary: 'x' },
+      { type: 'tool_finished', id: 'c1', name: 'av_cut', ok: true, output: 'x', elapsed_ms: 3 },
+      { type: 'tool_started', id: 'c2', name: 'av_cut', summary: 'y' },
+    ]);
+    expect(run([{ type: 'tool_progress', id: 'c1', share: 50 }], start)).toBe(start);
+    expect(run([{ type: 'tool_progress', id: 'c9', share: 50 }], start)).toBe(start);
+    expect(run([{ type: 'tool_progress', id: 'c2', share: '50' }], start)).toBe(start);
+    expect(run([{ type: 'tool_progress', share: 50 }], start)).toBe(start);
+  });
+
+  it('the share goes away when the tool finishes', () => {
+    const items = run([
+      { type: 'tool_started', id: 'c1', name: 'video_compress', summary: 'x' },
+      { type: 'tool_progress', id: 'c1', share: 90 },
+      { type: 'tool_finished', id: 'c1', name: 'video_compress', ok: true, output: 'x', elapsed_ms: 3 },
+    ]);
+    expect(items[0].progress).toBeUndefined();
+    expect(items[0].pending).toBe(false);
+  });
+});
+
+describe('file cards', () => {
+  it('formats megabytes, lengths and names', () => {
+    expect(megabytes(51_065_000)).toBe('48,7');
+    expect(megabytes(256_901_120)).toBe('245');
+    expect(megabytes(300_000)).toBe('0,3');
+    expect(clock(7.4)).toBe('0:07');
+    expect(clock(751.2)).toBe('12:31');
+    expect(clock(3723.4)).toBe('1:02:03');
+    expect(baseName('C:\\Users\\me\\Videos\\x (сжато).mp4')).toBe('x (сжато).mp4');
+    expect(baseName('\\\\server\\share\\a.mp3')).toBe('a.mp3');
+  });
+
+  it('labels video and sound tools', () => {
+    expect(toolLabel('video_compress')).toBe('tool.av');
+    expect(toolLabel('av_transcribe')).toBe('tool.av');
+    expect(isMessageKey(toolLabel('av_info'))).toBe(true);
+  });
+
+  it('labels folders, recording and background jobs as video and sound', () => {
+    for (const name of ['av_folder', 'screen_record', 'screen_record_stop', 'bg_jobs', 'bg_job_stop']) {
+      expect(toolLabel(name), name).toBe('tool.av');
+    }
+  });
+});
+
+describe('background jobs', () => {
+  const job = (over: Partial<JobView> = {}): JobView => ({
+    id: 3,
+    kind: 'video_compress',
+    title: 'Сжать «отпуск.mp4» до 50 МБ',
+    state: 'running',
+    live: false,
+    share: 0,
+    ...over,
+  });
+  const files = { kind: 'av_files', files: [{ path: 'C:\\v\\отпуск (сжато).mp4', bytes: 51066000, duration_s: 751.2 }] };
+  const updated = (j: unknown) => ({ type: 'bg_job_updated', job: j });
+  /** A tool call that went to the background: the row and its job card. */
+  const started = (id: string, j: JobView) => [
+    { type: 'tool_started', id, name: j.kind, summary: j.title },
+    { type: 'tool_finished', id, name: j.kind, ok: true, output: 'Запущено в фоне: задание №3', elapsed_ms: 40, data: { kind: 'bg_job', job: j } },
+  ];
+  const jobOf = (it: ChatItem) => (it.data?.kind === 'bg_job' ? it.data.job : undefined);
+
+  it('cardData reads a job card', () => {
+    expect(cardData({ kind: 'bg_job', job: job() })).toEqual({ kind: 'bg_job', job: job() });
+    const done = job({ state: 'done', share: 100, text: 'Готово', data: files });
+    expect(cardData({ kind: 'bg_job', job: done })).toEqual({ kind: 'bg_job', job: done });
+    // The result card inside the job is read by the same function.
+    expect(cardData(done.data)).toEqual(files);
+  });
+
+  it('cardData refuses a job card of a wrong shape', () => {
+    expect(cardData({ kind: 'bg_job' })).toBeUndefined();
+    expect(cardData({ kind: 'bg_job', job: null })).toBeUndefined();
+    expect(cardData({ kind: 'bg_job', job: { ...job(), state: 'paused' } })).toBeUndefined();
+    expect(cardData({ kind: 'bg_job', job: { id: 3 } })).toBeUndefined();
+  });
+
+  it('a tool that went to the background gets the job card', () => {
+    const items = run(started('c1', job()));
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: 'tool', id: 'c1', ok: true, pending: false, data: { kind: 'bg_job', job: job() } });
+  });
+
+  it('bg_job_updated redraws the card in place', () => {
+    const start = run([...started('c1', job()), { type: 'assistant_text', text: 'Запустила в фоне.' }, ...started('c2', job({ id: 4, state: 'queued' }))]);
+    const half = run([updated(job({ share: 42, note: '1 из 2: a.mp4' }))], start);
+    expect(half.map((it) => it.kind)).toEqual(['tool', 'assistant', 'tool']);
+    expect(jobOf(half[0])).toEqual(job({ share: 42, note: '1 из 2: a.mp4' }));
+    expect(jobOf(half[2])).toEqual(job({ id: 4, state: 'queued' }));
+    // Rows that did not change keep their identity.
+    expect(half[1]).toBe(start[1]);
+    expect(half[2]).toBe(start[2]);
+
+    const done = run([updated(job({ state: 'done', share: 100, text: 'Готово', data: files }))], half);
+    expect(jobOf(done[0])).toEqual(job({ state: 'done', share: 100, text: 'Готово', data: files }));
+    expect(done[0]).toMatchObject({ id: 'c1', ok: true, ms: 40 });
+  });
+
+  it('bg_job_updated ignores unknown ids and bad shapes', () => {
+    const start = run(started('c1', job()));
+    expect(run([updated(job({ id: 9, share: 50 }))], start)).toBe(start);
+    expect(run([updated({ id: 3, state: 'running' })], start)).toBe(start);
+    expect(run([updated(null)], start)).toBe(start);
+    expect(run([{ type: 'bg_job_updated' }], start)).toBe(start);
+    expect(run([updated(job({ share: 50 }))], [])).toEqual([]);
+  });
+
+  it('bg_job_updated never touches a card of another kind', () => {
+    const start = run([
+      { type: 'tool_started', id: 'c1', name: 'av_cut', summary: 'Вырезать' },
+      { type: 'tool_finished', id: 'c1', name: 'av_cut', ok: true, output: 'x', elapsed_ms: 3, data: files },
+    ]);
+    expect(run([updated(job())], start)).toBe(start);
+  });
+
+  it('fromJobs makes one finished tool row per job', () => {
+    const rec = job({ id: 5, kind: 'screen_record', title: 'Записать экран', live: true, share: 7, note: '2:15 из 30:00' });
+    expect(fromJobs([job({ share: 42 }), rec])).toEqual([
+      { kind: 'tool', id: 'bgjob-3', name: 'video_compress', text: 'Сжать «отпуск.mp4» до 50 МБ', ok: true, data: { kind: 'bg_job', job: job({ share: 42 }) } },
+      { kind: 'tool', id: 'bgjob-5', name: 'screen_record', text: 'Записать экран', ok: true, data: { kind: 'bg_job', job: rec } },
+    ]);
+    expect(fromJobs([])).toEqual([]);
+    expect(fromJobs(null)).toEqual([]);
+    expect(fromJobs([{ id: 1 }, 'x'])).toEqual([]);
+  });
+
+  it('rows made by fromJobs follow the events of their jobs', () => {
+    const items = run([updated(job({ state: 'stopping', share: 42 }))], fromJobs([job({ share: 42 })]));
+    expect(jobOf(items[0])?.state).toBe('stopping');
+  });
+
+  it('addJobs adds only jobs that have no card yet', () => {
+    const start = run(started('c1', job()));
+    expect(addJobs(start, [job({ share: 10 })])).toBe(start);
+    const more = addJobs(start, [job({ share: 10 }), job({ id: 4, state: 'queued' })]);
+    expect(more.map((it) => it.id)).toEqual(['c1', 'bgjob-4']);
+    expect(addJobs(start, 'nothing')).toBe(start);
+  });
+
+  it('refreshJobs gives a card the state an event told about before the card came', () => {
+    // The job started and even ended before the tool row got its card.
+    const done = job({ state: 'done', share: 100, text: 'Готово', data: files });
+    const stale = run(started('c1', job({ state: 'queued' })));
+    const fresh = refreshJobs(stale, { 3: done });
+    expect(jobOf(fresh[0])).toEqual(done);
+    expect(fresh[0]).toMatchObject({ id: 'c1', ok: true, ms: 40 });
+    // Nothing newer is known: the very same array comes back.
+    expect(refreshJobs(fresh, { 3: done })).toBe(fresh);
+    expect(refreshJobs(stale, {})).toBe(stale);
+    expect(refreshJobs(fresh, { 3: job({ share: 80 }) })).toBe(fresh);
+  });
 });
 
 describe('formatSeconds', () => {
@@ -270,6 +492,33 @@ describe('toolLabel', () => {
       expect(isMessageKey(toolLabel(name)), name).toBe(true);
       expect(toolLabel(name)).not.toBe('tool.other');
     }
+  });
+});
+
+describe('events and watching', () => {
+  it('scenario and watch tools share one label', () => {
+    for (const name of ['trigger_create', 'trigger_list', 'trigger_delete', 'wait_for', 'wait_list', 'wait_stop']) {
+      expect(toolLabel(name), name).toBe('tool.events');
+    }
+    expect(isMessageKey(toolLabel('wait_for'))).toBe(true);
+  });
+
+  it('what she was asked to watch for becomes a row', () => {
+    expect(reduceChat([], { type: 'remark', text: 'Процесс cargo.exe завершился.', kind: 'watch' })).toEqual([
+      { kind: 'reminder', text: 'Процесс cargo.exe завершился.' },
+    ]);
+    expect(
+      reduceChat([], { type: 'remark', text: 'Сценарий «Вернулся» выключен: команды «сводка» больше нет.', kind: 'trigger' }),
+    ).toEqual([{ kind: 'reminder', text: 'Сценарий «Вернулся» выключен: команды «сводка» больше нет.' }]);
+  });
+
+  it('a scenario run opens with its own line, like a message', () => {
+    const items = run([
+      { type: 'user_text', text: '⚡ Сценарий «Наушники»: подключено звуковое устройство' },
+      { type: 'tool_started', id: 'c1', name: 'media_control', summary: 'Плеер: продолжить' },
+    ]);
+    expect(items.map((it) => it.kind)).toEqual(['user', 'tool']);
+    expect(items[0].text).toBe('⚡ Сценарий «Наушники»: подключено звуковое устройство');
   });
 });
 
@@ -316,5 +565,64 @@ describe('inlineMarkup', () => {
 
   it('leaves an unclosed marker as text while the reply streams', () => {
     expect(inlineMarkup('файл `text.t')).toEqual([{ kind: 'text', text: 'файл `text.t' }]);
+  });
+});
+
+describe('research report card', () => {
+  const report = {
+    kind: 'research_report',
+    path: 'C:\\Users\\me\\Documents\\Mika\\Research\\2026-11-14 12-30 Чем тепловой насос.md',
+    title: 'Чем тепловой насос «воздух-вода» отличается от «грунт-вода»',
+    sources: 6,
+    unread: 3,
+    unsourced: 1,
+    llm_calls: 9,
+    tokens: 38200,
+    seconds: 143,
+    limits: [],
+  };
+
+  it('accepts the report of a deep search', () => {
+    expect(cardData(report)).toEqual(report);
+    expect(cardData({ ...report, limits: ['time', 'tokens'], extra: 'x' })).toEqual({ ...report, limits: ['time', 'tokens'] });
+  });
+
+  it('fills what an older core does not send', () => {
+    const { unread: _unread, unsourced: _unsourced, limits: _limits, ...bare } = report;
+    expect(cardData(bare)).toEqual({ ...report, unread: 0, unsourced: 0, limits: [] });
+    expect(cardData({ ...report, unread: -1, unsourced: 'many', limits: 'time' })).toEqual({ ...report, unread: 0, unsourced: 0, limits: [] });
+  });
+
+  it('drops limits it does not know', () => {
+    expect(cardData({ ...report, limits: ['time', 'money', 5, null, 'tokens'] })).toEqual({ ...report, limits: ['time', 'tokens'] });
+  });
+
+  it('rejects broken shapes', () => {
+    expect(cardData({ ...report, path: '' })).toBeUndefined();
+    expect(cardData({ ...report, path: 5 })).toBeUndefined();
+    expect(cardData({ ...report, title: null })).toBeUndefined();
+    expect(cardData({ ...report, sources: '6' })).toBeUndefined();
+    expect(cardData({ ...report, sources: -1 })).toBeUndefined();
+    expect(cardData({ ...report, llm_calls: Number.NaN })).toBeUndefined();
+    expect(cardData({ ...report, tokens: undefined })).toBeUndefined();
+    expect(cardData({ ...report, seconds: Number.POSITIVE_INFINITY })).toBeUndefined();
+    expect(cardData({ kind: 'research_report' })).toBeUndefined();
+  });
+
+  it('a failed deep search shows no card', () => {
+    const items = run([
+      { type: 'tool_started', id: 'r1', name: 'deep_search', summary: 'Глубокий поиск' },
+      { type: 'tool_finished', id: 'r1', name: 'deep_search', ok: false, output: 'Ошибка', elapsed_ms: 9100, data: report },
+      { type: 'tool_started', id: 'r2', name: 'deep_search', summary: 'Глубокий поиск' },
+      { type: 'tool_progress', id: 'r2', share: 62 },
+      { type: 'tool_finished', id: 'r2', name: 'deep_search', ok: true, output: '', elapsed_ms: 143000, data: report },
+    ]);
+    expect(items.map((it) => it.data)).toEqual([undefined, report]);
+    expect(items[1].progress).toBeUndefined();
+  });
+
+  it('labels the tool as a search', () => {
+    expect(toolLabel('deep_search')).toBe('tool.search');
+    expect(isMessageKey(toolLabel('deep_search'))).toBe(true);
   });
 });

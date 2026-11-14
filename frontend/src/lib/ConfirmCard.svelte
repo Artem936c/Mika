@@ -1,8 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Icon from './Icon.svelte';
-  import { alwaysTitle, confirmHead, secondsLeft, type Pending } from './confirm';
+  import { alwaysTitle, confirmHead, secondsLeft, showsWhole, untranslated, type Pending } from './confirm';
   import { t } from './i18n';
+  import { CONFIRM_LINES, confirmTargetHeight } from './island';
+  import { lang } from './locale.svelte';
 
   let {
     pending,
@@ -22,6 +24,12 @@
   });
   const left = $derived(secondsLeft(pending, now));
   const level = $derived(pending.assessment.level);
+  // A target written in lines is shown whole, as far as the card has room: on the
+  // island `confirmShape` makes that room, in the chat the card is as tall as it needs.
+  const listed = $derived(pending.assessment.target.includes('\n'));
+  // A scenario by event is shown whole by its own rule (`pre.whole`, 11 lines):
+  // the eight-line box of a listed target must not cut it.
+  const whole = $derived(showsWhole(pending.tool));
 </script>
 
 <div class="cf lvl-{level}" class:compact>
@@ -30,8 +38,9 @@
     <span>{t(confirmHead(level))}</span>
     <span class="timer" title={t('confirm.timer_title')}>{t('chat.seconds', { value: left })}</span>
   </div>
+  {#if untranslated(pending, lang())}<p class="untr">{t('confirm.untranslated')}</p>{/if}
   <h3>{pending.assessment.summary}</h3>
-  <pre>{pending.assessment.target}</pre>
+  <pre class:whole style:max-height={listed && !whole ? `${confirmTargetHeight(CONFIRM_LINES)}px` : undefined}>{pending.assessment.target}</pre>
   <p class="why">{pending.assessment.reason}</p>
   <div class="acts">
     <button class="bt pri" onclick={() => onanswer('once')}><Icon name="check" />{t('confirm.once')}</button>
@@ -102,11 +111,14 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  /* The exact command or path. It scrolls, so the buttons never leave the card. */
+  /* The exact command or path. It scrolls, so the buttons never leave the card.
+     A command gets five lines. A target written in lines gets a taller box from
+     the script: a screen recording names the microphone and the sound on lines
+     of their own, and none of them may hide below a scroll bar. */
   pre {
     flex: 0 1 auto;
     min-height: 36px;
-    max-height: 72px;
+    max-height: 110px;
     box-sizing: border-box;
     margin: 0;
     font: 12.5px/1.45 var(--mono);
@@ -119,6 +131,12 @@
     word-break: break-all;
     overflow: auto;
     user-select: text;
+  }
+  /* A scenario by event: its limits and its whole instruction stay in sight (11 lines). */
+  pre.whole {
+    max-height: 218px;
+    word-break: normal;
+    overflow-wrap: anywhere;
   }
   .why {
     flex: none;
@@ -145,6 +163,16 @@
     margin: 12px 0 0;
     font-size: 12px;
     color: var(--mute);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* English interface, Russian description: said before the description itself. */
+  .untr {
+    flex: none;
+    margin: 8px 0 -4px;
+    font-size: 12px;
+    color: var(--warn);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;

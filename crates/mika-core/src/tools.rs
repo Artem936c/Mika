@@ -1,13 +1,16 @@
 //! Tool registry. Every tool reports its risk and runs only with an `Approval`.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::events::{Event, EventBus};
 use crate::gate::Approval;
 use crate::llm::ToolSpec;
 
@@ -103,6 +106,94 @@ pub enum ToolError {
     Failed(String),
     #[error("остановлено")]
     Cancelled,
+    /// The tool cannot work yet; `data` is a chat card that helps: a button
+    /// to download FFmpeg.
+    #[error("{message}")]
+    NotReady {
+        message: String,
+        data: serde_json::Value,
+    },
+}
+
+/// Least time between two progress events of one call.
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+
+struct ProgressInner {
+    /// Gets every share that goes out.
+    sink: Box<dyn Fn(u8) + Send + Sync>,
+    last: Option<u8>,
+    at: Option<Instant>,
+}
+
+/// How far the running tool call has got. Empty outside a tool call: then
+/// `set` does nothing.
+#[derive(Clone, Default)]
+pub struct Progress {
+    inner: Option<Arc<parking_lot::Mutex<ProgressInner>>>,
+}
+
+impl Progress {
+    /// Progress of the tool call `id`: every share goes out as `ToolProgress`.
+    pub fn new(id: String, bus: EventBus) -> Self {
+        Self::to(move |share| {
+            bus.publish(Event::ToolProgress {
+                id: id.clone(),
+                share,
+            });
+        })
+    }
+
+    /// Progress that goes to `sink` in place of the bus, by the same rule as
+    /// `set`: a background job shows it on its own card.
+    pub fn to(sink: impl Fn(u8) + Send + Sync + 'static) -> Self {
+        Self {
+            inner: Some(Arc::new(parking_lot::Mutex::new(ProgressInner {
+                sink: Box::new(sink),
+                last: None,
+                at: None,
+            }))),
+        }
+    }
+
+    /// Reports the share when it changed, at most every 250 ms; 100 always
+    /// goes out. A call's own progress is published as `ToolProgress`.
+    pub fn set(&self, share: u8) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        let share = share.min(100);
+        let mut p = inner.lock();
+        if p.last == Some(share) {
+            return;
+        }
+        let due = p.at.is_none_or(|at| at.elapsed() >= PROGRESS_EVERY);
+        if !due && share != 100 {
+            return;
+        }
+        p.last = Some(share);
+        p.at = Some(Instant::now());
+        (p.sink)(share);
+    }
+}
+
+tokio::task_local! {
+    static PROGRESS: Progress;
+}
+
+/// Progress of the tool call that runs in this task. Take it at the start of
+/// `run`: callbacks may run in other tasks.
+pub fn progress_handle() -> Progress {
+    PROGRESS.try_with(Clone::clone).unwrap_or_default()
+}
+
+/// Runs `fut` with the progress of the call `id`.
+pub async fn with_progress<F: Future>(id: String, bus: EventBus, fut: F) -> F::Output {
+    PROGRESS.scope(Progress::new(id, bus), fut).await
+}
+
+/// Runs `fut` with `progress` as what `progress_handle` gives inside it.
+pub async fn with_progress_handle<F: Future>(progress: Progress, fut: F) -> F::Output {
+    PROGRESS.scope(progress, fut).await
 }
 
 #[async_trait]
@@ -324,6 +415,72 @@ mod tests {
             EchoTool.assess(&json!({})),
             Err(ToolError::BadArguments(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn progress_publishes_changes_with_the_call_id() {
+        let bus = EventBus::new(16);
+        let mut rx = bus.subscribe();
+        assert!(progress_handle().inner.is_none(), "empty outside a call");
+        progress_handle().set(10);
+        with_progress("c1".into(), bus.clone(), async {
+            let p = progress_handle();
+            p.set(5);
+            p.set(5);
+            p.set(7);
+            p.set(200);
+        })
+        .await;
+        let mut got = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            got.push(e);
+        }
+        assert_eq!(
+            got,
+            vec![
+                Event::ToolProgress {
+                    id: "c1".into(),
+                    share: 5
+                },
+                Event::ToolProgress {
+                    id: "c1".into(),
+                    share: 100
+                },
+            ],
+            "7 came too soon, 100 always goes out"
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_to_a_sink_follows_the_same_throttle() {
+        let got = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = got.clone();
+        let p = Progress::to(move |share| seen.lock().push(share));
+        p.set(5);
+        p.set(5);
+        p.set(7);
+        p.set(200);
+        assert_eq!(
+            *got.lock(),
+            vec![5, 100],
+            "7 came too soon, 100 always goes out"
+        );
+        tokio::time::sleep(PROGRESS_EVERY + Duration::from_millis(30)).await;
+        p.set(100);
+        p.set(60);
+        assert_eq!(*got.lock(), vec![5, 100, 60], "the same share twice is one");
+
+        // Inside a scope the tool gets this very progress, not the bus.
+        let bus = EventBus::new(8);
+        let mut rx = bus.subscribe();
+        let inner = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let seen = inner.clone();
+        with_progress_handle(Progress::to(move |s| seen.lock().push(s)), async {
+            progress_handle().set(42);
+        })
+        .await;
+        assert_eq!(*inner.lock(), vec![42]);
+        assert!(rx.try_recv().is_err(), "nothing goes to the bus");
     }
 
     #[test]

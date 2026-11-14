@@ -1,6 +1,7 @@
 //! Windows voice: `SpeechSynthesizer` makes the sound, `MediaPlayer` plays it.
 //! Both are built into Windows, so speech works offline and adds no downloads.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
@@ -8,15 +9,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use windows::core::HSTRING;
+use windows::core::{Interface, HSTRING};
 use windows::Foundation::TypedEventHandler;
 use windows::Media::Core::MediaSource;
 use windows::Media::Playback::MediaPlayer;
 use windows::Media::SpeechSynthesis::{SpeechSynthesizer, VoiceInformation};
-use windows::Storage::Streams::{DataWriter, InMemoryRandomAccessStream};
+use windows::Storage::Streams::{
+    DataReader, DataWriter, IRandomAccessStream, InMemoryRandomAccessStream,
+};
+use windows::Win32::Media::MediaFoundation::{
+    IMFAttributes, IMFSample, MFAudioFormat_PCM, MFCreateMFByteStreamOnStreamEx, MFCreateMediaType,
+    MFCreateSourceReaderFromByteStream, MFMediaType_Audio, MFShutdown, MFStartup,
+    MF_BYTESTREAM_CONTENT_TYPE, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS,
+    MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
-use crate::speech::{defuse, prosody_ssml, FirstSound, RemoteSynth, ToneSource, Voice, VoiceInfo};
+use crate::lead::{wav, with_lead_in, LEAD_IN_MS};
+
+use crate::speech::{
+    defuse, prosody_ssml, with_direction, DirectionSource, FirstSound, RemoteSynth, ToneSource,
+    Voice, VoiceInfo,
+};
 
 /// One sentence never plays longer than this, whatever the player reports.
 const MAX_SENTENCE_PLAY: Duration = Duration::from_secs(90);
@@ -118,6 +132,8 @@ pub struct WindowsVoice {
     /// Sentences queued and not yet said or dropped.
     pending: Arc<AtomicUsize>,
     tone: Mutex<Option<ToneSource>>,
+    /// Her mood as a direction for the remote synthesizer (decision 0029).
+    direction: Mutex<Option<DirectionSource>>,
 }
 
 /// Counts a sentence as done when the worker lets go of it.
@@ -168,6 +184,7 @@ impl WindowsVoice {
             fresh: AtomicBool::new(true),
             pending,
             tone: Mutex::new(None),
+            direction: Mutex::new(None),
         }
     }
 }
@@ -189,8 +206,18 @@ fn info(v: &VoiceInformation) -> Option<VoiceInfo> {
     })
 }
 
-/// The voice with this name, or the first Russian one for an empty name.
+/// The voice with this name, or for an empty name the first one of the
+/// language she replies in (`mika_core::i18n::voice_language`).
 pub fn pick<'a>(voices: &'a [VoiceInfo], wanted: &str) -> Option<&'a VoiceInfo> {
+    pick_for(voices, wanted, &mika_core::i18n::voice_language())
+}
+
+/// `language` is a prefix of the voice language tag: `ru`, `en`.
+pub fn pick_for<'a>(
+    voices: &'a [VoiceInfo],
+    wanted: &str,
+    language: &str,
+) -> Option<&'a VoiceInfo> {
     let wanted = wanted.trim();
     if !wanted.is_empty() {
         if let Some(v) = voices.iter().find(|v| v.name == wanted) {
@@ -199,7 +226,7 @@ pub fn pick<'a>(voices: &'a [VoiceInfo], wanted: &str) -> Option<&'a VoiceInfo> 
     }
     voices
         .iter()
-        .find(|v| v.language.to_lowercase().starts_with("ru"))
+        .find(|v| v.language.to_lowercase().starts_with(language))
 }
 
 struct Engine {
@@ -285,21 +312,28 @@ impl Engine {
         if stopped() {
             return Ok(());
         }
-        let source = MediaSource::CreateFromStream(&stream, &stream.ContentType()?)?;
-        ready();
-        self.play_source(&source, stopped)
+        // The sound goes the way of a remote one, to get quiet before its
+        // first word; one that cannot be read is played as it is.
+        match read_all(&stream.cast()?) {
+            Ok(bytes) => {
+                ready();
+                self.play_audio(&bytes, stopped)
+            }
+            Err(e) => {
+                log::warn!("voice sound not read: {}", e.message());
+                let source = MediaSource::CreateFromStream(&stream, &stream.ContentType()?)?;
+                ready();
+                self.play_source(&source, stopped)
+            }
+        }
     }
 
-    /// Plays a ready sound file: WAV, MP3, Ogg or FLAC.
+    /// Plays a ready sound file: WAV, MP3, Ogg or FLAC. It starts with
+    /// quiet, see `lead`.
     fn play_audio(&self, bytes: &[u8], stopped: impl Fn() -> bool) -> windows::core::Result<()> {
-        let stream = InMemoryRandomAccessStream::new()?;
-        let writer = DataWriter::CreateDataWriter(&stream)?;
-        writer.WriteBytes(bytes)?;
-        writer.StoreAsync()?.join()?;
-        writer.FlushAsync()?.join()?;
-        writer.DetachStream()?;
-        stream.Seek(0)?;
-        let source = MediaSource::CreateFromStream(&stream, &HSTRING::from(audio_mime(bytes)))?;
+        let bytes = quiet_start(bytes);
+        let stream = memory_stream(&bytes)?;
+        let source = MediaSource::CreateFromStream(&stream, &HSTRING::from(audio_mime(&bytes)))?;
         self.play_source(&source, stopped)
     }
 
@@ -324,6 +358,121 @@ impl Engine {
             }
         }
         Ok(())
+    }
+}
+
+/// `bytes` in a stream of memory, read from its start.
+fn memory_stream(bytes: &[u8]) -> windows::core::Result<InMemoryRandomAccessStream> {
+    let stream = InMemoryRandomAccessStream::new()?;
+    let writer = DataWriter::CreateDataWriter(&stream)?;
+    writer.WriteBytes(bytes)?;
+    writer.StoreAsync()?.join()?;
+    writer.FlushAsync()?.join()?;
+    writer.DetachStream()?;
+    stream.Seek(0)?;
+    Ok(stream)
+}
+
+/// The whole of a stream.
+fn read_all(stream: &IRandomAccessStream) -> windows::core::Result<Vec<u8>> {
+    let size = u32::try_from(stream.Size()?).unwrap_or(u32::MAX);
+    let reader = DataReader::CreateDataReader(&stream.GetInputStreamAt(0)?)?;
+    let got = reader.LoadAsync(size)?.join()?;
+    let mut bytes = vec![0u8; got as usize];
+    reader.ReadBytes(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// A sound that starts with at least `LEAD_IN_MS` of quiet. A compressed
+/// sound is decoded to WAV for it. A sound that has the quiet already, or
+/// cannot be read, stays as it is.
+fn quiet_start(bytes: &[u8]) -> Cow<'_, [u8]> {
+    let decoded = if bytes.starts_with(b"RIFF") {
+        None
+    } else {
+        decode(bytes)
+            .map_err(|e| log::warn!("sound not decoded: {}", e.message()))
+            .ok()
+    };
+    match with_lead_in(decoded.as_deref().unwrap_or(bytes), LEAD_IN_MS) {
+        Some(padded) => Cow::Owned(padded),
+        None => Cow::Borrowed(bytes),
+    }
+}
+
+/// Media Foundation, started for as long as this lives.
+struct MediaFoundation;
+
+impl MediaFoundation {
+    fn start() -> windows::core::Result<Self> {
+        // MF_VERSION and MFSTARTUP_LITE: no network sources are needed.
+        // SAFETY: paired with `MFShutdown` in `drop`.
+        unsafe { MFStartup(0x0002_0070, 1)? };
+        Ok(Self)
+    }
+}
+
+impl Drop for MediaFoundation {
+    fn drop(&mut self) {
+        // SAFETY: `MFStartup` succeeded in `start`.
+        let _ = unsafe { MFShutdown() };
+    }
+}
+
+/// The first audio stream of a source reader.
+const FIRST_AUDIO_STREAM: u32 = 0xFFFF_FFFD;
+/// The stream of a source reader has no more samples.
+const END_OF_STREAM: u32 = 2;
+
+/// A compressed sound, MP3, Ogg or FLAC, as a WAV file of 16-bit samples.
+fn decode(bytes: &[u8]) -> windows::core::Result<Vec<u8>> {
+    let _mf = MediaFoundation::start()?;
+    let stream = memory_stream(bytes)?;
+    // SAFETY: plain Media Foundation calls on objects owned here; the
+    // locked buffer is read only while it is locked.
+    unsafe {
+        let byte_stream = MFCreateMFByteStreamOnStreamEx(&stream)?;
+        if let Ok(attrs) = byte_stream.cast::<IMFAttributes>() {
+            attrs.SetString(
+                &MF_BYTESTREAM_CONTENT_TYPE,
+                &HSTRING::from(audio_mime(bytes)),
+            )?;
+        }
+        let reader = MFCreateSourceReaderFromByteStream(&byte_stream, None)?;
+        let pcm = MFCreateMediaType()?;
+        pcm.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        pcm.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM)?;
+        pcm.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16)?;
+        reader.SetCurrentMediaType(FIRST_AUDIO_STREAM, None, &pcm)?;
+        let format = reader.GetCurrentMediaType(FIRST_AUDIO_STREAM)?;
+        let rate = format.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)?;
+        let channels = format.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)?;
+        let bits = format.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE)?;
+        let mut samples = Vec::new();
+        loop {
+            let mut flags = 0u32;
+            let mut sample: Option<IMFSample> = None;
+            reader.ReadSample(
+                FIRST_AUDIO_STREAM,
+                0,
+                None,
+                Some(&mut flags),
+                None,
+                Some(&mut sample),
+            )?;
+            if let Some(sample) = sample {
+                let buffer = sample.ConvertToContiguousBuffer()?;
+                let mut data = std::ptr::null_mut();
+                let mut len = 0u32;
+                buffer.Lock(&mut data, None, Some(&mut len))?;
+                samples.extend_from_slice(std::slice::from_raw_parts(data, len as usize));
+                buffer.Unlock()?;
+            }
+            if flags & END_OF_STREAM != 0 {
+                break;
+            }
+        }
+        Ok(wav(&samples, rate, channels as u16, bits as u16))
     }
 }
 
@@ -463,6 +612,14 @@ fn remote_plain(text: &str) -> String {
     text.chars().filter_map(defuse).collect()
 }
 
+/// A sentence as the remote synthesizer gets it: with her mood of this
+/// moment as a direction, when it has no voice mark of its own (decision
+/// 0029). The Windows voice never gets one.
+fn directed(text: &str, direction: Option<&DirectionSource>) -> String {
+    let mood = direction.and_then(|mood| mood());
+    with_direction(text, mood.as_deref())
+}
+
 impl WindowsVoice {
     /// Queues a sentence. A remote synthesizer, if any, is asked for
     /// `remote`; the Windows voice says `local` when there is none or it fails.
@@ -472,9 +629,11 @@ impl WindowsVoice {
         // `LOOKAHEAD` sentences ahead: each request is paid.
         let remote = self.remote.lock().clone().map(|synth| {
             let (tx, rx) = mpsc::channel();
+            // Asked only when a remote synthesizer is set.
+            let direction = self.direction.lock().clone();
             self.prefetch.submit(Job {
                 generation: gen,
-                text: remote(),
+                text: directed(&remote(), direction.as_ref()),
                 tx,
                 synth,
             });
@@ -511,6 +670,10 @@ impl Voice for WindowsVoice {
 
     fn set_tone(&self, tone: Option<ToneSource>) {
         *self.tone.lock() = tone;
+    }
+
+    fn set_direction(&self, direction: Option<DirectionSource>) {
+        *self.direction.lock() = direction;
     }
 
     fn set_observer(&self, observer: Option<FirstSound>) {
@@ -558,6 +721,57 @@ impl Voice for WindowsVoice {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 16-bit mono at 24 kHz that starts loud.
+    fn loud_wav(frames: usize) -> Vec<u8> {
+        let mut pcm = Vec::new();
+        for i in 0..frames {
+            let v: i16 = if i % 2 == 0 { 9_000 } else { -9_000 };
+            pcm.extend_from_slice(&v.to_le_bytes());
+        }
+        wav(&pcm, 24_000, 1, 16)
+    }
+
+    /// Silent MPEG-1 Layer III frames, mono, 128 kbit/s at 44.1 kHz.
+    fn silent_mp3(frames: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for _ in 0..frames {
+            let mut frame = vec![0u8; 417];
+            frame[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0xC0]);
+            out.extend_from_slice(&frame);
+        }
+        out
+    }
+
+    #[test]
+    fn every_phrase_starts_with_quiet() {
+        let src = loud_wav(4_800);
+        let out = quiet_start(&src);
+        assert!(matches!(out, Cow::Owned(_)));
+        // 150 ms of zeros at 24 kHz, then the sound as it was.
+        assert_eq!(out.len(), src.len() + 3_600 * 2);
+        assert!(out[44..44 + 7_200].iter().all(|&b| b == 0));
+        assert_eq!(&out[44 + 7_200..], &src[44..]);
+        // Quiet already there: the sound stays as it is.
+        let quiet = quiet_start(&out).into_owned();
+        assert_eq!(quiet, *out);
+        // Bytes that are no sound are played as they are.
+        assert!(matches!(quiet_start(b"no sound here"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_compressed_sound_is_decoded_for_its_quiet() {
+        // SAFETY: COM for this test thread, as the voice worker does.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+        let decoded = decode(&silent_mp3(40)).expect("MP3 is decoded");
+        assert!(decoded.starts_with(b"RIFF"));
+        // About a second of mono 16-bit sound at 44.1 kHz.
+        let samples = (decoded.len() - 44) / 2;
+        assert!((30_000..=50_000).contains(&samples), "{samples} samples");
+        assert!(decode(b"no sound here").is_err());
+    }
 
     #[test]
     fn a_long_reply_is_ordered_only_a_few_sentences_ahead() {
@@ -610,6 +824,42 @@ mod tests {
         assert_eq!(remote_plain("Напоминаю: чайник."), "Напоминаю: чайник.");
     }
 
+    #[test]
+    fn a_remote_sentence_without_marks_gets_her_mood_as_a_direction() {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = asked.clone();
+        let sad: DirectionSource = Arc::new(move || {
+            count.fetch_add(1, Ordering::Relaxed);
+            Some("sad, quietly".to_string())
+        });
+        // Words of the model without marks and her own lines.
+        assert_eq!(
+            directed("Ну вот, всё готово.", Some(&sad)),
+            "[sad, quietly] Ну вот, всё готово."
+        );
+        // Text of others keeps its brackets harmless; the direction is hers.
+        assert_eq!(
+            directed(&remote_plain("[Фото] от Ани: <b>привет</b>"), Some(&sad)),
+            "[sad, quietly] (Фото) от Ани: bпривет/b"
+        );
+        // A phrase the model marked itself stays as it is.
+        assert_eq!(
+            directed("[sigh] Ну вот, всё готово.", Some(&sad)),
+            "[sigh] Ну вот, всё готово."
+        );
+        assert_eq!(
+            directed("<whisper>Тихо.</whisper>", Some(&sad)),
+            "<whisper>Тихо.</whisper>"
+        );
+        // The mood is asked for each sentence anew.
+        assert_eq!(asked.load(Ordering::Relaxed), 4);
+
+        // She is calm, or the switch is off: nothing is added.
+        let calm: DirectionSource = Arc::new(|| None);
+        assert_eq!(directed("Ну вот.", Some(&calm)), "Ну вот.");
+        assert_eq!(directed("Ну вот.", None), "Ну вот.");
+    }
+
     fn v(name: &str, language: &str) -> VoiceInfo {
         VoiceInfo {
             name: name.into(),
@@ -632,5 +882,29 @@ mod tests {
         assert_eq!(pick(&voices, "Нет такого").unwrap().name, "Microsoft Irina");
         // No Russian voice: the synthesizer keeps its default one.
         assert_eq!(pick(&voices[..1], ""), None);
+    }
+
+    #[test]
+    fn the_automatic_voice_follows_the_given_language() {
+        let voices = vec![
+            v("Microsoft David", "en-US"),
+            v("Microsoft Irina", "ru-RU"),
+            v("Microsoft Pavel", "ru-RU"),
+        ];
+        assert_eq!(pick_for(&voices, "", "en").unwrap().name, "Microsoft David");
+        assert_eq!(pick_for(&voices, "", "ru").unwrap().name, "Microsoft Irina");
+        // No English voice: the synthesizer keeps its default one.
+        assert_eq!(pick_for(&voices[1..], "", "en"), None);
+        // A voice picked by name wins for any language.
+        for language in ["ru", "en"] {
+            assert_eq!(
+                pick_for(&voices, "Microsoft Pavel", language).unwrap().name,
+                "Microsoft Pavel"
+            );
+        }
+        assert_eq!(
+            pick_for(&voices, "Нет такого", "en").unwrap().name,
+            "Microsoft David"
+        );
     }
 }

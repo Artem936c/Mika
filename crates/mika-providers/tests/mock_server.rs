@@ -87,6 +87,9 @@ async fn openai_streams_text_deltas() {
         .to_ascii_lowercase()
         .contains("authorization: bearer sk-1"));
     assert!(raw.contains("\"stream\":true"));
+    // No tracker of paid calls is installed in this test program: nothing is
+    // added to the request for the sake of counting.
+    assert!(!raw.contains("stream_options"), "{raw}");
 }
 
 #[tokio::test]

@@ -54,8 +54,22 @@ pub fn vosk_dir() -> PathBuf {
     }
 }
 
+/// FFmpeg that Mika downloaded with the user's consent: `ffmpeg.exe`,
+/// `ffprobe.exe` and `LICENSE.txt`, flat. Machine-local, next to the logs.
+pub fn ffmpeg_dir() -> PathBuf {
+    match logs_dir().parent() {
+        Some(parent) => parent.join("ffmpeg"),
+        None => data_dir().join("ffmpeg"),
+    }
+}
+
 pub fn database_path() -> PathBuf {
     data_dir().join("mika.db")
+}
+
+/// Copies of the data made before a restore: `%APPDATA%\Mika\backups`.
+pub fn backups_dir() -> PathBuf {
+    data_dir().join("backups")
 }
 
 #[cfg(test)]

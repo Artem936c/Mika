@@ -55,6 +55,11 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<serde_json::Value>,
     },
+    /// How far a long tool call has got, 0..=100: converting a video.
+    ToolProgress {
+        id: String,
+        share: u8,
+    },
     ConfirmRequested {
         id: u64,
         tool: String,
@@ -90,7 +95,11 @@ pub enum Event {
         text: String,
     },
     /// A short line of her own, made without the model: a break, the end of
-    /// focus, a meeting soon, a greeting. `kind`: `break`, `focus`, `calendar`, `life`.
+    /// focus, a meeting soon, a greeting, the summary of the day, a budget
+    /// warning, a refused dictation or screen question, what she watched for,
+    /// a line about a scenario, the end of a background job. `kind`: `break`,
+    /// `focus`, `calendar`, `life`, `day`, `cost`, `dictation`, `screen_ask`,
+    /// `watch`, `trigger`, `job`.
     Remark {
         text: String,
         kind: String,
@@ -111,6 +120,10 @@ pub enum Event {
     /// The whole state of the running multi-step task, sent after every change.
     TaskUpdated {
         task: crate::task::Task,
+    },
+    /// The whole state of a background job, sent after every change.
+    BgJobUpdated {
+        job: crate::bgjobs::JobView,
     },
     Error {
         message: String,
@@ -227,6 +240,61 @@ mod tests {
                 other => panic!("{other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn tool_progress_serializes_with_id_and_share() {
+        let e = Event::ToolProgress {
+            id: "c1".into(),
+            share: 42,
+        };
+        assert_eq!(
+            serde_json::to_value(&e).unwrap(),
+            serde_json::json!({ "type": "tool_progress", "id": "c1", "share": 42 })
+        );
+    }
+
+    #[test]
+    fn bg_job_updated_serializes_with_the_job_object() {
+        use crate::bgjobs::{JobState, JobView};
+        let mut job = JobView {
+            id: 3,
+            kind: "video_compress".into(),
+            title: "Сжать «отпуск.mp4»".into(),
+            state: JobState::Running,
+            live: false,
+            share: 42,
+            note: String::new(),
+            text: String::new(),
+            data: None,
+            silent: false,
+            remote: false,
+        };
+        let e = Event::BgJobUpdated { job: job.clone() };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "type": "bg_job_updated",
+                "job": {
+                    "id": 3, "kind": "video_compress", "title": "Сжать «отпуск.mp4»",
+                    "state": "running", "live": false, "share": 42
+                }
+            })
+        );
+        assert_eq!(serde_json::from_value::<Event>(v).unwrap(), e);
+
+        job.state = JobState::Done;
+        job.share = 100;
+        job.text = "Готово: C:\\v\\отпуск (сжато).mp4, 48,7 МБ.".into();
+        job.data = Some(serde_json::json!({
+            "kind": "av_files",
+            "files": [{ "path": "C:\\v\\отпуск (сжато).mp4", "bytes": 51066000, "duration_s": 751.2 }]
+        }));
+        let v = serde_json::to_value(Event::BgJobUpdated { job }).unwrap();
+        assert_eq!(v["job"]["state"], "done");
+        assert_eq!(v["job"]["data"]["files"][0]["bytes"], 51066000);
+        assert!(v["job"].get("note").is_none() && v["job"].get("silent").is_none());
     }
 
     #[test]
