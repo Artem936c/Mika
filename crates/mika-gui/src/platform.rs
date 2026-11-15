@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use mika_core::config::Config;
 use mika_core::journal::{self, Journal};
-use mika_core::paths::{config_path, data_dir, logs_dir};
+use mika_core::paths::{config_path, data_dir, logs_dir, models_dir};
 use mika_core::secrets::SecretStore;
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -152,15 +152,18 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
 
 /// Folders removed by "delete all data".
 pub fn data_folders() -> Vec<PathBuf> {
-    folders_for(data_dir(), logs_dir())
+    folders_for(data_dir(), vec![logs_dir(), models_dir()])
 }
 
-/// Only the logs folder itself: its parent `%LOCALAPPDATA%\Mika` is also
-/// where the installer puts the program.
-fn folders_for(data: PathBuf, logs: PathBuf) -> Vec<PathBuf> {
+/// The data folder and the machine-local folders that hold the user's own
+/// things: the journal and the avatar models. Each of them by itself: their
+/// parent `%LOCALAPPDATA%\Mika` is also where the installer puts the program.
+fn folders_for(data: PathBuf, local: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut v = vec![data.clone()];
-    if !logs.starts_with(&data) {
-        v.push(logs);
+    for folder in local {
+        if !folder.starts_with(&data) {
+            v.push(folder);
+        }
     }
     v
 }
@@ -287,13 +290,15 @@ mod tests {
         let install = PathBuf::from(r"C:\Users\me\AppData\Local\Mika");
         let v = folders_for(
             PathBuf::from(r"C:\Users\me\AppData\Roaming\Mika"),
-            install.join("logs"),
+            vec![install.join("logs"), install.join("models")],
         );
         assert_eq!(
             v,
             vec![
                 PathBuf::from(r"C:\Users\me\AppData\Roaming\Mika"),
-                install.join("logs")
+                install.join("logs"),
+                // The avatar models the user brought in are their data too.
+                install.join("models")
             ]
         );
         assert!(!v.contains(&install));
@@ -375,6 +380,9 @@ mod tests {
     #[test]
     fn logs_inside_data_dir_are_not_listed_twice() {
         let data = PathBuf::from(r"D:\mika");
-        assert_eq!(folders_for(data.clone(), data.join("logs")), vec![data]);
+        assert_eq!(
+            folders_for(data.clone(), vec![data.join("logs"), data.join("models")]),
+            vec![data]
+        );
     }
 }

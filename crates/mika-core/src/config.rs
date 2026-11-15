@@ -501,14 +501,16 @@ impl AssistantConfig {
     }
 }
 
-/// Where the avatar is shown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Where the avatar is shown and which one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AvatarConfig {
     /// Left column of the open chat.
     pub in_island: bool,
     /// Separate click-through window in the corner of the desktop.
     pub on_desktop: bool,
+    /// Id of the chosen model in the models folder; empty is the built-in avatar.
+    pub model: String,
 }
 
 impl Default for AvatarConfig {
@@ -516,6 +518,7 @@ impl Default for AvatarConfig {
         Self {
             in_island: true,
             on_desktop: false,
+            model: String::new(),
         }
     }
 }
@@ -1124,6 +1127,19 @@ mod tests {
         assert_eq!(c.assistant.persona, Persona::Caring);
         assert_eq!(c.assistant.custom_prompt, "");
         assert!(c.avatar.in_island && !c.avatar.on_desktop);
+    }
+
+    #[test]
+    fn an_old_config_without_avatar_model_loads() {
+        let (_d, p) = tmp();
+        std::fs::write(&p, "[avatar]\nin_island = false\non_desktop = true\n").unwrap();
+        let mut c = Config::load(&p).unwrap();
+        assert_eq!(c.avatar.model, "");
+        assert!(c.avatar.on_desktop);
+
+        c.avatar.model = "0123456789abcdef".into();
+        c.save(&p).unwrap();
+        assert_eq!(Config::load(&p).unwrap().avatar.model, "0123456789abcdef");
     }
 
     #[test]

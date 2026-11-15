@@ -4,6 +4,8 @@
   import Avatar from '../Avatar.svelte';
   import { EMOTION_ORDER, type Emotion } from '../avatar';
   import { t } from '../i18n';
+  import ModelSlots from './ModelSlots.svelte';
+  import ModelTiles from './ModelTiles.svelte';
 
   const PERSONAS = ['caring', 'cheerful', 'calm', 'bold', 'custom'] as const;
   type Persona = (typeof PERSONAS)[number];
@@ -96,11 +98,8 @@
     />
 
     <div class="lbl">{t('persona.model')}</div>
-    <div class="mods">
-      <div class="on">{savedName}<br />{t('persona.model_default')}</div>
-      <div class="off" title={t('persona.model_later')}>{t('persona.model_steam')}</div>
-      <div class="off" title={t('persona.model_later')}>{t('persona.model_upload')}</div>
-    </div>
+    <ModelTiles name={savedName} />
+    <ModelSlots onshow={(e) => (shown = e)} />
 
     <div class="lbl">{t('persona.character')}</div>
     <div class="chips" role="radiogroup" aria-label={t('persona.character')}>
@@ -138,6 +137,12 @@
     display: grid;
     grid-template-columns: 206px 1fr;
     gap: 22px;
+  }
+  /* The preview stays in sight while the long right column scrolls: a slot chosen there is shown here. */
+  .left {
+    position: sticky;
+    top: 0;
+    align-self: start;
   }
   .prev {
     position: relative;
@@ -198,31 +203,6 @@
   .emos button:hover,
   .emos button.on {
     border-color: var(--v);
-  }
-  .mods {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 10px;
-  }
-  .mods div {
-    height: 64px;
-    border-radius: 14px;
-    border: 1px solid var(--line2);
-    display: grid;
-    place-items: center;
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--mute);
-    text-align: center;
-    line-height: 1.35;
-  }
-  .mods div.on {
-    border-color: var(--v);
-    box-shadow: 0 0 0 3px rgba(143, 125, 255, 0.2);
-    color: #fff;
-  }
-  .mods div.off {
-    opacity: 0.5;
   }
   .chips {
     display: flex;

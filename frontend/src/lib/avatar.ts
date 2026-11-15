@@ -1,6 +1,7 @@
 // Built-in avatar: generated anime illustrations, one frame per emotion, plus eye and
 // mouth layers for blinking and talking (decision 0013). Pure functions, no DOM.
-// A stand-in until the Live2D model of epic 7.
+// The avatar by default, and what is shown when a model of the user cannot be
+// (decision 0039; the model lives in `model/`).
 
 export const EMOTION_ORDER = [
   'neutral',

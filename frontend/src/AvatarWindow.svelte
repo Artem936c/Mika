@@ -9,6 +9,7 @@
   import { reducePending, type Pending } from './lib/confirm';
   import { t } from './lib/i18n';
   import { noticeOf, reduceState, type AssistantState } from './lib/island';
+  import { startModelState } from './lib/model/state.svelte';
 
   let current = $state<AssistantState>('idle');
   let emotion = $state<Emotion>('neutral');
@@ -58,6 +59,7 @@
 
   onMount(() => {
     let unlisten: (() => void) | undefined;
+    startModelState();
     invoke<AssistantState>('get_state').then((s) => (current = s));
     invoke<unknown>('get_emotion').then((e) => {
       if (isEmotion(e)) emotion = e;

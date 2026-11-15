@@ -578,6 +578,8 @@ fn bring_front(app: &tauri::AppHandle) {
         let _ = w.set_always_on_top(true);
         if w.is_visible().unwrap_or(false) {
             let _ = show_without_activation(&w);
+            // An avatar model is drawn again.
+            crate::avatar_model::window_shown(app, label, true);
         }
     }
 }
@@ -611,6 +613,8 @@ fn send_back(app: &tauri::AppHandle) {
                 );
             }
         }
+        // Behind a full-screen program nobody sees her: an avatar model is not drawn.
+        crate::avatar_model::window_shown(app, label, false);
     }
 }
 

@@ -63,6 +63,15 @@ pub fn ffmpeg_dir() -> PathBuf {
     }
 }
 
+/// Avatar models the user brought in, a folder per model:
+/// `%LOCALAPPDATA%\Mika\models`. Big and machine-local, next to the logs.
+pub fn models_dir() -> PathBuf {
+    match logs_dir().parent() {
+        Some(parent) => parent.join("models"),
+        None => data_dir().join("models"),
+    }
+}
+
 pub fn database_path() -> PathBuf {
     data_dir().join("mika.db")
 }
@@ -90,6 +99,13 @@ mod tests {
             data_dir_from(None, Some("C:\\A".into())),
             PathBuf::from("C:\\A").join("Mika")
         );
+    }
+
+    #[test]
+    fn models_dir_sits_next_to_the_logs() {
+        let models = models_dir();
+        assert_eq!(models.file_name().unwrap(), "models");
+        assert_eq!(models.parent(), logs_dir().parent());
     }
 
     #[test]

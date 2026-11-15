@@ -72,6 +72,11 @@ pub fn install(app: &AppHandle, name: &str) -> tauri::Result<()> {
                         }
                         let _ = toggle_item.set_text(tr("tray.hide"));
                     }
+                    // A hidden window draws no avatar model.
+                    let shown = w.is_visible().unwrap_or(true);
+                    for label in ["island", window::AVATAR_LABEL] {
+                        crate::avatar_model::window_shown(app, label, shown);
+                    }
                 }
             }
             "quit" => {

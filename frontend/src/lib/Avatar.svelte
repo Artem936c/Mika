@@ -20,6 +20,10 @@
     type Motion,
     type MouthLayer,
   } from './avatar';
+  import ModelView from './model/ModelView.svelte';
+  import Portrait from './model/Portrait.svelte';
+  import { pickShow, stillName } from './model/show';
+  import { model } from './model/state.svelte';
 
   let {
     view = 'full',
@@ -37,6 +41,18 @@
     /** A click on her; without it she is not clickable. */
     onpoke?: () => void;
   } = $props();
+
+  // The built-in pictures, a picture of the chosen model, or the model itself.
+  const show = $derived(
+    pickShow(view, {
+      modelId: model.id,
+      hasStills: model.stills.has(stillName(emotion, false)),
+      failed: model.failed !== '',
+    }),
+  );
+
+  /** Clicks on her so far: the living model hops on each. */
+  let pokes = $state(0);
 
   let blinkEyes = $state<EyeLayer | null>(null);
   let gesture = $state<Gesture | null>(null);
@@ -111,6 +127,7 @@
     if (!onpoke) return;
     e.stopPropagation();
     play(POKE_MOTION);
+    pokes += 1;
     onpoke();
   }
 
@@ -134,15 +151,21 @@
   style:height={size !== undefined ? `${size}px` : undefined}
   onclick={poke}
 >
-  <span class="fig" style={figStyle}>
-    <span class="mv" bind:this={mover}>
-      {#key emotion}
-        <img class="frame" src={frameUrl(emotion)} alt="" draggable="false" transition:fade={{ duration: size === undefined ? 220 : 0 }} />
-      {/key}
-      {#if eyes}<img class="layer" src={frameUrl(eyes)} alt="" draggable="false" />{/if}
-      {#if shownMouth}<img class="layer" src={frameUrl(shownMouth)} alt="" draggable="false" />{/if}
+  {#if show === 'live'}
+    <ModelView {emotion} {talking} {pokes} />
+  {:else if show === 'portrait'}
+    <Portrait {emotion} {talking} />
+  {:else}
+    <span class="fig" style={figStyle}>
+      <span class="mv" bind:this={mover}>
+        {#key emotion}
+          <img class="frame" src={frameUrl(emotion)} alt="" draggable="false" transition:fade={{ duration: size === undefined ? 220 : 0 }} />
+        {/key}
+        {#if eyes}<img class="layer" src={frameUrl(eyes)} alt="" draggable="false" />{/if}
+        {#if shownMouth}<img class="layer" src={frameUrl(shownMouth)} alt="" draggable="false" />{/if}
+      </span>
     </span>
-  </span>
+  {/if}
 </span>
 
 <style>

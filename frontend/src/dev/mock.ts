@@ -534,6 +534,96 @@ function journalRows(): MockRow[] {
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// ---- avatar models ----
+// `&model` gives one model with stand-in portraits; `&vrm` also serves the file
+// `src/dev/sample.vrm` as that model (the file is not in the repository);
+// `&nostills` starts it without portraits, so the page draws them itself.
+
+const MOCK_MODEL_ID = '0123456789abcdef';
+const MOCK_MODEL_2 = 'fedcba9876543210';
+const MOCK_EMOTIONS = ['neutral', 'joy', 'shy', 'surprise', 'sad', 'angry', 'think', 'wink', 'sleepy', 'worry'];
+const MOCK_EXPRESSIONS = ['happy', 'angry', 'sad', 'relaxed', 'surprised', 'aa', 'ih', 'ou', 'ee', 'oh', 'blink', 'blinkLeft', 'blinkRight', 'Blush'];
+
+interface MockSlot {
+  source: 'auto' | 'manual';
+  mix: [string, number][];
+  gaze?: [number, number];
+}
+
+/** The slot as the program fills it; the same table as `auto_slot` in mika-core, for the expressions above. */
+function mockAutoSlot(emotion: string): MockSlot {
+  const mixes: Record<string, MockSlot> = {
+    neutral: { source: 'auto', mix: [] },
+    joy: { source: 'auto', mix: [['happy', 1]] },
+    shy: { source: 'auto', mix: [['Blush', 1]] },
+    surprise: { source: 'auto', mix: [['surprised', 1]] },
+    sad: { source: 'auto', mix: [['sad', 1]] },
+    angry: { source: 'auto', mix: [['angry', 1]] },
+    think: { source: 'auto', mix: [], gaze: [-15, 15] },
+    wink: { source: 'auto', mix: [['blinkLeft', 1], ['happy', 0.5]] },
+    sleepy: { source: 'auto', mix: [['relaxed', 0.5], ['blink', 0.6]] },
+    worry: { source: 'auto', mix: [['sad', 0.5], ['surprised', 0.2]] },
+  };
+  return mixes[emotion];
+}
+
+function mockProfile(title: string) {
+  return {
+    version: 1,
+    format: 'vrm',
+    spec: '1.0',
+    title,
+    author: 'Автор модели',
+    license: 'https://vrm.dev/licenses/1.0/; everyone; personalNonProfit',
+    expressions: MOCK_EXPRESSIONS,
+    slots: Object.fromEntries(MOCK_EMOTIONS.map((e) => [e, mockAutoSlot(e)])) as Record<string, MockSlot>,
+    lip: 1,
+  };
+}
+
+/** A stand-in portrait: a flat face of its own colour for each emotion, base64 PNG. */
+function mockStill(name: string): string {
+  const full = name === 'full';
+  const canvas = document.createElement('canvas');
+  canvas.width = full ? 192 : 96;
+  canvas.height = full ? 256 : 96;
+  const g = canvas.getContext('2d')!;
+  const emotion = name.replace('-talk', '');
+  const hue = (MOCK_EMOTIONS.indexOf(emotion) + 1) * 36;
+  if (!full) {
+    g.fillStyle = `hsl(${hue} 55% 30%)`;
+    g.fillRect(0, 0, 96, 96);
+  }
+  const cx = canvas.width / 2;
+  const cy = full ? 70 : 50;
+  if (full) {
+    g.fillStyle = 'hsl(260 40% 40%)';
+    g.beginPath();
+    g.roundRect(cx - 55, 110, 110, 160, 30);
+    g.fill();
+  }
+  g.fillStyle = '#ffe3d2';
+  g.beginPath();
+  g.arc(cx, cy, 30, 0, Math.PI * 2);
+  g.fill();
+  g.fillStyle = '#2a2140';
+  g.fillRect(cx - 14, cy - 8, 6, 6);
+  g.fillRect(cx + 8, cy - 8, 6, 6);
+  g.beginPath();
+  if (name.endsWith('-talk')) g.ellipse(cx, cy + 13, 6, 5, 0, 0, Math.PI * 2);
+  else g.rect(cx - 7, cy + 12, 14, 2);
+  g.fill();
+  if (!full) {
+    g.fillStyle = '#fff';
+    g.font = '10px sans-serif';
+    g.textAlign = 'center';
+    g.fillText(emotion, cx, 92);
+  }
+  return canvas.toDataURL('image/png').split(',')[1];
+}
+
+const MOCK_STILL_NAMES = [...MOCK_EMOTIONS.flatMap((e) => [e, `${e}-talk`]), 'full'];
+
 export async function install(scenario: string) {
   const params = new URLSearchParams(location.search);
   document.body.style.background =
@@ -545,6 +635,14 @@ export async function install(scenario: string) {
   let persona = 'caring';
   let inIsland = !params.has('narrow');
   let onDesktop = false;
+  const hasModel = params.has('model') || params.has('vrm');
+  const avatarModels = hasModel
+    ? [{ id: MOCK_MODEL_ID, title: 'Пробная модель', author: 'Автор модели', license: mockProfile('').license, spec: '1.0', size_bytes: 12_400_000, has_stills: !params.has('nostills') }]
+    : [];
+  const avatarProfiles = new Map(avatarModels.map((m) => [m.id, mockProfile(m.title)]));
+  const avatarStills = new Map<string, { name: string; png_base64: string }[]>();
+  let activeModel = hasModel ? MOCK_MODEL_ID : '';
+  const modelChanged = () => emit('mika://ui', { action: 'avatar_model_changed' });
   // `&window` starts the preview as an ordinary window.
   let windowed = params.has('window');
   const ffmpeg = {
@@ -1395,6 +1493,77 @@ export async function install(scenario: string) {
           return journalView();
         case 'journal_crash_seen':
           journal.crashed = false;
+          return null;
+        case 'avatar_models':
+          return { active: activeModel, models: avatarModels };
+        case 'avatar_model_profile': {
+          const found = avatarProfiles.get(String(a.id));
+          if (!found) throw 'Такой модели нет';
+          return found;
+        }
+        case 'avatar_model_stills': {
+          const id = String(a.id);
+          const saved = avatarStills.get(id);
+          if (saved) return saved;
+          if (!avatarModels.find((m) => m.id === id)?.has_stills) return [];
+          const drawn = MOCK_STILL_NAMES.map((name) => ({ name, png_base64: mockStill(name) }));
+          avatarStills.set(id, drawn);
+          return drawn;
+        }
+        case 'avatar_model_bytes':
+          // `&vrm`: the file a developer put beside this module.
+          if (!params.has('vrm')) throw 'Файл модели повреждён';
+          return fetch('/src/dev/sample.vrm').then((r) => {
+            if (!r.ok) throw 'Нет файла frontend/src/dev/sample.vrm';
+            return r.arrayBuffer();
+          });
+        case 'avatar_model_add': {
+          if (avatarModels.some((m) => m.id === MOCK_MODEL_2)) return avatarModels.find((m) => m.id === MOCK_MODEL_2);
+          const added = { id: MOCK_MODEL_2, title: 'Вторая модель', author: 'Другой автор', license: 'CC_BY; Everyone; Allow', spec: '0.x', size_bytes: 38_200_000, has_stills: false };
+          avatarModels.push(added);
+          avatarProfiles.set(added.id, mockProfile(added.title));
+          return added;
+        }
+        case 'avatar_model_select':
+          activeModel = String(a.id);
+          modelChanged();
+          return null;
+        case 'avatar_model_delete': {
+          const at = avatarModels.findIndex((m) => m.id === a.id);
+          if (at < 0) throw 'Такой модели нет';
+          avatarModels.splice(at, 1);
+          if (activeModel === a.id) activeModel = '';
+          modelChanged();
+          return null;
+        }
+        case 'avatar_model_set_slot': {
+          const found = avatarProfiles.get(String(a.id));
+          if (!found) throw 'Такой модели нет';
+          const emotion = String(a.emotion);
+          found.slots[emotion] = typeof a.expression === 'string' ? { source: 'manual', mix: [[a.expression, 1]] } : mockAutoSlot(emotion);
+          modelChanged();
+          return found;
+        }
+        case 'avatar_model_set_lip': {
+          const found = avatarProfiles.get(String(a.id));
+          if (!found) throw 'Такой модели нет';
+          found.lip = Math.min(1.5, Math.max(0, Number(a.lip)));
+          modelChanged();
+          return found;
+        }
+        case 'avatar_model_save_stills': {
+          const id = String(a.id);
+          const given = (a.stills as { name: string; png_base64: string }[]).map((s) => ({ name: s.name, png_base64: s.png_base64.split(',').pop() ?? '' }));
+          const kept = new Map((avatarStills.get(id) ?? []).map((s) => [s.name, s]));
+          for (const s of given) kept.set(s.name, s);
+          avatarStills.set(id, MOCK_STILL_NAMES.filter((n) => kept.has(n)).map((n) => kept.get(n)!));
+          const listed = avatarModels.find((m) => m.id === id);
+          if (listed) listed.has_stills = kept.size >= MOCK_STILL_NAMES.length;
+          modelChanged();
+          return null;
+        }
+        case 'avatar_model_failed':
+          console.info('[mock] avatar_model_failed', a.id, a.kind);
           return null;
         default:
           return null;

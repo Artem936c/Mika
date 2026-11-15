@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod avatar_model;
 mod backup;
 mod bgjobs;
 mod bridge;
@@ -208,6 +209,17 @@ fn main() {
             bridge::set_assistant_name,
             bridge::set_persona,
             bridge::set_avatar_placement,
+            avatar_model::avatar_models,
+            avatar_model::avatar_model_add,
+            avatar_model::avatar_model_select,
+            avatar_model::avatar_model_delete,
+            avatar_model::avatar_model_profile,
+            avatar_model::avatar_model_bytes,
+            avatar_model::avatar_model_set_slot,
+            avatar_model::avatar_model_set_lip,
+            avatar_model::avatar_model_save_stills,
+            avatar_model::avatar_model_stills,
+            avatar_model::avatar_model_failed,
             bridge::get_emotion,
             bridge::set_window_mode,
             settings::get_tool_settings,

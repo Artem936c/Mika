@@ -4,6 +4,8 @@ target/
 # Frontend
 node_modules/
 frontend/dist/
+# Made by frontend/src/dev/make-sample-vrm.mjs, or a model of your own for the preview
+frontend/src/dev/sample.vrm
 
 # Tauri
 crates/mika-gui/gen/

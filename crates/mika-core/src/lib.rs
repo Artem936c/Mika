@@ -1,6 +1,7 @@
 //! Core of the assistant. No Tauri or Windows dependencies except `keyring`.
 
 pub mod agent;
+pub mod avatar;
 pub mod backup;
 pub mod bgjobs;
 pub mod commands;

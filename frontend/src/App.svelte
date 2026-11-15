@@ -24,6 +24,7 @@
     type ScreenAsk,
   } from './lib/hotkeys';
   import { t } from './lib/i18n';
+  import { startModelState } from './lib/model/state.svelte';
   import { crashedOf } from './lib/journal';
   import { lang } from './lib/locale.svelte';
   import { reduceTask, type TaskView } from './lib/task';
@@ -291,6 +292,7 @@
   onMount(() => {
     let unlisten: (() => void) | undefined;
     let unlistenUi: (() => void) | undefined;
+    startModelState();
     invoke<AssistantState>('get_state').then((s) => (current = s));
     invoke<unknown>('get_emotion').then((e) => {
       if (isEmotion(e)) emotion = e;
