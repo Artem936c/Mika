@@ -156,7 +156,7 @@ fn strings(list: Option<&Value>) -> Vec<String> {
 }
 
 /// A buffer or a picture that lives outside the file: an address or a path.
-fn refers_outside(json: &Value) -> bool {
+pub(crate) fn refers_outside(json: &Value) -> bool {
     ["buffers", "images"].iter().any(|list| {
         json.get(list)
             .and_then(Value::as_array)

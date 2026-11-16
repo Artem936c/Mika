@@ -643,6 +643,7 @@ export async function install(scenario: string) {
   const avatarStills = new Map<string, { name: string; png_base64: string }[]>();
   let activeModel = hasModel ? MOCK_MODEL_ID : '';
   const modelChanged = () => emit('mika://ui', { action: 'avatar_model_changed' });
+  let look = { pose: params.get('pose') ?? 'relaxed', scale: 1, frame: params.get('frame') ?? 'full', follow_cursor: true, idle_actions: true };
   // `&window` starts the preview as an ordinary window.
   let windowed = params.has('window');
   const ffmpeg = {
@@ -1494,6 +1495,27 @@ export async function install(scenario: string) {
         case 'journal_crash_seen':
           journal.crashed = false;
           return null;
+        case 'avatar_motions':
+          return [{ id: 'aaaaaaaaaaaaaaaa', name: 'Победный танец', ms: 4200 }];
+        case 'avatar_motion_add':
+        case 'avatar_motion_rename':
+        case 'avatar_motion_delete':
+        case 'avatar_motion_play':
+        case 'avatar_hover':
+        case 'avatar_dragging':
+        case 'avatar_cursor_wanted':
+        case 'avatar_typing':
+          return null;
+        case 'avatar_look':
+          return look;
+        case 'avatar_set_look':
+          look = { ...(args as { look: typeof look }).look };
+          emit('mika://ui', { action: 'avatar_look_changed' });
+          return look;
+        case 'avatar_scale_step':
+          look = { ...look, scale: Math.min(1.6, Math.max(0.6, Math.round((look.scale + ((args as { delta: number }).delta > 0 ? 0.1 : -0.1)) * 10) / 10)) };
+          emit('mika://ui', { action: 'avatar_look_changed' });
+          return look.scale;
         case 'avatar_models':
           return { active: activeModel, models: avatarModels };
         case 'avatar_model_profile': {
@@ -1513,8 +1535,10 @@ export async function install(scenario: string) {
         case 'avatar_model_bytes':
           // `&vrm`: the file a developer put beside this module.
           if (!params.has('vrm')) throw 'Файл модели повреждён';
-          return fetch('/src/dev/sample.vrm').then((r) => {
-            if (!r.ok) throw 'Нет файла frontend/src/dev/sample.vrm';
+          // `&vrm=name` serves `src/dev/name.vrm`; a bare `&vrm=1` serves `sample.vrm`.
+          const file = /^[a-z0-9_-]+$/i.test(params.get('vrm') ?? '') && params.get('vrm') !== '1' ? params.get('vrm') : 'sample';
+          return fetch(`/src/dev/${file}.vrm`).then((r) => {
+            if (!r.ok) throw `Нет файла frontend/src/dev/${file}.vrm`;
             return r.arrayBuffer();
           });
         case 'avatar_model_add': {
@@ -1585,6 +1609,17 @@ export async function install(scenario: string) {
       await wait(110);
     }
     send({ type: 'assistant_text', text });
+    // The voice reads it phrase by phrase, a little behind the text.
+    void (async () => {
+      for (const phrase of text.split(/(?<=[.!?])\s+/)) {
+        const steps = Math.max(1, Math.round((phrase.length * 65) / 20));
+        const levels = Array.from({ length: steps }, (_, i) => Math.round(255 * Math.abs(Math.sin(i / 2.3)) * (i % 17 === 16 ? 0 : 1)));
+        send({ type: 'voice_phrase', text: phrase, frame_ms: 20, levels });
+        await wait(steps * 20);
+        send({ type: 'voice_quiet' });
+        await wait(250);
+      }
+    })();
   };
   const click = (selector: string) => (document.querySelector(selector) as HTMLElement | null)?.click();
 

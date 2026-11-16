@@ -1,4 +1,7 @@
 <script lang="ts">
+  import { invoke } from '@tauri-apps/api/core';
+  import { noteTyping } from './model/live.svelte';
+  import { talkingNow } from './model/voice.svelte';
   import { tick } from 'svelte';
   import Avatar from './Avatar.svelte';
   import AvFilesCard from './AvFilesCard.svelte';
@@ -97,7 +100,7 @@
     /** Hide a finished task panel. */
     ontaskhide?: () => void;
     /** A click on the avatar. */
-    onpoke?: () => void;
+    onpoke?: (part: import('./model/touch').TouchPart | null) => void;
     /** Text selected in another program, sent by the shortcut. */
     selection?: Selection | null;
     onselection?: (action: string) => void;
@@ -109,6 +112,21 @@
   } = $props();
 
   let draft = $state('');
+
+  /** When the desktop avatar was last told the user types, ms. */
+  let typingToldAt = 0;
+
+  /** The user types: a model looks at the field; the one on the desktop looks at the island. */
+  function ontyping() {
+    if (!input) return;
+    const box = input.getBoundingClientRect();
+    noteTyping(box.left + box.width / 2, box.top + box.height / 2);
+    const now = performance.now();
+    if (now - typingToldAt >= 500) {
+      typingToldAt = now;
+      invoke('avatar_typing').catch(() => {});
+    }
+  }
   let list: HTMLDivElement | undefined = $state();
   let input: HTMLTextAreaElement | undefined = $state();
   const busy = $derived(status !== 'idle');
@@ -160,7 +178,7 @@
   {#if wide}
     <div class="stagecol">
       <div class="halo"></div>
-      <div class="girlbox"><Avatar view="full" {emotion} talking={status === 'speaking'} {onpoke} /></div>
+      <div class="girlbox"><Avatar view="full" {emotion} talking={talkingNow(status === 'speaking')} {onpoke} /></div>
       <div class="plate">
         <b>{name}</b>
         <span><i class="live" class:busy></i>{t(stateLabel(status)).toLowerCase()}</span>
@@ -171,7 +189,7 @@
   <div class="chatcol">
     <header class="cbar" use:dragRegion={{ ondouble: windowed ? toggleMaximize : undefined }} title={t('chat.drag_title')}>
       {#if !wide}
-        <span title={t(stateLabel(status))}><Avatar view="head" {emotion} size={30} talking={status === 'speaking'} /></span>
+        <span title={t(stateLabel(status))}><Avatar view="head" {emotion} size={30} talking={talkingNow(status === 'speaking')} /></span>
       {/if}
       <button class="tg" class:on={speak} title={t('chat.speak_title')} aria-pressed={speak} onclick={() => onspeak(!speak)}>
         <Icon name={speak ? 'vol' : 'mute'} size={14} />{t('chat.speak')}
@@ -295,6 +313,7 @@
       <textarea
         bind:this={input}
         bind:value={draft}
+        oninput={ontyping}
         onkeydown={onkey}
         rows="1"
         placeholder={t('chat.placeholder')}

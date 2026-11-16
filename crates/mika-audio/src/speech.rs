@@ -74,6 +74,10 @@ pub trait Voice: Send + Sync {
     /// voice marks of its own. `None`: never any. A voice that wraps another
     /// must pass it on.
     fn set_direction(&self, _direction: Option<DirectionSource>) {}
+    /// Told of every phrase when it starts to sound and when it falls quiet,
+    /// for the lips of the avatar (decision 0040). A voice that wraps another
+    /// must pass it on.
+    fn set_lips(&self, _sink: Option<crate::lips::LipSink>) {}
 }
 
 /// Pitch and pace in percent of the usual, asked for each sentence.
@@ -879,6 +883,10 @@ impl Voice for Retold {
 
     fn set_direction(&self, direction: Option<DirectionSource>) {
         self.inner.set_direction(direction);
+    }
+
+    fn set_lips(&self, sink: Option<crate::lips::LipSink>) {
+        self.inner.set_lips(sink);
     }
 }
 
@@ -2898,6 +2906,38 @@ mod tests {
         fn set_direction(&self, direction: Option<DirectionSource>) {
             *self.direction.lock() = direction;
         }
+    }
+
+    /// A voice that only remembers whether it was given a lip sink.
+    #[derive(Default)]
+    struct LippedVoice {
+        lips: Mutex<Option<crate::lips::LipSink>>,
+    }
+
+    impl Voice for LippedVoice {
+        fn speak(&self, _text: &str) {}
+        fn stop(&self) {}
+        fn voices(&self) -> Vec<VoiceInfo> {
+            Vec::new()
+        }
+        fn configure(&self, _voice: &str, _rate: f32) {}
+        fn set_lips(&self, sink: Option<crate::lips::LipSink>) {
+            *self.lips.lock() = sink;
+        }
+    }
+
+    #[test]
+    fn a_wrapped_voice_passes_the_lip_sink_on() {
+        let inner = Arc::new(LippedVoice::default());
+        let voice = SpeakerSwitch::new(true).wrap(inner.clone());
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let into = heard.clone();
+        voice.set_lips(Some(Arc::new(move |cue| into.lock().push(cue))));
+        let sink = inner.lips.lock().clone().expect("passed on");
+        sink(crate::lips::LipCue::Quiet);
+        assert_eq!(*heard.lock(), vec![crate::lips::LipCue::Quiet]);
+        voice.set_lips(None);
+        assert!(inner.lips.lock().is_none());
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 pub mod apps;
 pub mod archive;
+pub mod avatar;
 pub mod batch;
 pub mod browser;
 pub mod calendar;
@@ -227,6 +228,10 @@ const HINTS: &[(&str, &str)] = &[
     ),
     ("bg_job_stop", "остановить фоновое задание"),
     (
+        "avatar_gesture",
+        "помахать, поклониться, станцевать, показать жест телом",
+    ),
+    (
         "journal_read",
         "почему у самой помощницы что-то не сработало, зависло или сломалось, какие были ошибки",
     ),
@@ -261,6 +266,11 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
     let profile = env.user_profile.clone();
     let web = env.shared.web_enabled.clone();
     reg.register(Arc::new(TimeTool));
+    // Only moves the model on the screen (decision 0040).
+    reg.register(Arc::new(avatar::AvatarGestureTool {
+        bus: env.shared.bus.clone(),
+        motions: mika_core::paths::motions_dir(),
+    }));
     reg.register(Arc::new(TaskPlanTool(env.shared.tasks.clone())));
     reg.register(Arc::new(TaskStepTool(env.shared.tasks.clone())));
 
@@ -594,7 +604,7 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register_all(&mut reg, &env, &[]);
         let specs = reg.specs();
-        assert_eq!(specs.len(), 109);
+        assert_eq!(specs.len(), 110);
         for s in specs {
             assert_eq!(s.parameters["type"], "object", "{}", s.name);
             assert!(!s.description.is_empty());
@@ -633,8 +643,10 @@ mod tests {
         let mut reg = ToolRegistry::new();
         let off: Vec<String> = GROUPS.iter().map(|g| g.to_string()).collect();
         register_all(&mut reg, &env, &off);
-        assert_eq!(reg.specs().len(), 3);
+        assert_eq!(reg.specs().len(), 4);
         assert!(reg.get("get_time").is_some() && reg.get("task_plan").is_some());
+        // A gesture only moves the model on the screen: it belongs to no group.
+        assert!(reg.get("avatar_gesture").is_some());
 
         let mut reg = ToolRegistry::new();
         register_all(&mut reg, &env, &["windows".into(), "screen".into()]);

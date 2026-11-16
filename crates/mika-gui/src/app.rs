@@ -759,6 +759,22 @@ impl Ctx {
                 let _ = this.check_update().await;
             });
         }
+        // The lips of the avatar follow each phrase as it sounds (decision 0040).
+        let lips = self.bus.clone();
+        self.voice.set_lips(Some(Arc::new(move |cue| {
+            lips.publish(match cue {
+                mika_audio::lips::LipCue::Phrase {
+                    text,
+                    frame_ms,
+                    levels,
+                } => mika_core::Event::VoicePhrase {
+                    text,
+                    frame_ms,
+                    levels,
+                },
+                mika_audio::lips::LipCue::Quiet => mika_core::Event::VoiceQuiet,
+            });
+        })));
         let timings = self.bus.clone();
         self.voice.set_observer(Some(Arc::new(move |ms| {
             timings.publish(mika_core::Event::Timing {

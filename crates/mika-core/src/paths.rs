@@ -72,6 +72,15 @@ pub fn models_dir() -> PathBuf {
     }
 }
 
+/// Avatar animations the user brought in, a folder per animation:
+/// `%LOCALAPPDATA%\Mika\motions` (decision 0040).
+pub fn motions_dir() -> PathBuf {
+    match logs_dir().parent() {
+        Some(parent) => parent.join("motions"),
+        None => data_dir().join("motions"),
+    }
+}
+
 pub fn database_path() -> PathBuf {
     data_dir().join("mika.db")
 }

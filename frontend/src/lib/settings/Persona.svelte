@@ -4,6 +4,8 @@
   import Avatar from '../Avatar.svelte';
   import { EMOTION_ORDER, type Emotion } from '../avatar';
   import { t } from '../i18n';
+  import ModelLook from './ModelLook.svelte';
+  import ModelMotions from './ModelMotions.svelte';
   import ModelSlots from './ModelSlots.svelte';
   import ModelTiles from './ModelTiles.svelte';
 
@@ -99,7 +101,9 @@
 
     <div class="lbl">{t('persona.model')}</div>
     <ModelTiles name={savedName} />
+    <ModelLook />
     <ModelSlots onshow={(e) => (shown = e)} />
+    <ModelMotions />
 
     <div class="lbl">{t('persona.character')}</div>
     <div class="chips" role="radiogroup" aria-label={t('persona.character')}>

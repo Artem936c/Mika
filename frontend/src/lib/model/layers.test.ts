@@ -5,7 +5,6 @@ import {
   VOWELS,
   approach,
   blinkWeight,
-  boneAngles,
   breath,
   canModelBlink,
   frameDue,
@@ -18,16 +17,32 @@ import {
   shouldRender,
   slotPose,
   slotWeights,
+  trunkPose,
   type Profile,
   type Slot,
   type Vowel,
 } from './layers';
+import { withSign } from './rig';
 
-const slot = (mix: [string, number][], gaze?: [number, number]): Slot => ({ source: 'auto', mix, gaze });
+const slot = (mix: [string, number][], gaze?: [number, number]): Slot => ({
+  source: 'auto',
+  mix,
+  gaze,
+});
 
 function profile(lip: number, mix: [string, number][] = []): Profile {
   const slots = Object.fromEntries(EMOTION_ORDER.map((e) => [e, slot(mix)])) as Record<Emotion, Slot>;
-  return { version: 1, format: 'vrm', spec: '1.0', title: 'T', author: 'A', license: '', expressions: [], slots, lip };
+  return {
+    version: 1,
+    format: 'vrm',
+    spec: '1.0',
+    title: 'T',
+    author: 'A',
+    license: '',
+    expressions: [],
+    slots,
+    lip,
+  };
 }
 
 describe('blinking', () => {
@@ -91,13 +106,30 @@ describe('smoothing', () => {
 
 describe('emotion', () => {
   it('weights skip expressions the model lacks', () => {
-    const weights = slotWeights(slot([['happy', 1], ['nope', 0.5]]), new Set(['happy']));
+    const weights = slotWeights(
+      slot([
+        ['happy', 1],
+        ['nope', 0.5],
+      ]),
+      new Set(['happy']),
+    );
     expect([...weights]).toEqual([['happy', 1]]);
   });
 
   it('a weight from the profile stays between 0 and 1', () => {
-    const weights = slotWeights(slot([['a', 7], ['b', -2], ['c', Number.NaN]]), new Set(['a', 'b', 'c']));
-    expect([...weights]).toEqual([['a', 1], ['b', 0], ['c', 0]]);
+    const weights = slotWeights(
+      slot([
+        ['a', 7],
+        ['b', -2],
+        ['c', Number.NaN],
+      ]),
+      new Set(['a', 'b', 'c']),
+    );
+    expect([...weights]).toEqual([
+      ['a', 1],
+      ['b', 0],
+      ['c', 0],
+    ]);
   });
 
   it('a model without expressions gives empty weights', () => {
@@ -110,10 +142,20 @@ describe('emotion', () => {
   });
 
   it('the neutral slot has no pose and no gesture', () => {
-    expect(slotPose('neutral')).toEqual({ pitch: 0, yaw: 0, roll: 0, spine: 0 });
+    expect(slotPose('neutral')).toEqual({
+      pitch: 0,
+      yaw: 0,
+      roll: 0,
+      spine: 0,
+    });
     expect(gestureAt('neutral', 0)).toBeNull();
     expect(slotPose('sad').pitch).toBeGreaterThan(0);
-    expect(slotPose('think')).toEqual({ pitch: -6, yaw: -12, roll: 8, spine: 0 });
+    expect(slotPose('think')).toEqual({
+      pitch: -6,
+      yaw: -12,
+      roll: 8,
+      spine: 0,
+    });
   });
 });
 
@@ -174,37 +216,39 @@ describe('rig', () => {
     expect(rigSign(undefined)).toBe(1);
   });
 
-  it('a VRM 1.0 model: head down is a positive turn about X, arms come down about Z', () => {
-    expect(boneAngles(pose, 1.5, 2, 1)).toEqual({
+  it('the trunk of a VRM 1.0 model: head down is a positive turn about X', () => {
+    expect(trunkPose(pose, 1.5, 2, true)).toEqual({
       head: [12, 6, -4],
-      spineX: 3,
-      chestX: 1.5,
-      hipsZ: -2,
-      leftUpperArmZ: -70,
-      rightUpperArmZ: 70,
-      leftLowerArmY: -10,
-      rightLowerArmY: 10,
+      spine: [3, 0, 0],
+      chest: [1.5, 0, 0],
+      hips: [0, 0, -2],
     });
   });
 
-  it('a VRM 0.x model gets the same pose with X and Z turned and Y kept', () => {
-    expect(boneAngles(pose, 1.5, 2, -1)).toEqual({
+  it('a model without a chest breathes with its spine', () => {
+    expect(trunkPose(pose, 1.5, 0, false)).toEqual({
+      head: [12, 6, -4],
+      spine: [4.5, 0, 0],
+      hips: [0, 0, 0],
+    });
+  });
+
+  it('a VRM 0.x model gets the same trunk with X and Z turned and Y kept', () => {
+    expect(withSign(trunkPose(pose, 1.5, 2, true), -1)).toEqual({
       head: [-12, 6, 4],
-      spineX: -3,
-      chestX: -1.5,
-      hipsZ: 2,
-      // Without this her arms would go up instead of down.
-      leftUpperArmZ: 70,
-      rightUpperArmZ: -70,
-      leftLowerArmY: -10,
-      rightLowerArmY: 10,
+      spine: [-3, 0, 0],
+      chest: [-1.5, 0, 0],
+      hips: [0, 0, 2],
     });
   });
 
-  it('at rest nothing is turned but the arms', () => {
-    const rest = boneAngles({ pitch: 0, yaw: 0, roll: 0, spine: 0 }, 0, 0, 1);
-    expect(rest.head.map((v) => v + 0)).toEqual([0, 0, 0]);
-    expect(rest.spineX + rest.chestX + rest.hipsZ).toBe(0);
+  it('at rest the trunk is not turned', () => {
+    const rest = trunkPose({ pitch: 0, yaw: 0, roll: 0, spine: 0 }, 0, 0, true);
+    expect(
+      Object.values(rest)
+        .flat()
+        .every((v) => v === 0),
+    ).toBe(true);
   });
 });
 
@@ -226,6 +270,25 @@ describe('camera', () => {
     expect(f.height).toBeCloseTo(0.255);
   });
 
+  it('the waist view runs from above the head to a little above the hips', () => {
+    const f = frameFor('waist', 1.4, 0.9, 1.55);
+    const bottom = f.centerY - f.height / 2;
+    expect(bottom).toBeGreaterThan(0.9);
+    expect(bottom).toBeLessThan(1.1);
+    expect(f.centerY + f.height / 2).toBeGreaterThan(1.55);
+    // Closer than the full view.
+    expect(f.height).toBeLessThan(frameFor('full', 1.4, 0.9, 1.55).height);
+  });
+
+  it('the close view shows the head and the shoulders', () => {
+    const f = frameFor('close', 1.4, 0.9, 1.55);
+    const bottom = f.centerY - f.height / 2;
+    expect(bottom).toBeLessThan(1.4 - 0.1);
+    expect(bottom).toBeGreaterThan(0.9);
+    expect(f.centerY + f.height / 2).toBeGreaterThan(1.55);
+    expect(f.height).toBeLessThan(frameFor('waist', 1.4, 0.9, 1.55).height);
+  });
+
   it('a model with broken bones still gets a frame', () => {
     const f = frameFor('full', 1, 1, 1);
     expect(f.height).toBeGreaterThan(0);
@@ -235,9 +298,27 @@ describe('camera', () => {
 
 describe('drawing', () => {
   it('nothing is drawn when the view is not seen', () => {
-    expect(shouldRender({ attached: true, windowShown: true, documentHidden: false })).toBe(true);
-    expect(shouldRender({ attached: false, windowShown: true, documentHidden: false })).toBe(false);
-    expect(shouldRender({ attached: true, windowShown: false, documentHidden: false })).toBe(false);
+    expect(
+      shouldRender({
+        attached: true,
+        windowShown: true,
+        documentHidden: false,
+      }),
+    ).toBe(true);
+    expect(
+      shouldRender({
+        attached: false,
+        windowShown: true,
+        documentHidden: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldRender({
+        attached: true,
+        windowShown: false,
+        documentHidden: false,
+      }),
+    ).toBe(false);
     expect(shouldRender({ attached: true, windowShown: true, documentHidden: true })).toBe(false);
   });
 

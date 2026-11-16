@@ -3,6 +3,7 @@
 // scene asks them what to show at a given moment.
 
 import type { Emotion } from '../avatar';
+import type { RigPose } from './rig';
 
 /** How a model shows one emotion; comes from its profile. */
 export interface Slot {
@@ -38,9 +39,6 @@ export const LIP_TAU_MS = 60;
 /** Mouth shapes of the VRM format. */
 export const VOWELS = ['aa', 'ih', 'ou', 'ee', 'oh'] as const;
 export type Vowel = (typeof VOWELS)[number];
-
-/** The arms of a model without animation stand out sideways: how far they come down, degrees. */
-export const REST_POSE = { upperArm: 70, lowerArm: 10 } as const;
 
 const clamp01 = (v: number) => (Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0);
 
@@ -121,34 +119,19 @@ export function rigSign(metaVersion: string | undefined): 1 | -1 {
   return metaVersion === '0' ? -1 : 1;
 }
 
-/** Turns of the bones of the rig, degrees. `head` is about X, Y and Z. */
-export interface BoneAngles {
-  head: [number, number, number];
-  spineX: number;
-  chestX: number;
-  hipsZ: number;
-  leftUpperArmZ: number;
-  rightUpperArmZ: number;
-  leftLowerArmY: number;
-  rightLowerArmY: number;
-}
-
 /**
- * Every turn the scene gives the bones: the pose of the emotion, breathing
- * (degrees of the chest), the roll of a one-off gesture and the arms at rest.
- * `sign` is `rigSign` of the model.
+ * The trunk of a VRM 1.0 rig for the pose of the emotion, breathing (degrees
+ * of the chest) and the roll of a one-off gesture. A model without a chest
+ * bone breathes with its spine. `withSign` turns it for a VRM 0.x rig.
  */
-export function boneAngles(pose: Pose, breathing: number, roll: number, sign: 1 | -1): BoneAngles {
-  return {
-    head: [sign * pose.pitch, pose.yaw, -sign * pose.roll],
-    spineX: sign * pose.spine,
-    chestX: sign * breathing,
-    hipsZ: -sign * roll,
-    leftUpperArmZ: -sign * REST_POSE.upperArm,
-    rightUpperArmZ: sign * REST_POSE.upperArm,
-    leftLowerArmY: -REST_POSE.lowerArm,
-    rightLowerArmY: REST_POSE.lowerArm,
+export function trunkPose(pose: Pose, breathing: number, roll: number, hasChest: boolean): RigPose {
+  const out: RigPose = {
+    head: [pose.pitch + 0, pose.yaw + 0, -pose.roll + 0],
+    spine: [pose.spine + (hasChest ? 0 : breathing) + 0, 0, 0],
+    hips: [0, 0, -roll + 0],
   };
+  if (hasChest) out.chest = [breathing + 0, 0, 0];
+  return out;
 }
 
 /** Chest pitch of breathing at `ms`, degrees: period 4000 ms, amplitude 1.5. */
@@ -158,7 +141,11 @@ export function breath(ms: number): number {
 
 /** A glance aside: where and for how long. `r1`, `r2` are random numbers in [0, 1). */
 export function gazeWander(r1: number, r2: number): { yaw: number; pitch: number; ms: number } {
-  return { yaw: (r1 * 2 - 1) * 10, pitch: (r2 * 2 - 1) * 4, ms: 1200 + r2 * 1000 };
+  return {
+    yaw: (r1 * 2 - 1) * 10,
+    pitch: (r2 * 2 - 1) * 4,
+    ms: 1200 + r2 * 1000,
+  };
 }
 
 /** A one-off movement: evenly spaced steps of height (share of her height, up is positive) and roll (degrees). */
@@ -174,12 +161,20 @@ const MOVES: Partial<Record<Emotion | 'poke', Move>> = {
   poke: { y: [0, 0.03, 0], roll: [0, 0, 0], ms: 450 },
   joy: { y: [0, 0.035, 0, 0.015, 0], roll: [0, 0, 0, 0, 0], ms: 700 },
   surprise: { y: [0, 0.025, -0.005, 0], roll: [0, 0, 0, 0], ms: 500 },
-  angry: { y: [0, 0, 0, 0, 0, 0, 0], roll: [0, -1.8, 1.8, -1.5, 1.5, -0.9, 0], ms: 450 },
+  angry: {
+    y: [0, 0, 0, 0, 0, 0, 0],
+    roll: [0, -1.8, 1.8, -1.5, 1.5, -0.9, 0],
+    ms: 450,
+  },
   sad: { y: [0, -0.02, -0.015, 0], roll: [0, -1.5, -1, 0], ms: 1600 },
   shy: { y: [0, -0.005, -0.005, 0], roll: [0, -3, -2.5, 0], ms: 1300 },
   wink: { y: [0, 0.0125, 0], roll: [0, 2.5, 0], ms: 500 },
   think: { y: [0, 0, 0, 0], roll: [0, 2.5, 2, 0], ms: 1800 },
-  sleepy: { y: [0, -0.015, -0.0025, -0.0175, 0], roll: [0, 2, 0.5, 2.5, 0], ms: 2400 },
+  sleepy: {
+    y: [0, -0.015, -0.0025, -0.0175, 0],
+    roll: [0, 2, 0.5, 2.5, 0],
+    ms: 2400,
+  },
   worry: { y: [0, 0, 0, 0, 0, 0], roll: [0, -0.6, 0.6, -0.6, 0.6, 0], ms: 600 },
 };
 
@@ -207,11 +202,23 @@ const MIN_FRAME = 0.2;
  * The part of her the camera shows: centre height and visible height, metres.
  * `headY` and `hipsY` are the heights of those bones, `topY` is the top of the head.
  */
-export function frameFor(view: 'full' | 'head', headY: number, hipsY: number, topY: number): { centerY: number; height: number } {
+export type ModelFrame = 'full' | 'waist' | 'close' | 'head';
+
+export function frameFor(view: ModelFrame, headY: number, hipsY: number, topY: number): { centerY: number; height: number } {
+  if (view === 'waist' || view === 'close') {
+    // Down to a little above the hips, or the head and the shoulders, with air above the head.
+    const headSize = Math.max(0, topY - headY);
+    const bottom = view === 'waist' ? hipsY + 0.15 * Math.max(0, topY - hipsY) : headY - 1.2 * headSize;
+    const height = Math.max(MIN_FRAME, (topY - bottom) / (1 - HEADROOM));
+    return { centerY: bottom + height / 2, height };
+  }
   if (view === 'head') {
     // The head bone sits at the neck; the head is what is between it and the top.
     const headSize = Math.max(0, topY - headY);
-    return { centerY: headY + 0.45 * headSize, height: Math.max(MIN_FRAME, 1.7 * headSize) };
+    return {
+      centerY: headY + 0.45 * headSize,
+      height: Math.max(MIN_FRAME, 1.7 * headSize),
+    };
   }
   // The same cut as the built-in pictures: down to the middle of the thigh,
   // and air above the head, because the places that show her clip the top.

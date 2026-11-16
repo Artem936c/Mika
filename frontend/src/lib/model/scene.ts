@@ -6,6 +6,7 @@
 // the view that loses it gets its last frame as a picture.
 
 import { VRMLoaderPlugin, VRMUtils, type VRM, type VRMHumanBoneName } from '@pixiv/three-vrm';
+import { VRMAnimationLoaderPlugin, createVRMAnimationHumanoidTracks, type VRMAnimation } from '@pixiv/three-vrm-animation';
 import { invoke } from '@tauri-apps/api/core';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
@@ -17,7 +18,6 @@ import {
   VOWELS,
   approach,
   blinkWeight,
-  boneAngles,
   breath,
   canModelBlink,
   frameDue,
@@ -30,11 +30,42 @@ import {
   shouldRender,
   slotPose,
   slotWeights,
+  trunkPose,
+  type ModelFrame,
   type Pose,
   type Profile,
   type Vowel,
 } from './layers';
+import { smoothOpen } from './lips';
+import {
+  BODY_TAU_MS,
+  EMOTION_BODY,
+  END_CUES,
+  GESTURES,
+  IDLE_ACTIONS,
+  STATE_BODY,
+  autoPosePause,
+  beatOffset,
+  beats,
+  bodyState,
+  endCue,
+  idleActionPause,
+  idleOffset,
+  nextAutoPose,
+  saccade,
+  sampleTimeline,
+  speechStrength,
+  twiceBlink,
+  ZERO_TRUNK,
+  type IdleAction,
+  type Timeline,
+} from './body';
+import { REST_POSES, restPoseOf, type RestPose } from './poses';
+import { RIG_BONES, add, mix, withSign, type RigBone, type RigPose } from './rig';
 import { FULL_STILL, stillName } from './show';
+import { STATE_GAZE, aimAt, angleTo, cursorInterest, pickGaze } from './gaze';
+import { Probe, REACTION, nearestBone, partOf, type TouchPart } from './touch';
+import { currentPhrase, mouthNow, voice } from './voice.svelte';
 
 /** Why a scene could not be shown: no WebGL, a model that did not load, a lost context. */
 export type FailKind = 'webgl' | 'load' | 'context_lost';
@@ -55,16 +86,50 @@ export interface SceneInput {
   windowShown: boolean;
   /** The system asks for less motion: the face lives, the body stands. */
   still: boolean;
+  /** Her state and whether a tool is at work. */
+  state?: string;
+  working?: boolean;
+  /** `performance.now()` of the last message the user sent: she nods to it. */
+  sentAt?: number;
+  /** The rest pose from the settings, or `auto`. */
+  pose?: string;
+  /** Idle actions now and then. */
+  idleActions?: boolean;
+  /** What part of her the view shows. */
+  frame?: 'full' | 'waist' | 'close';
+  /** She looks at the cursor. */
+  follow?: boolean;
+  /** The cursor in pixels of the window, and when it last moved. */
+  cursor?: { x: number; y: number; movedAt: number } | null;
+  /** Where the user types, in pixels of the window, and when. */
+  typing?: { x: number; y: number; at: number } | null;
 }
 
 export interface Scene {
   /** Moves the canvas into `host`. The view that had it gets `onLeave` with its last frame as a data URL. */
-  attach(host: HTMLElement, hooks: { onLeave: (lastFrame: string) => void; onFail: (kind: FailKind) => void }): void;
+  attach(
+    host: HTMLElement,
+    hooks: {
+      onLeave: (lastFrame: string) => void;
+      onFail: (kind: FailKind) => void;
+    },
+  ): void;
   /** Gives the canvas up if `host` still has it. */
   detach(host: HTMLElement): void;
   set(input: SceneInput): void;
   setProfile(profile: Profile): void;
   gesture(kind: Emotion | 'poke'): void;
+  /** The part of her under a point of the window; null when the point misses her. */
+  touch(clientX: number, clientY: number): TouchPart | null;
+  /** Her body answers a click on `part`. */
+  react(part: TouchPart): void;
+  /** How opaque she is under a point of the window, 0..255, as of the last frame drawn. */
+  /** Asks how opaque she is under a point of the window, 0..255; the answer comes after her next frame. */
+  probe(clientX: number, clientY: number, answer: (alpha: number) => void): void;
+  /** The window moves at this speed, logical pixels per second: her body and hair lag behind. */
+  push(vx: number, vy: number): void;
+  /** Plays one of her gestures by name, or an animation of the user by its id. */
+  perform(gesture: { name: string; motion: string | null }): void;
   /** Draws the 21 pictures of the model: PNG data URLs by name, 256x256 chips and one 384x512 full frame. */
   stills(): Map<string, string>;
   /** Names the loaded model really has. */
@@ -86,31 +151,95 @@ class LiveScene implements Scene {
   private readonly camera = new THREE.PerspectiveCamera(FOV, 3 / 4, 0.1, 20);
   private readonly world = new THREE.Scene();
   private host: HTMLElement | null = null;
-  private hooks: { onLeave: (lastFrame: string) => void; onFail: (kind: FailKind) => void } | null = null;
+  private hooks: {
+    onLeave: (lastFrame: string) => void;
+    onFail: (kind: FailKind) => void;
+  } | null = null;
   private readonly observer = new ResizeObserver(() => this.resize());
   private raf = 0;
   private last = 0;
-  private input: SceneInput = { emotion: 'neutral', talking: false, windowShown: true, still: false };
+  private input: SceneInput = {
+    emotion: 'neutral',
+    talking: false,
+    windowShown: true,
+    still: false,
+  };
 
   /** Turns about X and Z go the other way on a VRM 0.x rig. */
   private readonly sign: 1 | -1;
   // Bones of the normalized rig: every one of them rests at zero rotation.
-  private readonly bones: Partial<Record<VRMHumanBoneName, THREE.Object3D>> = {};
+  private readonly bones: Partial<Record<RigBone, THREE.Object3D>> = {};
+  private readonly euler = new THREE.Euler();
+  /** A rest pose set by hand in the preview; null: the one of the settings. */
+  private restOverride: RigPose | null = null;
+  /** The body as it is now, on its way to the pose it is asked for. */
+  private body: RigPose = { ...ZERO_TRUNK, ...REST_POSES.relaxed };
+  /** Makes the slow life of this window differ from another's. */
+  private readonly seed = Math.random();
+  /** The rest pose of `auto` and when it changes next. */
+  private autoRest: RestPose = 'relaxed';
+  private autoAt = 0;
+  /** One-off movements playing now: idle actions, end of a phrase, a nod. */
+  private moves: { tl: Timeline; start: number }[] = [];
+  private actionAt = 0;
+  private lastSent = -Infinity;
+  /** The phrase her hands follow, its beats and the beat playing. */
+  private phraseAt = -1;
+  private phraseText = '';
+  private beatTimes: number[] = [];
+  private beatIndex = 0;
+  private beat: { start: number; side: 'left' | 'right' } | null = null;
+  private beatSide: 'left' | 'right' = 'left';
   private hipsRest = 0;
+  private hipsRestX = 0;
+  private hipsRestZ = 0;
   private height = 1.5;
   private frame = { headY: 1.4, hipsY: 0.9, topY: 1.55 };
 
   private readonly emo = new Map<string, number>();
   private readonly touched = new Set<string>();
-  private readonly lips: Record<Vowel, number> = { aa: 0, ih: 0, ou: 0, ee: 0, oh: 0 };
+  private readonly lips: Record<Vowel, number> = {
+    aa: 0,
+    ih: 0,
+    ou: 0,
+    ee: 0,
+    oh: 0,
+  };
   private vowel: Vowel | null = null;
   private vowelAmp = 1;
   private vowelAt = 0;
+  /** How far the mouth is open while the voice sounds, 0..1. */
+  private opening = 0;
   private blinkAt = 0;
   private readonly pose: Pose = { pitch: 0, yaw: 0, roll: 0, spine: 0 };
   private readonly gaze: [number, number] = [0, 0];
   private wander: { yaw: number; pitch: number } | null = null;
   private wanderAt = 0;
+  /** Animations of the user, loaded once, and the one playing over the layers. */
+  private readonly clips = new Map<string, THREE.AnimationClip>();
+  private mixer: THREE.AnimationMixer | null = null;
+  private clip: {
+    action: THREE.AnimationAction;
+    start: number;
+    ms: number;
+    nodes: THREE.Object3D[];
+  } | null = null;
+  private readonly held = new THREE.Quaternion();
+  /** The point to read the opacity of after the next frame, and what was read. */
+  private readonly prober = new Probe();
+  private readonly pixel = new Uint8Array(4);
+  /** Where each bone of the clip stands at rest: what a clip blends from and goes back to. */
+  private readonly restOf = new Map<THREE.Object3D, { q: THREE.Quaternion; p: THREE.Vector3 }>();
+  private readonly blendQ = new THREE.Quaternion();
+  private readonly blendP = new THREE.Vector3();
+  /** The lean of a moving window, degrees, and the shift that swings her hair. */
+  private readonly drift = { lean: 0, shift: 0, vx: 0 };
+  /** How far her head and body are turned to what she looks at, degrees. */
+  private readonly turn = { yaw: 0, pitch: 0, body: 0 };
+  private readonly at = new THREE.Vector3();
+  /** A small jump of the eyes on top of where they look. */
+  private jump = { yaw: 0, pitch: 0 };
+  private jumpAt = 0;
   private gestureKind: Emotion | 'poke' | null = null;
   private gestureStart = 0;
 
@@ -134,26 +263,115 @@ class LiveScene implements Scene {
     sun.position.set(0.6, 1, 1.2);
     this.world.add(sun);
 
-    for (const name of ['hips', 'spine', 'chest', 'head', 'leftUpperArm', 'rightUpperArm', 'leftLowerArm', 'rightLowerArm'] as const) {
-      const node = vrm.humanoid.getNormalizedBoneNode(name);
+    for (const name of RIG_BONES) {
+      const node = vrm.humanoid.getNormalizedBoneNode(name as VRMHumanBoneName);
       if (node) this.bones[name] = node;
     }
-    this.restPose();
+    this.hipsRest = this.bones.hips?.position.y ?? 0;
+    this.hipsRestX = this.bones.hips?.position.x ?? 0;
+    this.hipsRestZ = this.bones.hips?.position.z ?? 0;
+    this.applyRig(this.body);
     this.measure();
     const now = performance.now();
     this.blinkAt = now + blinkPause(Math.random());
     this.wanderAt = now + gesturePause(Math.random());
+    this.actionAt = now + idleActionPause(Math.random());
+    this.autoAt = now + autoPosePause(Math.random());
   }
 
-  /** A model without animation stands with its arms out: bring them down. */
-  private restPose() {
-    const { leftUpperArm, rightUpperArm, leftLowerArm, rightLowerArm, hips } = this.bones;
-    const at = boneAngles(slotPose('neutral'), 0, 0, this.sign);
-    if (leftUpperArm) leftUpperArm.rotation.z = rad(at.leftUpperArmZ);
-    if (rightUpperArm) rightUpperArm.rotation.z = rad(at.rightUpperArmZ);
-    if (leftLowerArm) leftLowerArm.rotation.y = rad(at.leftLowerArmY);
-    if (rightLowerArm) rightLowerArm.rotation.y = rad(at.rightLowerArmY);
-    this.hipsRest = hips?.position.y ?? 0;
+  /** Turns every bone of the rig to `pose`; a bone it leaves out goes back to rest. */
+  private applyRig(pose: RigPose) {
+    const signed = withSign(pose, this.sign);
+    for (const [bone, node] of Object.entries(this.bones) as [RigBone, THREE.Object3D][]) {
+      const [x, y, z] = signed[bone] ?? [0, 0, 0];
+      this.euler.set(rad(x), rad(y), rad(z), 'XYZ');
+      node.quaternion.setFromEuler(this.euler);
+    }
+  }
+
+  /** Puts her in `pose` whatever the settings say; null gives the settings back. For the preview. */
+  setRest(pose: RigPose | null) {
+    this.restOverride = pose;
+    if (pose) this.body = { ...ZERO_TRUNK, ...pose };
+  }
+
+  /** The rest pose she stands in now. */
+  private restNow(now: number): RigPose {
+    if (this.restOverride) return this.restOverride;
+    const name = this.input.pose ?? 'relaxed';
+    if (name !== 'auto') return restPoseOf(name);
+    if (now >= this.autoAt) {
+      this.autoRest = nextAutoPose(this.autoRest, Math.random());
+      this.autoAt = now + autoPosePause(Math.random());
+    }
+    return REST_POSES[this.autoRest];
+  }
+
+  /** The body of this frame: rest, emotion, state, slow life, movements, hands of speech. */
+  private bodyNow(now: number, dt: number): RigPose {
+    const { emotion, still, talking } = this.input;
+    const state = bodyState(this.input.state ?? 'idle', this.input.working ?? false);
+    let target = mix({ ...ZERO_TRUNK, ...this.restNow(now) }, EMOTION_BODY[emotion], 1);
+    if (state) target = mix(target, STATE_BODY[state], 1);
+    this.body = mix(this.body, target, 1 - Math.exp(-dt / BODY_TAU_MS));
+    let pose = this.body;
+    if (still) return pose;
+    pose = add(pose, idleOffset(now, this.seed), 1);
+    // Thinking, her finger taps her chin.
+    if (state === 'thinking') pose = add(pose, { rightIndexProximal: [0, 0, 16 * Math.max(0, Math.sin(now / 90))] }, 1);
+
+    // She nods to a message the user sent.
+    const sent = this.input.sentAt ?? -Infinity;
+    if (sent > this.lastSent) {
+      if (Number.isFinite(this.lastSent) || now - sent < 1500) this.moves.push({ tl: END_CUES.nod, start: now });
+      this.lastSent = sent;
+    }
+    // Now and then an idle action, when nothing else goes on.
+    if (now >= this.actionAt) {
+      this.actionAt = now + idleActionPause(Math.random());
+      const busy = talking || voice.playing || state !== null || this.moves.length > 0 || this.input.idleActions === false;
+      if (!busy) {
+        const names = Object.keys(IDLE_ACTIONS) as IdleAction[];
+        this.moves.push({
+          tl: IDLE_ACTIONS[names[Math.floor(Math.random() * names.length)]],
+          start: now,
+        });
+      }
+    }
+    this.speechMoves(now);
+    for (const m of this.moves) {
+      const s = sampleTimeline(m.tl, now - m.start);
+      if (s) pose = mix(pose, s.pose, s.weight);
+    }
+    this.moves = this.moves.filter((m) => now - m.start <= m.tl.ms);
+    if (this.beat) {
+      const ms = now - this.beat.start;
+      if (ms > 600) this.beat = null;
+      else pose = add(pose, beatOffset(ms, this.beat.side, speechStrength(emotion)), 1);
+    }
+    return pose;
+  }
+
+  /** Beats of the phrase that sounds, and the nod or tilt when it ends. */
+  private speechMoves(now: number) {
+    const p = currentPhrase();
+    const at = p?.startedAt ?? -1;
+    if (at !== this.phraseAt) {
+      // The phrase before is over: its last sign shows in the head.
+      const cue = this.phraseText ? endCue(this.phraseText) : null;
+      if (cue) this.moves.push({ tl: END_CUES[cue], start: now });
+      this.phraseAt = at;
+      this.phraseText = p?.text ?? '';
+      this.beatTimes = p ? beats(p.levels, p.frameMs) : [];
+      this.beatIndex = 0;
+    }
+    if (!p) return;
+    const since = now - p.startedAt;
+    while (this.beatIndex < this.beatTimes.length && this.beatTimes[this.beatIndex] <= since) {
+      this.beatIndex += 1;
+      this.beatSide = this.beatSide === 'left' ? 'right' : 'left';
+      this.beat = { start: now, side: this.beatSide };
+    }
   }
 
   /** Where her head and hips are, for the camera. */
@@ -173,7 +391,7 @@ class LiveScene implements Scene {
     };
   }
 
-  private aim(view: 'full' | 'head', aspect: number) {
+  private aim(view: ModelFrame, aspect: number) {
     const f = frameFor(view, this.frame.headY, this.frame.hipsY, this.frame.topY);
     const distance = f.height / 2 / Math.tan(rad(FOV) / 2);
     this.camera.aspect = aspect;
@@ -186,12 +404,20 @@ class LiveScene implements Scene {
     if (!this.host) return;
     const w = Math.max(1, this.host.clientWidth);
     const h = Math.max(1, this.host.clientHeight);
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO));
+    // A view grown by CSS zoom (the desktop window at a bigger size) gets as many pixels more.
+    const zoom = (this.host as HTMLElement & { currentCSSZoom?: number }).currentCSSZoom ?? 1;
+    this.renderer.setPixelRatio(Math.min((window.devicePixelRatio || 1) * zoom, MAX_PIXEL_RATIO));
     this.renderer.setSize(w, h, false);
-    this.aim('full', w / h);
+    this.aim(this.input.frame ?? 'full', w / h);
   }
 
-  attach(host: HTMLElement, hooks: { onLeave: (lastFrame: string) => void; onFail: (kind: FailKind) => void }) {
+  attach(
+    host: HTMLElement,
+    hooks: {
+      onLeave: (lastFrame: string) => void;
+      onFail: (kind: FailKind) => void;
+    },
+  ) {
     if (this.host === host) {
       this.hooks = hooks;
       return;
@@ -204,6 +430,8 @@ class LiveScene implements Scene {
     }
     this.host = host;
     this.hooks = hooks;
+    // The preview looks inside her to check poses and lips.
+    if (import.meta.env.DEV) (window as unknown as { mikaScene?: unknown }).mikaScene = this;
     // The graphics may have gone while no view held her: nobody was there to hear of it.
     if (this.renderer.getContext().isContextLost()) {
       hooks.onFail('context_lost');
@@ -229,7 +457,9 @@ class LiveScene implements Scene {
   }
 
   set(input: SceneInput) {
+    const reframe = (input.frame ?? 'full') !== (this.input.frame ?? 'full');
     this.input = input;
+    if (reframe) this.resize();
   }
 
   setProfile(profile: Profile) {
@@ -241,9 +471,147 @@ class LiveScene implements Scene {
     this.gestureStart = performance.now();
   }
 
+  touch(clientX: number, clientY: number): TouchPart | null {
+    if (!this.host) return null;
+    const box = this.host.getBoundingClientRect();
+    const ndc = new THREE.Vector2(((clientX - box.left) / box.width) * 2 - 1, -((clientY - box.top) / box.height) * 2 + 1);
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(ndc, this.camera);
+    const hit = ray.intersectObject(this.vrm.scene, true)[0];
+    if (!hit) return null;
+    const bones: Record<string, [number, number, number]> = {};
+    for (const [name, node] of Object.entries(this.bones) as [RigBone, THREE.Object3D][]) {
+      node.getWorldPosition(this.at);
+      bones[name] = [this.at.x, this.at.y, this.at.z];
+    }
+    const bone = nearestBone([hit.point.x, hit.point.y, hit.point.z], bones);
+    const head = bones.head;
+    const headSize = Math.max(0.05, this.frame.topY - this.frame.headY);
+    const up = head ? (hit.point.y - head[1]) / headSize : 0;
+    return partOf(bone, up);
+  }
+
+  react(part: TouchPart) {
+    const tl = REACTION[part];
+    if (tl && !this.input.still) this.moves.push({ tl, start: performance.now() });
+  }
+
+  probe(clientX: number, clientY: number, answer: (alpha: number) => void) {
+    this.prober.ask(clientX, clientY, answer);
+  }
+
+  /** Answers an asked point with the opacity of the frame just drawn; nothing is read when nobody asked. */
+  private readProbe() {
+    const host = this.host;
+    if (!host) return;
+    this.prober.take((x, y) => {
+      const box = host.getBoundingClientRect();
+      const gl = this.renderer.getContext();
+      const px = Math.floor(((x - box.left) / box.width) * gl.drawingBufferWidth);
+      const py = Math.floor((1 - (y - box.top) / box.height) * gl.drawingBufferHeight);
+      if (px < 0 || py < 0 || px >= gl.drawingBufferWidth || py >= gl.drawingBufferHeight) return 0;
+      gl.readPixels(px, py, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, this.pixel);
+      return this.pixel[3];
+    });
+  }
+
+  perform(gesture: { name: string; motion: string | null }) {
+    if (gesture.motion) {
+      this.loadClip(gesture.motion)
+        .then((clip) => this.startClip(clip))
+        .catch(() => {
+          // An animation that does not load is not played; the model stays.
+        });
+      return;
+    }
+    const tl = (GESTURES as Record<string, Timeline>)[gesture.name];
+    if (tl) this.moves.push({ tl, start: performance.now() });
+  }
+
+  private async loadClip(id: string): Promise<THREE.AnimationClip> {
+    const cached = this.clips.get(id);
+    if (cached) return cached;
+    const bytes = await invoke<ArrayBuffer>('avatar_motion_bytes', { id });
+    const { loader, blocked } = guardedLoader('motion');
+    const gltf = await loader.parseAsync(bytes, '');
+    if (blocked()) throw new Error('the animation refers to outside files');
+    const animation = (gltf.userData.vrmAnimations as VRMAnimation[] | undefined)?.[0];
+    if (!animation) throw new Error('no animation in the file');
+    // Only the bones: her face, lips and eyes stay with her own layers.
+    const { rotation, translation } = createVRMAnimationHumanoidTracks(animation, this.vrm.humanoid, this.sign === -1 ? '0' : '1');
+    const clip = new THREE.AnimationClip('motion', -1, [...rotation.values(), ...translation.values()]);
+    this.clips.set(id, clip);
+    return clip;
+  }
+
+  private startClip(clip: THREE.AnimationClip) {
+    this.mixer ??= new THREE.AnimationMixer(this.vrm.scene);
+    this.mixer.stopAllAction();
+    const action = this.mixer.clipAction(clip);
+    action.setLoop(THREE.LoopOnce, 1);
+    action.clampWhenFinished = true;
+    action.reset().play();
+    const nodes = clip.tracks
+      .map((track) => this.vrm.scene.getObjectByName(track.name.slice(0, track.name.lastIndexOf('.'))))
+      .filter((node): node is THREE.Object3D => node !== undefined);
+    const unique = [...new Set(nodes)];
+    // The rest of every bone of the clip, once: the clip blends from it and gives it back.
+    for (const node of unique) {
+      if (!this.restOf.has(node)) this.restOf.set(node, { q: node.quaternion.clone(), p: node.position.clone() });
+    }
+    this.clip = { action, start: performance.now(), ms: clip.duration * 1000, nodes: unique };
+  }
+
+  /** Bones of the clip that no layer sets go back to rest; the hips stand where they stood. */
+  private restClipBones(nodes: THREE.Object3D[]) {
+    const own = new Set(Object.values(this.bones));
+    for (const node of nodes) {
+      const rest = this.restOf.get(node);
+      if (!rest) continue;
+      if (!own.has(node)) node.quaternion.copy(rest.q);
+      if (node !== this.bones.hips) node.position.copy(rest.p);
+    }
+  }
+
+  /** The animation of the user over the layers: in and out in 300 ms. */
+  private applyClip(now: number) {
+    const c = this.clip;
+    if (!c || !this.mixer) return;
+    const ms = now - c.start;
+    // What the layers set this frame, or rest for bones they leave alone.
+    this.restClipBones(c.nodes);
+    if (ms > c.ms) {
+      c.action.stop();
+      this.clip = null;
+      return;
+    }
+    const w = Math.min(1, ms / 300, (c.ms - ms) / 300);
+    const kept = c.nodes.map((node) => [node.quaternion.x, node.quaternion.y, node.quaternion.z, node.quaternion.w, node.position.x, node.position.y, node.position.z]);
+    c.action.time = ms / 1000;
+    this.mixer.update(0);
+    c.nodes.forEach((node, i) => {
+      const k = kept[i];
+      this.held.copy(node.quaternion);
+      this.blendQ.set(k[0], k[1], k[2], k[3]);
+      node.quaternion.slerpQuaternions(this.blendQ, this.held, w);
+      this.blendP.set(k[4], k[5], k[6]);
+      node.position.lerpVectors(this.blendP, node.position, w);
+    });
+  }
+
+  push(vx: number, _vy: number) {
+    this.drift.vx = vx;
+  }
+
   private readonly tick = (now: number) => {
     this.raf = requestAnimationFrame(this.tick);
-    if (!shouldRender({ attached: this.host !== null, windowShown: this.input.windowShown, documentHidden: document.hidden })) {
+    if (
+      !shouldRender({
+        attached: this.host !== null,
+        windowShown: this.input.windowShown,
+        documentHidden: document.hidden,
+      })
+    ) {
       this.last = now;
       return;
     }
@@ -254,6 +622,7 @@ class LiveScene implements Scene {
     try {
       this.step(now, dt);
       this.renderer.render(this.world, this.camera);
+      this.readProbe();
     } catch {
       // A model that breaks a frame would break every frame: she goes back to the pictures.
       cancelAnimationFrame(this.raf);
@@ -281,26 +650,40 @@ class LiveScene implements Scene {
       this.blinkAt = Math.max(this.blinkAt, now + 400);
     } else if (now >= this.blinkAt) {
       blink = blinkWeight(now - this.blinkAt);
-      if (now - this.blinkAt >= 190) this.blinkAt = now + blinkPause(Math.random());
+      if (now - this.blinkAt >= 190) this.blinkAt = now + (twiceBlink(Math.random()) ? 120 : blinkPause(Math.random()));
     }
 
-    // Lips while she talks.
-    if (!talking) {
-      this.vowel = null;
-    } else if (now >= this.vowelAt) {
-      this.vowel = nextVowel(this.vowel, Math.random());
-      this.vowelAmp = 0.6 + 0.4 * Math.random();
-      this.vowelAt = now + MOUTH_STEP_MS;
-    }
+    // Lips: by the sound of the voice while it plays (decision 0040), by
+    // chance while a reply is written with the voice off.
     const gain = lipGain(this.profile, emotion);
-    for (const v of VOWELS) {
-      this.lips[v] = approach(this.lips[v], this.vowel === v ? Math.min(1, gain * this.vowelAmp) : 0, dt, LIP_TAU_MS);
+    if (voice.playing) {
+      const m = mouthNow(now);
+      this.opening = smoothOpen(this.opening, m ? m.open : 0, dt);
+      if (m?.shape) this.vowel = m.shape;
+      for (const v of VOWELS) {
+        this.lips[v] = approach(this.lips[v], this.vowel === v ? Math.min(1, gain * this.opening) : 0, dt, LIP_TAU_MS / 2);
+      }
+    } else {
+      this.opening = 0;
+      if (!talking) {
+        this.vowel = null;
+      } else if (now >= this.vowelAt) {
+        this.vowel = nextVowel(this.vowel, Math.random());
+        this.vowelAmp = 0.6 + 0.4 * Math.random();
+        this.vowelAt = now + MOUTH_STEP_MS;
+      }
+      for (const v of VOWELS) {
+        this.lips[v] = approach(this.lips[v], this.vowel === v ? Math.min(1, gain * this.vowelAmp) : 0, dt, LIP_TAU_MS);
+      }
     }
 
     const out = new Map(this.emo);
     if (this.expressions.has('blink')) out.set('blink', Math.max(out.get('blink') ?? 0, blink));
     for (const v of VOWELS) if (this.expressions.has(v)) out.set(v, Math.max(out.get(v) ?? 0, this.lips[v]));
     this.applyExpressions(out);
+
+    // What she looks at: the head and body turn to it, the eyes do the rest.
+    const eyes = this.aimNow(now, dt, slot.gaze ?? null);
 
     // Head and spine of the emotion, breathing, a one-off gesture.
     const want = slotPose(emotion);
@@ -312,7 +695,23 @@ class LiveScene implements Scene {
       move = gestureAt(this.gestureKind, now - this.gestureStart);
       if (!move) this.gestureKind = null;
     }
-    this.applyPose(this.pose, still ? 0 : breath(now), move);
+    // A window on the move: she leans against it, then rights herself in about 600 ms.
+    const wantLean = Math.max(-8, Math.min(8, -this.drift.vx / 150));
+    this.drift.lean = approach(this.drift.lean, wantLean, dt, 120);
+    this.drift.vx = approach(this.drift.vx, 0, dt, 150);
+    this.drift.shift = approach(this.drift.shift, -this.drift.vx / 20000, dt, 200);
+    this.vrm.scene.position.x = this.drift.shift;
+    const turned = add(
+      this.bodyNow(now, dt),
+      {
+        head: [-this.turn.pitch, this.turn.yaw, 0],
+        spine: [0, 0.6 * this.turn.body, this.drift.lean * 0.6],
+        chest: [0, 0.4 * this.turn.body, this.drift.lean * 0.4],
+      },
+      1,
+    );
+    this.applyPose(this.pose, still ? 0 : breath(now), move, turned);
+    this.applyClip(now);
 
     // The eyes: where the emotion looks, or now and then aside.
     if (now >= this.wanderAt) {
@@ -325,12 +724,68 @@ class LiveScene implements Scene {
         this.wanderAt = now + glance.ms;
       }
     }
-    const look = slot.gaze ?? (this.wander && !still ? [this.wander.yaw, this.wander.pitch] : [0, 0]);
+    const look = eyes ?? slot.gaze ?? (this.wander && !still ? [this.wander.yaw, this.wander.pitch] : [0, 0]);
     this.gaze[0] = approach(this.gaze[0], look[0], dt, GAZE_TAU);
     this.gaze[1] = approach(this.gaze[1], look[1], dt, GAZE_TAU);
-    this.applyGaze(this.gaze[0], this.gaze[1]);
+    // Eyes never stand quite still: small quick jumps, which do not glide.
+    if (now >= this.jumpAt) {
+      const j = saccade(Math.random(), Math.random());
+      this.jump = still ? { yaw: 0, pitch: 0 } : j;
+      this.jumpAt = now + j.ms;
+    }
+    this.applyGaze(this.gaze[0] + this.jump.yaw, this.gaze[1] + this.jump.pitch);
 
     this.vrm.update(dt / 1000);
+  }
+
+  /**
+   * Turns the head and body towards what she looks at and returns where the
+   * eyes look past the head; null when the eyes keep their own way (the
+   * gaze of the emotion or a glance aside).
+   */
+  private aimNow(now: number, dt: number, emotionGaze: [number, number] | null): [number, number] | null {
+    const { still, cursor, typing } = this.input;
+    const state = bodyState(this.input.state ?? 'idle', this.input.working ?? false);
+    const typingNow = typing != null && now - typing.at < 1500;
+    const cursorNow = this.input.follow !== false && !still && cursor != null && cursorInterest(cursor.movedAt, now);
+    const source = pickGaze({
+      typing: typingNow,
+      state: state !== null,
+      cursor: cursorNow,
+      emotion: emotionGaze !== null,
+    });
+    let want = { headYaw: 0, headPitch: 0, eyeYaw: 0, eyePitch: 0, bodyYaw: 0 };
+    let eyes: [number, number] | null = null;
+    if ((source === 'typing' || source === 'cursor') && this.host) {
+      const point = source === 'typing' ? typing! : cursor!;
+      const a = angleTo(point, this.headOnScreen(), this.host.clientHeight * 1.5);
+      want = aimAt(a.yaw, a.pitch);
+      eyes = [want.eyeYaw, want.eyePitch];
+    } else if (source === 'state' && state) {
+      const [yaw, pitch] = STATE_GAZE[state];
+      want = aimAt(yaw * 0.5, pitch * 0.5);
+      eyes = [yaw * 0.5, pitch * 0.5];
+    }
+    // The head follows in about 300 ms.
+    this.turn.yaw = approach(this.turn.yaw, want.headYaw, dt, 100);
+    this.turn.pitch = approach(this.turn.pitch, want.headPitch, dt, 100);
+    this.turn.body = approach(this.turn.body, want.bodyYaw, dt, 200);
+    return eyes;
+  }
+
+  /** Her eyes on the page, pixels of the window. */
+  private headOnScreen(): { x: number; y: number } {
+    const host = this.host!;
+    const box = host.getBoundingClientRect();
+    const head = this.bones.head;
+    if (!head) return { x: box.left + box.width / 2, y: box.top + box.height * 0.2 };
+    head.getWorldPosition(this.at);
+    this.at.y += 0.06;
+    this.at.project(this.camera);
+    return {
+      x: box.left + ((this.at.x + 1) / 2) * box.width,
+      y: box.top + ((1 - this.at.y) / 2) * box.height,
+    };
   }
 
   private applyExpressions(weights: ReadonlyMap<string, number>) {
@@ -343,17 +798,12 @@ class LiveScene implements Scene {
     }
   }
 
-  private applyPose(pose: Pose, breathing: number, move: { y: number; roll: number } | null) {
-    const { head, spine, chest, hips } = this.bones;
-    const at = boneAngles(pose, breathing, move?.roll ?? 0, this.sign);
-    head?.rotation.set(rad(at.head[0]), rad(at.head[1]), rad(at.head[2]));
-    // A model without a chest bone breathes with its spine.
-    if (spine) spine.rotation.x = rad(at.spineX + (chest ? 0 : at.chestX));
-    if (chest) chest.rotation.x = rad(at.chestX);
-    if (hips) {
-      hips.position.y = this.hipsRest + (move?.y ?? 0) * this.height;
-      hips.rotation.z = rad(at.hipsZ);
-    }
+  private applyPose(pose: Pose, breathing: number, move: { y: number; roll: number } | null, body: RigPose = this.body) {
+    const trunk = trunkPose(pose, breathing, move?.roll ?? 0, this.bones.chest !== undefined);
+    this.applyRig(add(body, trunk, 1));
+    const hips = this.bones.hips;
+    // The hips stand where they stood: a clip that moved them gives them back.
+    if (hips) hips.position.set(this.hipsRestX, this.hipsRest + (move?.y ?? 0) * this.height, this.hipsRestZ);
   }
 
   /** Yaw to her left and pitch up are positive; the format counts pitch down. */
@@ -416,8 +866,11 @@ class LiveScene implements Scene {
   }
 }
 
-/** A model file may only use what is inside it: any other address is refused. */
-function guardedLoader(): { loader: GLTFLoader; blocked: () => boolean } {
+/** A model or animation file may only use what is inside it: any other address is refused. */
+function guardedLoader(kind: 'model' | 'motion' = 'model'): {
+  loader: GLTFLoader;
+  blocked: () => boolean;
+} {
   let blocked = false;
   const manager = new THREE.LoadingManager();
   manager.setURLModifier((url) => {
@@ -426,14 +879,19 @@ function guardedLoader(): { loader: GLTFLoader; blocked: () => boolean } {
     return 'data:,';
   });
   const loader = new GLTFLoader(manager);
-  loader.register((parser) => new VRMLoaderPlugin(parser));
+  if (kind === 'model') loader.register((parser) => new VRMLoaderPlugin(parser));
+  else loader.register((parser) => new VRMAnimationLoaderPlugin(parser));
   return { loader, blocked: () => blocked };
 }
 
 async function load(id: string, profile: Profile): Promise<LiveScene> {
   let renderer: THREE.WebGLRenderer;
   try {
-    renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true, premultipliedAlpha: true });
+    renderer = new THREE.WebGLRenderer({
+      alpha: true,
+      antialias: true,
+      premultipliedAlpha: true,
+    });
     renderer.setClearColor(0x000000, 0);
   } catch (e) {
     throw new SceneError('webgl', String(e));

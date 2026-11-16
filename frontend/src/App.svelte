@@ -25,6 +25,8 @@
   } from './lib/hotkeys';
   import { t } from './lib/i18n';
   import { startModelState } from './lib/model/state.svelte';
+  import { startLive } from './lib/model/live.svelte';
+  import { startVoice } from './lib/model/voice.svelte';
   import { crashedOf } from './lib/journal';
   import { lang } from './lib/locale.svelte';
   import { reduceTask, type TaskView } from './lib/task';
@@ -293,6 +295,8 @@
     let unlisten: (() => void) | undefined;
     let unlistenUi: (() => void) | undefined;
     startModelState();
+    startVoice();
+    startLive();
     invoke<AssistantState>('get_state').then((s) => (current = s));
     invoke<unknown>('get_emotion').then((e) => {
       if (isEmotion(e)) emotion = e;
@@ -423,7 +427,7 @@
       invoke('screen_ask_cancel');
     }}
     ontaskhide={() => (task = null)}
-    onpoke={() => invoke('poke_avatar')}
+    onpoke={(part) => invoke('poke_avatar', { part })}
     onspeak={setSpeak}
     onscreen={setScreen}
     onmic={setMic}

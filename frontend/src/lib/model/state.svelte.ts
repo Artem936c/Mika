@@ -36,6 +36,24 @@ let failed = $state('');
 let stillsFailed = $state(false);
 let windowShown = $state(true);
 
+/** How a model looks and moves, from the persona page of the settings (`AvatarLook` in Rust). */
+export interface Look {
+  pose: string;
+  scale: number;
+  frame: 'full' | 'waist' | 'close';
+  follow_cursor: boolean;
+  idle_actions: boolean;
+}
+
+export const DEFAULT_LOOK: Look = {
+  pose: 'relaxed',
+  scale: 1,
+  frame: 'full',
+  follow_cursor: true,
+  idle_actions: true,
+};
+let look = $state<Look>({ ...DEFAULT_LOOK });
+
 export const model = {
   /** Every model the user brought in. */
   get list() {
@@ -66,6 +84,9 @@ export const model = {
   },
   get windowShown() {
     return windowShown;
+  },
+  get look() {
+    return look;
   },
 };
 
@@ -120,6 +141,15 @@ export async function reloadModel(): Promise<void> {
   failed = '';
 }
 
+/** Reads the look of the model again. */
+export async function reloadLook(): Promise<void> {
+  try {
+    look = { ...DEFAULT_LOOK, ...(await invoke<Look>('avatar_look')) };
+  } catch {
+    // No such command here: the look stays as it is.
+  }
+}
+
 let started = false;
 
 /** Called once by the root of a window. Outside Tauri and without a mock she stays built-in. */
@@ -131,8 +161,10 @@ export async function startModelState(): Promise<void> {
     await listen<{ action?: string; label?: string; shown?: boolean }>('mika://ui', (e) => {
       const p = e.payload;
       if (p?.action === 'avatar_model_changed') reloadModel().catch(() => {});
+      if (p?.action === 'avatar_look_changed') reloadLook();
       if (p?.action === 'window_shown' && p.label === label) windowShown = p.shown !== false;
     });
+    await reloadLook();
     await reloadModel();
   } catch {
     // No model commands here: the built-in avatar is shown.

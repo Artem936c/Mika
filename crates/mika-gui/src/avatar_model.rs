@@ -93,6 +93,21 @@ pub fn error_text(error: &ModelError) -> String {
     }
 }
 
+/// The text of an error of an animation: its own limit and its own format,
+/// the rest as for a model.
+pub fn motion_error_text(error: &ModelError) -> String {
+    match error {
+        ModelError::TooBig => tr("error.motion_too_big"),
+        ModelError::NotVrm | ModelError::NotGlb => tr("error.motion_not_vrma"),
+        other => error_text(other),
+    }
+}
+
+fn failed_motion(what: &str, error: &ModelError) -> String {
+    log::warn!(target: "app", "avatar animation: {what} failed: kind={}", error.kind());
+    motion_error_text(error)
+}
+
 /// What the page is told about its window.
 fn shown_payload(label: &str, shown: bool) -> serde_json::Value {
     serde_json::json!({ "action": "window_shown", "label": label, "shown": shown })
@@ -140,6 +155,9 @@ fn still_out(name: String, bytes: &[u8]) -> Still {
 /// Tells the pages whether window `label` (`island` or `avatar`) is seen:
 /// a model is not drawn in a window nobody sees.
 pub fn window_shown(app: &AppHandle, label: &str, shown: bool) {
+    if label == crate::window::AVATAR_LABEL {
+        crate::window::AVATAR_SHOWN.store(shown, std::sync::atomic::Ordering::Relaxed);
+    }
     let _ = app.emit(UI_CHANNEL, shown_payload(label, shown));
 }
 
@@ -257,6 +275,220 @@ pub async fn avatar_model_bytes(id: String) -> Result<tauri::ipc::Response, Stri
         .map_err(|e| failed("load", &e))
 }
 
+fn motions() -> mika_core::avatar::MotionStore {
+    mika_core::avatar::MotionStore::new(mika_core::paths::motions_dir())
+}
+
+/// Tells every window the list of animations changed.
+fn motions_changed(app: &AppHandle) {
+    let _ = app.emit(
+        UI_CHANNEL,
+        serde_json::json!({ "action": "avatar_motions_changed" }),
+    );
+}
+
+/// The animations the user brought in, sorted by name.
+#[tauri::command]
+pub fn avatar_motions() -> Vec<mika_core::avatar::MotionEntry> {
+    motions().list()
+}
+
+/// Lets the user pick a `.vrma` file and takes it in. `None` when the dialog was closed.
+#[tauri::command]
+pub async fn avatar_motion_add(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+) -> Result<Option<mika_core::avatar::MotionEntry>, String> {
+    let owner = window.hwnd().map(|h| h.0 as isize).unwrap_or(0);
+    let added = tauri::async_runtime::spawn_blocking(move || {
+        let Some(path) = pick_open(owner, &tr("persona.motion_pick"), ("VRMA", "*.vrma"))? else {
+            return Ok(None);
+        };
+        let entry = motions()
+            .import(&path)
+            .map_err(|e| failed_motion("import", &e))?;
+        // The name came from the user's file: it stays out of the journal.
+        log::info!(target: "app", "avatar animation imported: id={} ms={}", entry.id, entry.ms);
+        Ok(Some(entry))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if matches!(added, Ok(Some(_))) {
+        motions_changed(&app);
+    }
+    added
+}
+
+#[tauri::command]
+pub fn avatar_motion_rename(
+    app: AppHandle,
+    id: String,
+    name: String,
+) -> Result<mika_core::avatar::MotionEntry, String> {
+    let entry = motions()
+        .rename(&id, &name)
+        .map_err(|e| failed_motion("rename", &e))?;
+    motions_changed(&app);
+    Ok(entry)
+}
+
+#[tauri::command]
+pub fn avatar_motion_delete(app: AppHandle, id: String) -> Result<(), String> {
+    motions()
+        .delete(&id)
+        .map_err(|e| failed_motion("delete", &e))?;
+    log::info!(target: "app", "avatar animation deleted: id={}", safe_id(&id));
+    motions_changed(&app);
+    Ok(())
+}
+
+/// The animation file as raw bytes. The store checks it again before reading.
+#[tauri::command]
+pub async fn avatar_motion_bytes(id: String) -> Result<tauri::ipc::Response, String> {
+    tauri::async_runtime::spawn_blocking(move || motions().bytes(&id))
+        .await
+        .map_err(|e| e.to_string())?
+        .map(tauri::ipc::Response::new)
+        .map_err(|e| failed_motion("load", &e))
+}
+
+/// Plays an animation in every window that shows a model: the «▶» of the page.
+#[tauri::command]
+pub fn avatar_motion_play(ctx: CtxState<'_>, id: String) -> Result<(), String> {
+    let entry = motions()
+        .list()
+        .into_iter()
+        .find(|m| m.id == id)
+        .ok_or_else(|| failed_motion("play", &ModelError::Unknown))?;
+    ctx.bus.publish(mika_core::Event::AvatarGesture {
+        name: entry.name,
+        motion: Some(entry.id),
+    });
+    Ok(())
+}
+
+/// How a model looks and moves: pose, size, frame, cursor, idle actions.
+#[tauri::command]
+pub fn avatar_look(ctx: CtxState<'_>) -> mika_core::config::AvatarLook {
+    ctx.config.lock().avatar.look()
+}
+
+/// Takes the look from the «Персонаж» page; a new size resizes the desktop window.
+#[tauri::command]
+pub fn avatar_set_look(
+    app: AppHandle,
+    ctx: CtxState<'_>,
+    look: mika_core::config::AvatarLook,
+) -> Result<mika_core::config::AvatarLook, String> {
+    let (before, now) = {
+        let mut c = ctx.config.lock();
+        let before = c.avatar.scale;
+        c.avatar.set_look(look);
+        (before, c.avatar.look())
+    };
+    ctx.save_config()?;
+    if (before - now.scale).abs() > f32::EPSILON {
+        if let Err(e) = crate::window::resize_desktop_avatar(&app, now.scale) {
+            log::warn!(target: "app", "the avatar window was not resized: {e}");
+        }
+    }
+    look_changed(&app);
+    Ok(now)
+}
+
+/// The wheel over her on the desktop: a step bigger or smaller.
+#[tauri::command]
+pub fn avatar_scale_step(app: AppHandle, ctx: CtxState<'_>, delta: f32) -> Result<f32, String> {
+    let step = if delta > 0.0 { 0.1 } else { -0.1 };
+    let scale = {
+        let mut c = ctx.config.lock();
+        let next =
+            mika_core::config::clamp_avatar_scale(((c.avatar.scale + step) * 10.0).round() / 10.0);
+        if (next - c.avatar.scale).abs() < f32::EPSILON {
+            return Ok(next);
+        }
+        c.avatar.scale = next;
+        next
+    };
+    ctx.save_config()?;
+    if let Err(e) = crate::window::resize_desktop_avatar(&app, scale) {
+        log::warn!(target: "app", "the avatar window was not resized: {e}");
+    }
+    look_changed(&app);
+    Ok(scale)
+}
+
+/// A page asks for the cursor while a model there looks at it (decision 0040).
+#[tauri::command]
+pub fn avatar_cursor_wanted(window: tauri::WebviewWindow, on: bool) {
+    let flag = if window.label() == crate::window::AVATAR_LABEL {
+        &crate::window::CURSOR_AVATAR
+    } else {
+        &crate::window::CURSOR_ISLAND
+    };
+    flag.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The cursor is over her in the desktop window, or not: the window takes
+/// clicks on her and lets every other click through.
+#[tauri::command]
+pub fn avatar_hover(window: tauri::WebviewWindow, over: bool) {
+    if window.label() != crate::window::AVATAR_LABEL {
+        return;
+    }
+    crate::window::AVATAR_OVER.store(over, std::sync::atomic::Ordering::Relaxed);
+    crate::window::apply_avatar_clicks(&window);
+}
+
+/// The user starts to drag the desktop window: where it stops is kept.
+#[tauri::command]
+pub fn avatar_dragging() {
+    crate::window::AVATAR_DRAGGED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The user types in the island: the desktop avatar looks at the island.
+/// Tells it where the bottom of the island is, in its own logical pixels.
+#[tauri::command]
+pub fn avatar_typing(
+    app: AppHandle,
+    rect: tauri::State<'_, Arc<parking_lot::Mutex<crate::window::IslandRect>>>,
+) {
+    use tauri::Manager;
+    let (Some(island), Some(avatar)) = (
+        app.get_webview_window("island"),
+        app.get_webview_window(crate::window::AVATAR_LABEL),
+    ) else {
+        return;
+    };
+    let r = *rect.lock();
+    let (Ok(io), Ok(ik), Ok(ao), Ok(ak)) = (
+        island.inner_position(),
+        island.scale_factor(),
+        avatar.inner_position(),
+        avatar.scale_factor(),
+    ) else {
+        return;
+    };
+    let at = (
+        io.x + ((r.x + r.w / 2.0) * ik).round() as i32,
+        io.y + ((r.y + r.h) * ik).round() as i32,
+    );
+    let (x, y) = crate::window::cursor_payload(at, (ao.x, ao.y), ak);
+    let _ = app.emit_to(
+        crate::window::AVATAR_LABEL,
+        UI_CHANNEL,
+        serde_json::json!({ "action": "typing", "x": x, "y": y }),
+    );
+}
+
+/// Tells every window the look of the model changed.
+fn look_changed(app: &AppHandle) {
+    let _ = app.emit(
+        UI_CHANNEL,
+        serde_json::json!({ "action": "avatar_look_changed" }),
+    );
+}
+
 /// `expression` is a name from the profile, or nothing to let the program choose.
 #[tauri::command]
 pub fn avatar_model_set_slot(
@@ -337,6 +569,22 @@ pub fn avatar_model_failed(id: String, kind: String) {
 mod tests {
     use super::*;
     use mika_core::i18n::{tr_in, Lang};
+
+    #[test]
+    fn errors_of_an_animation_name_its_own_limits() {
+        let big = motion_error_text(&ModelError::TooBig);
+        assert!(big.contains("20"), "{big}");
+        assert!(!big.contains("200"), "{big}");
+        assert_ne!(
+            motion_error_text(&ModelError::NotVrm),
+            error_text(&ModelError::NotVrm)
+        );
+        // Other errors read the same for both.
+        assert_eq!(
+            motion_error_text(&ModelError::External),
+            error_text(&ModelError::External)
+        );
+    }
 
     #[test]
     fn a_chosen_model_that_is_gone_shows_the_built_in_one() {

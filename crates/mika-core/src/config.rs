@@ -501,8 +501,8 @@ impl AssistantConfig {
     }
 }
 
-/// Where the avatar is shown and which one.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Where the avatar is shown, which one and how it looks (decision 0040).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AvatarConfig {
     /// Left column of the open chat.
@@ -511,6 +511,19 @@ pub struct AvatarConfig {
     pub on_desktop: bool,
     /// Id of the chosen model in the models folder; empty is the built-in avatar.
     pub model: String,
+    /// Rest pose of a model: one of `AVATAR_POSES`.
+    pub pose: String,
+    /// Size of the desktop avatar window, `MIN_AVATAR_SCALE..=MAX_AVATAR_SCALE`.
+    pub scale: f32,
+    /// What part of a model the chat column shows: one of `AVATAR_FRAMES`.
+    pub frame: String,
+    /// A model looks at the cursor.
+    pub follow_cursor: bool,
+    /// A model does something now and then when nothing goes on.
+    pub idle_actions: bool,
+    /// Top-left corner of the desktop avatar window after the user moved it,
+    /// physical pixels; none: the corner of the screen.
+    pub position: Option<(i32, i32)>,
 }
 
 impl Default for AvatarConfig {
@@ -519,7 +532,71 @@ impl Default for AvatarConfig {
             in_island: true,
             on_desktop: false,
             model: String::new(),
+            pose: "relaxed".into(),
+            scale: 1.0,
+            frame: "full".into(),
+            follow_cursor: true,
+            idle_actions: true,
+            position: None,
         }
+    }
+}
+
+/// Rest poses of a model; `auto` changes them now and then.
+pub const AVATAR_POSES: [&str; 6] = ["relaxed", "clasped", "behind", "hip", "crossed", "auto"];
+/// Frames of a model in the chat column.
+pub const AVATAR_FRAMES: [&str; 3] = ["full", "waist", "close"];
+pub const MIN_AVATAR_SCALE: f32 = 0.6;
+pub const MAX_AVATAR_SCALE: f32 = 1.6;
+
+/// A size of the desktop avatar within bounds; anything else is the usual size.
+pub fn clamp_avatar_scale(v: f32) -> f32 {
+    if v.is_finite() {
+        v.clamp(MIN_AVATAR_SCALE, MAX_AVATAR_SCALE)
+    } else {
+        1.0
+    }
+}
+
+/// How a model looks and moves, as the «Персонаж» page sets it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AvatarLook {
+    pub pose: String,
+    pub scale: f32,
+    pub frame: String,
+    pub follow_cursor: bool,
+    pub idle_actions: bool,
+}
+
+impl AvatarConfig {
+    pub fn look(&self) -> AvatarLook {
+        let known = |name: &str, names: &[&str], fallback: &str| {
+            if names.contains(&name) {
+                name.to_string()
+            } else {
+                fallback.to_string()
+            }
+        };
+        AvatarLook {
+            pose: known(&self.pose, &AVATAR_POSES, "relaxed"),
+            scale: clamp_avatar_scale(self.scale),
+            frame: known(&self.frame, &AVATAR_FRAMES, "full"),
+            follow_cursor: self.follow_cursor,
+            idle_actions: self.idle_actions,
+        }
+    }
+
+    /// Takes a look from the page; an unknown name or a size out of bounds is put right.
+    pub fn set_look(&mut self, look: AvatarLook) {
+        self.pose = look.pose;
+        self.scale = look.scale;
+        self.frame = look.frame;
+        self.follow_cursor = look.follow_cursor;
+        self.idle_actions = look.idle_actions;
+        let fixed = self.look();
+        self.pose = fixed.pose;
+        self.scale = fixed.scale;
+        self.frame = fixed.frame;
     }
 }
 
@@ -1140,6 +1217,68 @@ mod tests {
         c.avatar.model = "0123456789abcdef".into();
         c.save(&p).unwrap();
         assert_eq!(Config::load(&p).unwrap().avatar.model, "0123456789abcdef");
+    }
+
+    #[test]
+    fn an_old_config_gets_the_look_of_the_avatar_by_default() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            &p,
+            "[avatar]
+in_island = true
+model = \"\"
+",
+        )
+        .unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.avatar.pose, "relaxed");
+        assert_eq!(c.avatar.scale, 1.0);
+        assert_eq!(c.avatar.frame, "full");
+        assert!(c.avatar.follow_cursor && c.avatar.idle_actions);
+        assert_eq!(c.avatar.position, None);
+    }
+
+    #[test]
+    fn the_scale_of_the_avatar_stays_in_bounds() {
+        assert_eq!(clamp_avatar_scale(0.1), 0.6);
+        assert_eq!(clamp_avatar_scale(9.0), 1.6);
+        assert_eq!(clamp_avatar_scale(f32::NAN), 1.0);
+        assert_eq!(clamp_avatar_scale(1.25), 1.25);
+    }
+
+    #[test]
+    fn a_look_with_unknown_names_gets_the_defaults() {
+        let mut avatar = AvatarConfig::default();
+        avatar.set_look(AvatarLook {
+            pose: "dance".into(),
+            scale: 3.0,
+            frame: "feet".into(),
+            follow_cursor: false,
+            idle_actions: false,
+        });
+        let look = avatar.look();
+        assert_eq!(look.pose, "relaxed");
+        assert_eq!(look.scale, 1.6);
+        assert_eq!(look.frame, "full");
+        assert!(!look.follow_cursor && !look.idle_actions);
+        avatar.set_look(AvatarLook {
+            pose: "auto".into(),
+            scale: 0.8,
+            frame: "close".into(),
+            follow_cursor: true,
+            idle_actions: true,
+        });
+        assert_eq!(avatar.look().pose, "auto");
+        assert_eq!(avatar.look().frame, "close");
+    }
+
+    #[test]
+    fn the_place_of_the_avatar_window_is_kept() {
+        let (_d, p) = tmp();
+        let mut c = Config::default();
+        c.avatar.position = Some((1200, -40));
+        c.save(&p).unwrap();
+        assert_eq!(Config::load(&p).unwrap().avatar.position, Some((1200, -40)));
     }
 
     #[test]

@@ -6,11 +6,13 @@
 //! at import and again at every load.
 
 pub mod glb;
+pub mod motions;
 pub mod profile;
 pub mod slots;
 pub mod store;
 pub mod vrm;
 
+pub use motions::{inspect_motion, MotionEntry, MotionStore, MAX_MOTION_BYTES};
 pub use profile::Profile;
 pub use slots::{Slot, Source};
 pub use store::{is_model_id, still_names, ModelEntry, Store};
@@ -37,6 +39,8 @@ pub enum ModelError {
     Unknown,
     #[error("bad picture")]
     BadStill,
+    #[error("the name is empty or taken")]
+    BadName,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -53,6 +57,7 @@ impl ModelError {
             ModelError::Broken => "broken",
             ModelError::Unknown => "unknown",
             ModelError::BadStill => "bad_still",
+            ModelError::BadName => "bad_name",
             ModelError::Io(_) => "io",
         }
     }

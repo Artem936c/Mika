@@ -4,8 +4,9 @@ target/
 # Frontend
 node_modules/
 frontend/dist/
-# Made by frontend/src/dev/make-sample-vrm.mjs, or a model of your own for the preview
-frontend/src/dev/sample.vrm
+# Avatar models and animations: the user's own files, never in the repository
+*.vrm
+*.vrma
 
 # Tauri
 crates/mika-gui/gen/

@@ -24,6 +24,9 @@
   import Portrait from './model/Portrait.svelte';
   import { pickShow, stillName } from './model/show';
   import { model } from './model/state.svelte';
+  import { live, locate, react } from './model/live.svelte';
+  import type { TouchPart } from './model/touch';
+  import { mouthNow, voice } from './model/voice.svelte';
 
   let {
     view = 'full',
@@ -38,8 +41,8 @@
     talking?: boolean;
     /** Round chip of this diameter, px. Without it the avatar fills its parent's width. */
     size?: number;
-    /** A click on her; without it she is not clickable. */
-    onpoke?: () => void;
+    /** A click on her, with the part of a living model it hit; without it she is not clickable. */
+    onpoke?: (part: TouchPart | null) => void;
   } = $props();
 
   // The built-in pictures, a picture of the chosen model, or the model itself.
@@ -111,7 +114,11 @@
       return;
     }
     const face = emotion;
-    const timer = setInterval(() => (mouth = nextMouth(face, mouth, Math.random())), MOUTH_STEP_MS);
+    const timer = setInterval(() => {
+      // While the voice sounds the mouth shuts in its pauses.
+      const sound = voice.playing ? mouthNow(performance.now()) : null;
+      mouth = sound && sound.open < 0.25 ? null : nextMouth(face, mouth, Math.random());
+    }, MOUTH_STEP_MS);
     return () => clearInterval(timer);
   });
 
@@ -123,12 +130,23 @@
     shown = e;
   });
 
+  // A gesture asked of her: the built-in pictures hop for joy.
+  let asked = live.gestures;
+  $effect(() => {
+    const n = live.gestures;
+    if (n > asked && show !== 'live') play(MOTIONS.joy);
+    asked = n;
+  });
+
   function poke(e: MouseEvent) {
     if (!onpoke) return;
     e.stopPropagation();
     play(POKE_MOTION);
-    pokes += 1;
-    onpoke();
+    const part = show === 'live' ? locate(e.clientX, e.clientY) : null;
+    // A part with a movement of its own answers with it; the rest hops as before.
+    if (part && part !== 'other') react(part);
+    else pokes += 1;
+    onpoke(part);
   }
 
   // In the head chip the frame is enlarged and shifted so the face fills the circle.

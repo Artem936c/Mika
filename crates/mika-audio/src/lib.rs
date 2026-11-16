@@ -3,6 +3,7 @@
 //! phrase is heard on this computer, by Vosk or by the recognizer of Windows.
 
 pub mod lead;
+pub mod lips;
 pub mod mic;
 pub mod sound_capture;
 pub mod speech;

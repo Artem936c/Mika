@@ -26,6 +26,7 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 use crate::lead::{wav, with_lead_in, LEAD_IN_MS};
+use crate::lips::{envelope, LipCue, LipSink, FRAME_MS};
 
 use crate::speech::{
     defuse, prosody_ssml, with_direction, DirectionSource, FirstSound, RemoteSynth, ToneSource,
@@ -119,6 +120,8 @@ enum Cmd {
 }
 
 type Observer = Arc<Mutex<Option<FirstSound>>>;
+/// Who hears when a phrase starts to sound and when it falls quiet.
+type Lips = Arc<Mutex<Option<LipSink>>>;
 
 pub struct WindowsVoice {
     tx: Mutex<mpsc::Sender<Cmd>>,
@@ -127,6 +130,7 @@ pub struct WindowsVoice {
     remote: Mutex<Option<RemoteSynth>>,
     prefetch: Arc<Prefetch>,
     observer: Observer,
+    lips: Lips,
     /// True until the first sentence after a stop is queued.
     fresh: AtomicBool,
     /// Sentences queued and not yet said or dropped.
@@ -167,13 +171,15 @@ impl WindowsVoice {
         let seen = generation.clone();
         let observer: Observer = Arc::new(Mutex::new(None));
         let watching = observer.clone();
+        let lips: Lips = Arc::new(Mutex::new(None));
+        let mouth = lips.clone();
         let prefetch = Arc::new(Prefetch::default());
         let ahead = prefetch.clone();
         let pending = Arc::new(AtomicUsize::new(0));
         let queue = pending.clone();
         std::thread::Builder::new()
             .name("voice".into())
-            .spawn(move || worker(rx, seen, watching, ahead, queue))
+            .spawn(move || worker(rx, seen, watching, mouth, ahead, queue))
             .expect("spawn voice thread");
         Self {
             tx: Mutex::new(tx),
@@ -181,6 +187,7 @@ impl WindowsVoice {
             remote: Mutex::new(None),
             prefetch,
             observer,
+            lips,
             fresh: AtomicBool::new(true),
             pending,
             tone: Mutex::new(None),
@@ -286,6 +293,7 @@ impl Engine {
         tone: (i8, i8),
         stopped: impl Fn() -> bool,
         ready: impl FnOnce(),
+        lips: &Lips,
     ) -> windows::core::Result<()> {
         let plain = || {
             self.synth
@@ -317,24 +325,36 @@ impl Engine {
         match read_all(&stream.cast()?) {
             Ok(bytes) => {
                 ready();
-                self.play_audio(&bytes, stopped)
+                self.play_audio(&bytes, text, stopped, lips)
             }
             Err(e) => {
                 log::warn!("voice sound not read: {}", e.message());
                 let source = MediaSource::CreateFromStream(&stream, &stream.ContentType()?)?;
                 ready();
-                self.play_source(&source, stopped)
+                // Nothing to measure: the lips follow the letters alone.
+                self.play_source(&source, stopped, Some((text, Vec::new())), lips)
             }
         }
     }
 
     /// Plays a ready sound file: WAV, MP3, Ogg or FLAC. It starts with
     /// quiet, see `lead`.
-    fn play_audio(&self, bytes: &[u8], stopped: impl Fn() -> bool) -> windows::core::Result<()> {
-        let bytes = quiet_start(bytes);
+    fn play_audio(
+        &self,
+        bytes: &[u8],
+        text: &str,
+        stopped: impl Fn() -> bool,
+        lips: &Lips,
+    ) -> windows::core::Result<()> {
+        let (bytes, levels) = prepare(bytes);
         let stream = memory_stream(&bytes)?;
         let source = MediaSource::CreateFromStream(&stream, &HSTRING::from(audio_mime(&bytes)))?;
-        self.play_source(&source, stopped)
+        self.play_source(
+            &source,
+            stopped,
+            Some((text, levels.unwrap_or_default())),
+            lips,
+        )
     }
 
     /// Plays to the end. Returns early when `stopped` says the generation changed.
@@ -342,10 +362,25 @@ impl Engine {
         &self,
         source: &MediaSource,
         stopped: impl Fn() -> bool,
+        phrase: Option<(&str, Vec<u8>)>,
+        lips: &Lips,
     ) -> windows::core::Result<()> {
         // Signals left over from a sentence that was cut short.
         while self.ended.try_recv().is_ok() {}
         self.player.SetSource(source)?;
+        let sink = lips.lock().clone();
+        // Told right before the sound starts, and quiet whatever way it ends.
+        let _quiet = match (sink, phrase) {
+            (Some(sink), Some((text, levels))) => {
+                sink(LipCue::Phrase {
+                    text: text.to_string(),
+                    frame_ms: FRAME_MS,
+                    levels,
+                });
+                Some(QuietOnDrop(sink))
+            }
+            _ => None,
+        };
         self.player.Play()?;
         let started = std::time::Instant::now();
         loop {
@@ -383,10 +418,12 @@ fn read_all(stream: &IRandomAccessStream) -> windows::core::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// A sound that starts with at least `LEAD_IN_MS` of quiet. A compressed
-/// sound is decoded to WAV for it. A sound that has the quiet already, or
-/// cannot be read, stays as it is.
-fn quiet_start(bytes: &[u8]) -> Cow<'_, [u8]> {
+/// A sound that starts with at least `LEAD_IN_MS` of quiet, and its loudness
+/// every `FRAME_MS` for the lips (decision 0040). A compressed sound is
+/// decoded to WAV for both. A sound that has the quiet already plays as it
+/// came; its levels come from the decoded copy, which sounds the same. A
+/// sound that cannot be read plays as it is, with no levels.
+fn prepare(bytes: &[u8]) -> (Cow<'_, [u8]>, Option<Vec<u8>>) {
     let decoded = if bytes.starts_with(b"RIFF") {
         None
     } else {
@@ -394,9 +431,22 @@ fn quiet_start(bytes: &[u8]) -> Cow<'_, [u8]> {
             .map_err(|e| log::warn!("sound not decoded: {}", e.message()))
             .ok()
     };
-    match with_lead_in(decoded.as_deref().unwrap_or(bytes), LEAD_IN_MS) {
-        Some(padded) => Cow::Owned(padded),
-        None => Cow::Borrowed(bytes),
+    let readable = decoded.as_deref().unwrap_or(bytes);
+    match with_lead_in(readable, LEAD_IN_MS) {
+        Some(padded) => {
+            let levels = envelope(&padded);
+            (Cow::Owned(padded), levels)
+        }
+        None => (Cow::Borrowed(bytes), envelope(readable)),
+    }
+}
+
+/// Tells the lips the phrase is over when the player lets go of it.
+struct QuietOnDrop(LipSink);
+
+impl Drop for QuietOnDrop {
+    fn drop(&mut self) {
+        (self.0)(LipCue::Quiet);
     }
 }
 
@@ -501,6 +551,7 @@ fn worker(
     rx: mpsc::Receiver<Cmd>,
     generation: Arc<AtomicU64>,
     observer: Observer,
+    lips: Lips,
     prefetch: Arc<Prefetch>,
     pending: Arc<AtomicUsize>,
 ) {
@@ -577,7 +628,8 @@ fn worker(
                 let remote_result = s.remote.as_ref().map(|rx| match wait_remote(rx, &stopped) {
                     Some(Ok(bytes)) => {
                         ready();
-                        e.play_audio(&bytes, stopped).map_err(|err| err.message())
+                        e.play_audio(&bytes, &s.text, stopped, &lips)
+                            .map_err(|err| err.message())
                     }
                     Some(Err(why)) => Err(why),
                     // Stopped while waiting for the sound.
@@ -596,9 +648,12 @@ fn worker(
                             "the voice of the provider failed, the phrase is said by Windows: chars={chars} error={}",
                             mika_core::journal::error_text(&why)
                         );
-                        e.play(&s.text, s.tone, stopped, ready).map(|()| "windows")
+                        e.play(&s.text, s.tone, stopped, ready, &lips)
+                            .map(|()| "windows")
                     }
-                    None => e.play(&s.text, s.tone, stopped, ready).map(|()| "windows"),
+                    None => e
+                        .play(&s.text, s.tone, stopped, ready, &lips)
+                        .map(|()| "windows"),
                 };
                 match result {
                     Ok(engine) => log::debug!(
@@ -702,6 +757,10 @@ impl Voice for WindowsVoice {
         *self.observer.lock() = observer;
     }
 
+    fn set_lips(&self, sink: Option<LipSink>) {
+        *self.lips.lock() = sink;
+    }
+
     fn busy(&self) -> bool {
         self.pending.load(Ordering::Relaxed) > 0
     }
@@ -766,19 +825,35 @@ mod tests {
     }
 
     #[test]
+    fn the_levels_match_the_sound_that_plays() {
+        // 200 ms of sound at 24 kHz gets 150 ms of quiet in front: 350 ms, 18 steps.
+        let src = loud_wav(4_800);
+        let (play, levels) = prepare(&src);
+        assert!(matches!(play, Cow::Owned(_)));
+        let levels = levels.expect("a WAV has levels");
+        assert_eq!(levels.len(), 18);
+        assert!(levels[..7].iter().all(|&l| l == 0), "{levels:?}");
+        assert!(levels[8..].iter().all(|&l| l > 200), "{levels:?}");
+        // Bytes that are no sound play as they are, with no levels.
+        let (play, levels) = prepare(b"no sound here");
+        assert!(matches!(play, Cow::Borrowed(_)));
+        assert_eq!(levels, None);
+    }
+
+    #[test]
     fn every_phrase_starts_with_quiet() {
         let src = loud_wav(4_800);
-        let out = quiet_start(&src);
+        let out = prepare(&src).0;
         assert!(matches!(out, Cow::Owned(_)));
         // 150 ms of zeros at 24 kHz, then the sound as it was.
         assert_eq!(out.len(), src.len() + 3_600 * 2);
         assert!(out[44..44 + 7_200].iter().all(|&b| b == 0));
         assert_eq!(&out[44 + 7_200..], &src[44..]);
         // Quiet already there: the sound stays as it is.
-        let quiet = quiet_start(&out).into_owned();
+        let quiet = prepare(&out).0.into_owned();
         assert_eq!(quiet, *out);
         // Bytes that are no sound are played as they are.
-        assert!(matches!(quiet_start(b"no sound here"), Cow::Borrowed(_)));
+        assert!(matches!(prepare(b"no sound here").0, Cow::Borrowed(_)));
     }
 
     #[test]

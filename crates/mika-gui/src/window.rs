@@ -35,16 +35,68 @@ const AVATAR_RIGHT: f64 = 24.0;
 /// Leaves room for the taskbar.
 const AVATAR_BOTTOM: f64 = 64.0;
 
+/// Logical size of the avatar window at `avatar_scale` (decision 0040).
+pub fn avatar_size(avatar_scale: f32) -> (f64, f64) {
+    let k = f64::from(mika_core::config::clamp_avatar_scale(avatar_scale));
+    ((AVATAR_WIDTH * k).round(), (AVATAR_HEIGHT * k).round())
+}
+
+/// The kept top-left corner of the avatar window, physical pixels, when the
+/// whole window of `size` (physical) lies on one of `monitors` (x, y, width,
+/// height); none when that monitor is gone or she would be past its edge.
+pub fn place_on_screen(
+    saved: Option<(i32, i32)>,
+    size: (u32, u32),
+    monitors: &[(i32, i32, u32, u32)],
+) -> Option<(i32, i32)> {
+    let (x, y) = saved?;
+    let (left, top) = (i64::from(x), i64::from(y));
+    let (right, bottom) = (left + i64::from(size.0), top + i64::from(size.1));
+    monitors
+        .iter()
+        .any(|&(mx, my, mw, mh)| {
+            let (mx, my) = (i64::from(mx), i64::from(my));
+            left >= mx && top >= my && right <= mx + i64::from(mw) && bottom <= my + i64::from(mh)
+        })
+        .then_some((x, y))
+}
+
+/// The page says the cursor is over her in the desktop window.
+pub static AVATAR_OVER: AtomicBool = AtomicBool::new(false);
+/// The desktop avatar window is seen: only then it gets the cursor.
+pub static AVATAR_SHOWN: AtomicBool = AtomicBool::new(true);
+/// The user started to drag the desktop window: its next place is kept.
+pub static AVATAR_DRAGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the desktop window takes clicks: over her, and never on the spot
+/// where her own tool is about to click (`pass_clicks_at`).
+pub fn avatar_catches(over: bool, passing: bool) -> bool {
+    over && !passing
+}
+
+/// Sets whether the desktop window takes clicks now, from what the page said
+/// and where her own tool clicks.
+pub fn apply_avatar_clicks(window: &WebviewWindow) {
+    let passing =
+        cursor_position().is_some_and(|c| passes_through(c, Instant::now(), *PASSING.lock()));
+    let catches = avatar_catches(AVATAR_OVER.load(Ordering::Relaxed), passing);
+    if let Err(e) = window.set_ignore_cursor_events(!catches) {
+        log::warn!(target: "app", "the avatar window did not change its clicks: {e}");
+    }
+}
+
 /// Top-left corner of the avatar window in physical pixels: bottom-right corner of the monitor.
+/// `size` is the logical size of the window.
 pub fn avatar_position(
     monitor_x: i32,
     monitor_y: i32,
     monitor_width: u32,
     monitor_height: u32,
     scale: f64,
+    size: (f64, f64),
 ) -> (i32, i32) {
-    let w = ((AVATAR_WIDTH + AVATAR_RIGHT) * scale).round() as i64;
-    let h = ((AVATAR_HEIGHT + AVATAR_BOTTOM) * scale).round() as i64;
+    let w = ((size.0 + AVATAR_RIGHT) * scale).round() as i64;
+    let h = ((size.1 + AVATAR_BOTTOM) * scale).round() as i64;
     let x = monitor_x as i64 + monitor_width as i64 - w;
     let y = monitor_y as i64 + monitor_height as i64 - h;
     (
@@ -64,6 +116,13 @@ pub fn set_desktop_avatar(app: &tauri::AppHandle, on: bool) -> tauri::Result<()>
         }
         return Ok(());
     }
+    let (avatar_scale, saved) = {
+        let ctx = app.state::<Arc<crate::app::Ctx>>();
+        let c = ctx.config.lock();
+        (c.avatar.scale, c.avatar.position)
+    };
+    let size = avatar_size(avatar_scale);
+    let fresh = existing.is_none();
     let window = match existing {
         Some(w) => w,
         None => tauri::WebviewWindowBuilder::new(
@@ -72,7 +131,7 @@ pub fn set_desktop_avatar(app: &tauri::AppHandle, on: bool) -> tauri::Result<()>
             tauri::WebviewUrl::App("index.html?view=avatar".into()),
         )
         .title("Mika avatar")
-        .inner_size(AVATAR_WIDTH, AVATAR_HEIGHT)
+        .inner_size(size.0, size.1)
         .decorations(false)
         .transparent(true)
         .shadow(false)
@@ -83,18 +142,235 @@ pub fn set_desktop_avatar(app: &tauri::AppHandle, on: bool) -> tauri::Result<()>
         .visible(false)
         .build()?,
     };
-    if let Some(m) = window.primary_monitor()? {
+    let monitors: Vec<(i32, i32, u32, u32)> = window
+        .available_monitors()?
+        .iter()
+        .map(|m| {
+            (
+                m.position().x,
+                m.position().y,
+                m.size().width,
+                m.size().height,
+            )
+        })
+        .collect();
+    let k = window.scale_factor().unwrap_or(1.0);
+    let physical = ((size.0 * k).round() as u32, (size.1 * k).round() as u32);
+    if let Some((x, y)) = place_on_screen(saved, physical, &monitors) {
+        window.set_position(PhysicalPosition::new(x, y))?;
+    } else if let Some(m) = window.primary_monitor()? {
         let (x, y) = avatar_position(
             m.position().x,
             m.position().y,
             m.size().width,
             m.size().height,
             m.scale_factor(),
+            size,
         );
         window.set_position(PhysicalPosition::new(x, y))?;
     }
+    if fresh {
+        keep_avatar_place(app, &window);
+        spawn_avatar_cursor(&window);
+    }
+    // Shown again: she takes no click until the page sees the cursor over her.
+    AVATAR_OVER.store(false, Ordering::Relaxed);
     window.set_ignore_cursor_events(true)?;
     show_without_activation(&window)
+}
+
+/// Where a window was put and when.
+type Moved = ((i32, i32), Instant);
+
+/// Keeps where the user put the avatar window: half a second after it last moved.
+fn keep_avatar_place(app: &tauri::AppHandle, window: &WebviewWindow) {
+    let moved: Arc<Mutex<Option<Moved>>> = Arc::new(Mutex::new(None));
+    let seen = moved.clone();
+    window.on_window_event(move |event| {
+        // Only a move the user made is kept: not a resize, not the corner at start.
+        if let WindowEvent::Moved(p) = event {
+            if AVATAR_DRAGGED.load(Ordering::Relaxed) {
+                *seen.lock() = Some(((p.x, p.y), Instant::now()));
+            }
+        }
+    });
+    let app = app.clone();
+    let label = window.label().to_string();
+    std::thread::Builder::new()
+        .name("avatar-place".into())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(250));
+            use tauri::Manager;
+            if app.get_webview_window(&label).is_none() {
+                break;
+            }
+            let ready = {
+                let mut m = moved.lock();
+                match *m {
+                    Some((at, when)) if when.elapsed() >= Duration::from_millis(500) => {
+                        *m = None;
+                        Some(at)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(at) = ready {
+                AVATAR_DRAGGED.store(false, Ordering::Relaxed);
+                let ctx = app.state::<Arc<crate::app::Ctx>>();
+                if ctx.config.lock().avatar.position != Some(at) {
+                    ctx.config.lock().avatar.position = Some(at);
+                    if let Err(e) = ctx.save_config() {
+                        log::warn!(target: "app", "the place of the avatar window was not kept: {e}");
+                    }
+                }
+            }
+        })
+        .expect("spawn avatar place thread");
+}
+
+/// Gives the desktop avatar window the size of `avatar_scale`, keeping its
+/// bottom-right corner where it was.
+pub fn resize_desktop_avatar(app: &tauri::AppHandle, avatar_scale: f32) -> tauri::Result<()> {
+    use tauri::Manager;
+    let Some(window) = app.get_webview_window(AVATAR_LABEL) else {
+        return Ok(());
+    };
+    let k = window.scale_factor()?;
+    let before = window.outer_size()?;
+    let at = window.outer_position()?;
+    let (w, h) = avatar_size(avatar_scale);
+    window.set_size(tauri::LogicalSize::new(w, h))?;
+    let (nw, nh) = ((w * k).round() as i32, (h * k).round() as i32);
+    window.set_position(PhysicalPosition::new(
+        at.x + before.width as i32 - nw,
+        at.y + before.height as i32 - nh,
+    ))?;
+    Ok(())
+}
+
+/// The page of the island asked for the cursor: a model there looks at it.
+pub static CURSOR_ISLAND: AtomicBool = AtomicBool::new(false);
+/// The page of the desktop avatar asked for the cursor.
+pub static CURSOR_AVATAR: AtomicBool = AtomicBool::new(false);
+/// Where the cursor is, in logical pixels of the window that gets it (decision 0040).
+pub const CURSOR_EVENT: &str = "mika://cursor";
+
+/// The cursor (physical screen pixels) as a point of a window whose top-left
+/// corner is at `origin` (physical) with `scale` physical pixels per logical one.
+pub fn cursor_payload(cursor: (i32, i32), origin: (i32, i32), scale: f64) -> (f64, f64) {
+    let k = if scale > 0.0 { scale } else { 1.0 };
+    (
+        f64::from(cursor.0 - origin.0) / k,
+        f64::from(cursor.1 - origin.1) / k,
+    )
+}
+
+/// Tells a page the cursor when it moved, at most 30 times a second.
+#[derive(Debug, Default)]
+pub struct CursorFeed {
+    last: Option<((i32, i32), Instant)>,
+}
+
+impl CursorFeed {
+    const GAP: Duration = Duration::from_millis(33);
+
+    /// Whether to send `cursor` at `now`; when so, it is remembered as sent.
+    pub fn due(&mut self, cursor: (i32, i32), now: Instant) -> bool {
+        match self.last {
+            Some((at, _)) if at == cursor => false,
+            Some((_, when)) if now.saturating_duration_since(when) < Self::GAP => false,
+            _ => {
+                self.last = Some((cursor, now));
+                true
+            }
+        }
+    }
+}
+
+/// Sends `cursor` to the page of `window` when it asked and the cursor moved.
+fn feed_cursor(
+    window: &WebviewWindow,
+    wanted: &AtomicBool,
+    feed: &mut CursorFeed,
+    cursor: (i32, i32),
+    origin: (i32, i32),
+    scale: f64,
+) {
+    if !wanted.load(Ordering::Relaxed) || !feed.due(cursor, Instant::now()) {
+        return;
+    }
+    let (x, y) = cursor_payload(cursor, origin, scale);
+    // Never written to the journal: where the cursor is stays here.
+    use tauri::Emitter;
+    let _ = window.emit_to(
+        window.label(),
+        CURSOR_EVENT,
+        serde_json::json!({ "x": x, "y": y }),
+    );
+}
+
+/// Tells the page of the desktop avatar where the cursor is, while it asks.
+fn spawn_avatar_cursor(window: &WebviewWindow) {
+    let placement = Arc::new(Mutex::new(Placement {
+        origin: window
+            .inner_position()
+            .map(|p| (p.x, p.y))
+            .unwrap_or((0, 0)),
+        scale: window.scale_factor().unwrap_or(1.0),
+    }));
+    let cache = placement.clone();
+    let events_window = window.clone();
+    window.on_window_event(move |event| match event {
+        WindowEvent::Moved(_) | WindowEvent::Resized(_) => {
+            if let Ok(p) = events_window.inner_position() {
+                cache.lock().origin = (p.x, p.y);
+            }
+        }
+        WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+            cache.lock().scale = *scale_factor;
+        }
+        _ => {}
+    });
+    let window = window.clone();
+    std::thread::Builder::new()
+        .name("avatar-cursor".into())
+        .spawn(move || {
+            let mut feed = CursorFeed::default();
+            let mut passing_prev = false;
+            loop {
+                std::thread::sleep(Duration::from_millis(33));
+                use tauri::Manager;
+                if window
+                    .app_handle()
+                    .get_webview_window(AVATAR_LABEL)
+                    .is_none()
+                {
+                    break;
+                }
+                // A hidden window gets no cursor.
+                if !AVATAR_SHOWN.load(Ordering::Relaxed) {
+                    continue;
+                }
+                if let Some(cursor) = cursor_position() {
+                    let p = *placement.lock();
+                    feed_cursor(
+                        &window,
+                        &CURSOR_AVATAR,
+                        &mut feed,
+                        cursor,
+                        p.origin,
+                        p.scale,
+                    );
+                    // Her own tool clicks under her: the window lets that click through.
+                    let passing = passes_through(cursor, Instant::now(), *PASSING.lock());
+                    if passing != passing_prev {
+                        passing_prev = passing;
+                        apply_avatar_clicks(&window);
+                    }
+                }
+            }
+        })
+        .expect("spawn avatar cursor thread");
 }
 
 /// Island rectangle in logical pixels relative to the canvas top-left corner.
@@ -730,6 +1006,7 @@ pub fn spawn_click_through(
         .spawn(move || {
             let mut inside_prev: Option<bool> = None;
             let mut tick: u32 = 0;
+            let mut feed = CursorFeed::default();
             loop {
                 tick = tick.wrapping_add(1);
                 if drag_ended() {
@@ -751,6 +1028,14 @@ pub fn spawn_click_through(
                 }
                 if let Some(cursor) = cursor_position() {
                     let p = *placement.lock();
+                    feed_cursor(
+                        &window,
+                        &CURSOR_ISLAND,
+                        &mut feed,
+                        cursor,
+                        p.origin,
+                        p.scale,
+                    );
                     let inside = island_hit(cursor, p.origin, p.scale, *rect.lock())
                         && !passes_through(cursor, Instant::now(), *PASSING.lock());
                     if inside_prev != Some(inside) {
@@ -962,11 +1247,77 @@ mod tests {
     }
 
     #[test]
+    fn the_avatar_window_grows_with_its_scale() {
+        assert_eq!(avatar_size(1.0), (560.0, 470.0));
+        assert_eq!(avatar_size(1.5), (840.0, 705.0));
+        // Out of bounds is put right first.
+        assert_eq!(avatar_size(9.0), avatar_size(1.6));
+    }
+
+    #[test]
+    fn a_kept_place_is_used_only_when_the_whole_window_fits_a_monitor() {
+        let monitors = [(0, 0, 1920, 1080), (1920, 0, 2560, 1440)];
+        let size = (560, 470);
+        assert_eq!(
+            place_on_screen(Some((2000, 300)), size, &monitors),
+            Some((2000, 300))
+        );
+        assert_eq!(place_on_screen(Some((-900, 300)), size, &monitors), None);
+        assert_eq!(place_on_screen(Some((100, 5000)), size, &monitors), None);
+        assert_eq!(place_on_screen(None, size, &monitors), None);
+        // The corner is on the screen, most of her is past its edge.
+        assert_eq!(
+            place_on_screen(Some((1700, 900)), size, &[(0, 0, 1920, 1080)]),
+            None
+        );
+    }
+
+    #[test]
+    fn the_avatar_window_never_catches_a_click_of_her_own_tool() {
+        assert!(avatar_catches(true, false));
+        assert!(!avatar_catches(true, true));
+        assert!(!avatar_catches(false, false));
+    }
+
+    #[test]
+    fn the_cursor_is_told_in_logical_pixels_of_the_window() {
+        assert_eq!(
+            cursor_payload((1300, 700), (1000, 500), 1.25),
+            (240.0, 160.0)
+        );
+        assert_eq!(
+            cursor_payload((900, 400), (1000, 500), 1.0),
+            (-100.0, -100.0)
+        );
+    }
+
+    #[test]
+    fn the_cursor_is_sent_on_a_change_at_most_30_times_a_second() {
+        let t0 = Instant::now();
+        let mut feed = CursorFeed::default();
+        assert!(feed.due((10, 10), t0));
+        // The same place again: nothing to tell.
+        assert!(!feed.due((10, 10), t0 + Duration::from_millis(100)));
+        // A new place too soon waits.
+        assert!(!feed.due((11, 10), t0 + Duration::from_millis(10)));
+        assert!(feed.due((11, 10), t0 + Duration::from_millis(40)));
+    }
+
+    #[test]
     fn avatar_window_sits_in_bottom_right_corner() {
-        assert_eq!(avatar_position(0, 0, 1920, 1080, 1.0), (1336, 546));
-        assert_eq!(avatar_position(0, 0, 2560, 1440, 1.25), (1830, 772));
+        assert_eq!(
+            avatar_position(0, 0, 1920, 1080, 1.0, avatar_size(1.0)),
+            (1336, 546)
+        );
+        assert_eq!(
+            avatar_position(0, 0, 2560, 1440, 1.25, avatar_size(1.0)),
+            (1830, 772)
+        );
         // A monitor smaller than the window: stay on it.
-        assert_eq!(avatar_position(100, 50, 400, 300, 1.0), (100, 50));
+        assert_eq!(
+            avatar_position(100, 50, 400, 300, 1.0, avatar_size(1.0)),
+            (100, 50)
+        );
     }
 
     #[test]

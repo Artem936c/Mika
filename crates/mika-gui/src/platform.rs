@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use mika_core::config::Config;
 use mika_core::journal::{self, Journal};
-use mika_core::paths::{config_path, data_dir, logs_dir, models_dir};
+use mika_core::paths::{config_path, data_dir, logs_dir, models_dir, motions_dir};
 use mika_core::secrets::SecretStore;
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -152,7 +152,7 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
 
 /// Folders removed by "delete all data".
 pub fn data_folders() -> Vec<PathBuf> {
-    folders_for(data_dir(), vec![logs_dir(), models_dir()])
+    folders_for(data_dir(), vec![logs_dir(), models_dir(), motions_dir()])
 }
 
 /// The data folder and the machine-local folders that hold the user's own
@@ -283,6 +283,13 @@ mod tests {
             here.starts_with("Windows") && !here.contains('\n'),
             "{here}"
         );
+    }
+
+    #[test]
+    fn wipe_removes_the_models_and_the_animations() {
+        let folders = data_folders();
+        assert!(folders.contains(&models_dir()));
+        assert!(folders.contains(&motions_dir()));
     }
 
     #[test]

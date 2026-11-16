@@ -13,16 +13,16 @@ const QUIET: f64 = 0.01;
 
 /// What a WAV file holds, as far as the quiet at its start goes.
 #[derive(Debug, PartialEq)]
-struct Wav {
-    rate: u32,
-    bits: u16,
+pub(crate) struct Wav {
+    pub(crate) rate: u32,
+    pub(crate) bits: u16,
     float: bool,
     /// Bytes of one frame: one sample of every channel.
-    block: usize,
+    pub(crate) block: usize,
     /// Where the size of the data chunk is written.
     size_at: usize,
     /// The samples, within the file as it came.
-    data: Range<usize>,
+    pub(crate) data: Range<usize>,
 }
 
 fn u16_at(b: &[u8], at: usize) -> Option<u16> {
@@ -35,7 +35,7 @@ fn u32_at(b: &[u8], at: usize) -> Option<u32> {
 
 /// The samples of a WAV file of plain PCM or 32-bit float. `None` for any
 /// other file.
-fn parse(b: &[u8]) -> Option<Wav> {
+pub(crate) fn parse(b: &[u8]) -> Option<Wav> {
     if b.get(..4)? != b"RIFF" || b.get(8..12)? != b"WAVE" {
         return None;
     }
@@ -85,7 +85,7 @@ fn parse(b: &[u8]) -> Option<Wav> {
 
 impl Wav {
     /// Loudness of one sample, a share of full scale.
-    fn level(&self, s: &[u8]) -> f64 {
+    pub(crate) fn level(&self, s: &[u8]) -> f64 {
         match (self.bits, self.float) {
             (8, _) => (f64::from(s[0]) - 128.0).abs() / 128.0,
             (16, _) => f64::from(i16::from_le_bytes([s[0], s[1]])).abs() / 32768.0,

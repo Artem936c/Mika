@@ -132,6 +132,23 @@ pub enum Event {
     Error {
         message: String,
     },
+    /// A phrase of the voice starts to sound now (decision 0040). `levels` is
+    /// its loudness every `frame_ms`, 0..=255 of its loudest moment; empty
+    /// when the sound could not be read. Never written to the journal: it
+    /// carries what she says.
+    VoicePhrase {
+        text: String,
+        frame_ms: u32,
+        levels: Vec<u8>,
+    },
+    /// The phrase that was sounding is over or was cut short.
+    VoiceQuiet,
+    /// The avatar makes a gesture (decision 0040): one of her own by `name`,
+    /// or an animation the user brought in, by its id in `motion`.
+    AvatarGesture {
+        name: String,
+        motion: Option<String>,
+    },
 }
 
 /// Broadcast bus. Cloning gives another handle to the same channel.
@@ -159,6 +176,40 @@ impl EventBus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gesture_names_the_animation_it_plays() {
+        let built_in = serde_json::to_value(Event::AvatarGesture {
+            name: "wave".into(),
+            motion: None,
+        })
+        .unwrap();
+        assert_eq!(
+            built_in,
+            serde_json::json!({ "type": "avatar_gesture", "name": "wave", "motion": null })
+        );
+        let own = serde_json::to_value(Event::AvatarGesture {
+            name: "Dance".into(),
+            motion: Some("0123456789abcdef".into()),
+        })
+        .unwrap();
+        assert_eq!(own["motion"], "0123456789abcdef");
+    }
+
+    #[test]
+    fn voice_events_serialize_as_snake_case() {
+        let phrase = Event::VoicePhrase {
+            text: "Привет!".into(),
+            frame_ms: 20,
+            levels: vec![0, 128, 255],
+        };
+        let json = serde_json::to_value(&phrase).unwrap();
+        assert_eq!(json["type"], "voice_phrase");
+        assert_eq!(json["frame_ms"], 20);
+        assert_eq!(json["levels"], serde_json::json!([0, 128, 255]));
+        let quiet = serde_json::to_value(Event::VoiceQuiet).unwrap();
+        assert_eq!(quiet, serde_json::json!({ "type": "voice_quiet" }));
+    }
 
     #[test]
     fn publish_without_subscribers_returns_zero() {

@@ -83,6 +83,9 @@ impl Renderer {
             Event::Remark { text, kind } => format!("[{kind}] {text}"),
             Event::UiTarget { x, y, w, h } => format!("[target] {x},{y} {w}x{h}"),
             Event::Timing { stage, ms } => format!("[time] {stage} {ms} ms"),
+            Event::VoicePhrase { levels, .. } => format!("[voice] phrase, {} steps", levels.len()),
+            Event::VoiceQuiet => "[voice] quiet".to_string(),
+            Event::AvatarGesture { name, .. } => format!("[gesture] {name}"),
             Event::TaskUpdated { task } => {
                 let done = task
                     .steps

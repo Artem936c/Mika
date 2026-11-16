@@ -5,7 +5,8 @@
   import { untrack } from 'svelte';
   import type { Emotion } from '../avatar';
   import type { FailKind, Scene } from './scene';
-  import { FULL_STILL, stillsKey } from './show';
+  import { FULL_STILL, stillsKey, windowLabel } from './show';
+  import { cursorWanted, live, releaseShownScene, setShownScene } from './live.svelte';
   import { model, onSceneDrop, reportFailure, reportStillsFailure } from './state.svelte';
 
   let {
@@ -25,6 +26,9 @@
   let left = $state('');
   /** The canvas has come in over the picture. */
   let covered = $state(false);
+
+  /** The desktop window always shows her whole; the chat column as the settings say. */
+  const desktop = windowLabel(location.search) === 'avatar';
 
   const still = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
 
@@ -79,6 +83,7 @@
         // Pictures that are there are taken to match the profile they came with.
         drawnKey = stillsKey(profile);
         scene = s;
+        setShownScene(s, node);
         // The picture stays under the canvas while it comes in, then goes: she is see-through around the edges.
         // Not when another view took the canvas meanwhile: then the picture is all this view has.
         setTimeout(() => {
@@ -97,6 +102,8 @@
     return () => {
       gone = true;
       mine?.detach(node);
+      // A view that came in since keeps the scene.
+      releaseShownScene(node);
       scene = null;
       covered = false;
     };
@@ -119,8 +126,35 @@
     return () => clearTimeout(timer);
   });
 
+  // The cursor comes from Rust only while a model here wants it: on the
+  // desktop always, to tell clicks on her from clicks past her.
   $effect(() => {
-    scene?.set({ emotion, talking, windowShown: model.windowShown, still });
+    // The desktop window asks for the cursor itself, for the clicks too.
+    if (desktop || scene === null || !model.look.follow_cursor) return;
+    // Views of a window are counted: the one that leaves does not take the cursor from the one that came.
+    const tell = (on: boolean | null) => {
+      if (on !== null) invoke('avatar_cursor_wanted', { on }).catch(() => {});
+    };
+    tell(cursorWanted(1));
+    return () => tell(cursorWanted(-1));
+  });
+
+  $effect(() => {
+    scene?.set({
+      emotion,
+      talking,
+      windowShown: model.windowShown,
+      still,
+      state: live.state,
+      working: live.working,
+      sentAt: live.sentAt,
+      pose: model.look.pose,
+      idleActions: model.look.idle_actions,
+      frame: desktop ? 'full' : model.look.frame,
+      follow: model.look.follow_cursor,
+      cursor: live.cursor,
+      typing: live.typing,
+    });
   });
 
   // The body moves once when a new emotion begins, and hops when she is clicked.

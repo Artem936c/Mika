@@ -1,5 +1,6 @@
 <script lang="ts">
-  // Desktop avatar: a click-through window in the corner of the screen with a speech bubble.
+  // Desktop avatar: a window in the corner of the screen with a speech bubble.
+  // Clicks on her are hers; every other click goes through (decision 0040).
   import { onMount } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
@@ -9,7 +10,11 @@
   import { reducePending, type Pending } from './lib/confirm';
   import { t } from './lib/i18n';
   import { noticeOf, reduceState, type AssistantState } from './lib/island';
-  import { startModelState } from './lib/model/state.svelte';
+  import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { model, startModelState } from './lib/model/state.svelte';
+  import { live as signals, locate, probeAt, pushScene, react, startLive } from './lib/model/live.svelte';
+  import { isOnFigure, wheelDue } from './lib/model/touch';
+  import { startVoice, talkingNow } from './lib/model/voice.svelte';
 
   let current = $state<AssistantState>('idle');
   let emotion = $state<Emotion>('neutral');
@@ -57,24 +62,133 @@
     }
   }
 
+  let fig: HTMLElement | undefined = $state();
+  /** The cursor is over her: the window takes clicks. */
+  let over = false;
+
+  /** Tells Rust whether the cursor is over her, when that changes. */
+  function setOver(now: boolean) {
+    if (now === over) return;
+    over = now;
+    invoke('avatar_hover', { over }).catch(() => {});
+  }
+
+  /**
+   * Whether the cursor is on her: the opacity of a living model under it,
+   * read from her next frame, or the middle of a picture.
+   */
+  function check(x: number, y: number) {
+    if (probeAt(x, y, (alpha) => setOver(isOnFigure(alpha)))) return;
+    if (!fig) return setOver(false);
+    const r = fig.getBoundingClientRect();
+    const side = r.width / 8;
+    setOver(x >= r.left + side && x <= r.right - side && y >= r.top && y <= r.bottom);
+  }
+
+  // Checked when the cursor moves, and again now and then while it rests:
+  // she moves under a resting cursor too.
+  $effect(() => {
+    const c = signals.cursor;
+    if (!c) return;
+    check(c.x, c.y);
+    const again = setInterval(() => check(c.x, c.y), 150);
+    return () => clearInterval(again);
+  });
+
+  /** A press on her: a short one is a click, one that moves drags the window. */
+  let pressed: { x: number; y: number } | null = null;
+
+  function onpointerdown(e: PointerEvent) {
+    if (e.button === 0) pressed = { x: e.screenX, y: e.screenY };
+  }
+
+  function onpointermove(e: PointerEvent) {
+    if (pressed && Math.hypot(e.screenX - pressed.x, e.screenY - pressed.y) > 4) {
+      pressed = null;
+      // Where the user leaves her is kept: only a move by the user.
+      invoke('avatar_dragging').catch(() => {});
+      try {
+        getCurrentWindow()
+          .startDragging()
+          .catch(() => {});
+      } catch {
+        // Outside Tauri there is no window to drag.
+      }
+    }
+  }
+
+  function onpointerup(e: PointerEvent) {
+    if (!pressed) return;
+    pressed = null;
+    const part = locate(e.clientX, e.clientY);
+    if (part && part !== 'other') react(part);
+    invoke('poke_avatar', { part }).catch(() => {});
+  }
+
+  /** When the size last stepped under the wheel: a touchpad sends a flood. */
+  let wheelAt = -Infinity;
+
+  function onwheel(e: WheelEvent) {
+    const now = performance.now();
+    if (e.deltaY === 0 || !wheelDue(wheelAt, now)) return;
+    wheelAt = now;
+    invoke('avatar_scale_step', { delta: -e.deltaY }).catch(() => {});
+  }
+
   onMount(() => {
     let unlisten: (() => void) | undefined;
+    // The cursor is needed here always: to tell clicks on her from clicks past her.
+    invoke('avatar_cursor_wanted', { on: true }).catch(() => {});
+    // Her body and hair lag behind a window on the move.
+    let last: { x: number; y: number; t: number } | null = null;
+    let stopMoved: (() => void) | undefined;
+    try {
+      getCurrentWindow()
+        .onMoved(({ payload }) => {
+        const t = performance.now();
+        const k = window.devicePixelRatio || 1;
+        if (last && t > last.t) {
+          const ms = t - last.t;
+          pushScene((((payload.x - last.x) / k) * 1000) / ms, (((payload.y - last.y) / k) * 1000) / ms);
+        }
+        last = { x: payload.x, y: payload.y, t };
+        })
+        .then((u) => (stopMoved = u))
+        .catch(() => {});
+    } catch {
+      // Outside Tauri the window does not move.
+    }
     startModelState();
+    startVoice();
+    startLive();
     invoke<AssistantState>('get_state').then((s) => (current = s));
     invoke<unknown>('get_emotion').then((e) => {
       if (isEmotion(e)) emotion = e;
     });
     listen('mika://event', (e) => onEvent(e.payload)).then((u) => (unlisten = u));
+    // Shown again: Rust starts with clicks going through, the page with the cursor off her.
+    let stopShown: (() => void) | undefined;
+    listen<{ action?: string; label?: string; shown?: boolean }>('mika://ui', (e) => {
+      if (e.payload?.action === 'window_shown' && e.payload.label === 'avatar') over = false;
+    })
+      .then((u) => (stopShown = u))
+      .catch(() => {});
     return () => {
       unlisten?.();
+      stopShown?.();
+      stopMoved?.();
       clearTimeout(lingerTimer);
     };
   });
 </script>
 
-<div class="stage">
+<!-- The window grows with the size from the settings; what is in it grows the same. -->
+<div class="stage" style:zoom={model.look.scale}>
   <div class="bbl" class:on={text !== ''}>{shownText}</div>
-  <div class="cmp"><Avatar view="full" {emotion} talking={current === 'speaking'} /></div>
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="cmp" bind:this={fig} {onpointerdown} {onpointermove} {onpointerup} {onwheel}>
+    <Avatar view="full" {emotion} talking={talkingNow(current === 'speaking')} />
+  </div>
 </div>
 
 <style>
@@ -89,6 +203,8 @@
     right: 0;
     bottom: -6px;
     width: 300px;
+    pointer-events: auto;
+    touch-action: none;
     filter: drop-shadow(0 20px 40px rgba(0, 0, 0, 0.5));
     animation: rise 0.7s var(--spring) backwards;
   }

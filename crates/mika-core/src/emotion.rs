@@ -147,6 +147,20 @@ pub fn poke_reaction(n: u32) -> Emotion {
     }
 }
 
+/// The part of her a click on a living model hit (decision 0040). Chest,
+/// hips and legs are never told apart: they are `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TouchPart {
+    /// The top of her head: she is patted.
+    Crown,
+    /// Her face or cheek.
+    Face,
+    /// An arm or a hand.
+    Hand,
+    Other,
+}
+
 /// Counts clicks on the avatar into series.
 #[derive(Debug, Default)]
 pub struct Pokes {
@@ -154,14 +168,19 @@ pub struct Pokes {
 }
 
 impl Pokes {
-    /// The reaction to a click at `now`.
-    pub fn poke(&mut self, now: Instant) -> Emotion {
+    /// The reaction to a click at `now` on `part` of her. The first two
+    /// clicks of a series answer the part; from the third the series decides.
+    pub fn poke(&mut self, now: Instant, part: Option<TouchPart>) -> Emotion {
         let n = match self.last {
             Some((t, n)) if now.duration_since(t) < POKE_SERIES => n + 1,
             _ => 1,
         };
         self.last = Some((now, n));
-        poke_reaction(n)
+        match part {
+            Some(TouchPart::Crown | TouchPart::Hand) if n <= 2 => Emotion::Joy,
+            Some(TouchPart::Face) if n <= 2 => Emotion::Shy,
+            _ => poke_reaction(n),
+        }
     }
 }
 
@@ -362,7 +381,7 @@ mod tests {
         let t = Instant::now();
         let mut p = Pokes::default();
         let s = Duration::from_secs(1);
-        let faces: Vec<Emotion> = (0..6).map(|i| p.poke(t + s * i)).collect();
+        let faces: Vec<Emotion> = (0..6).map(|i| p.poke(t + s * i, None)).collect();
         assert_eq!(
             faces,
             [
@@ -374,7 +393,33 @@ mod tests {
                 Emotion::Angry
             ]
         );
-        assert_eq!(p.poke(t + s * 5 + POKE_SERIES), Emotion::Joy);
+        assert_eq!(p.poke(t + s * 5 + POKE_SERIES, None), Emotion::Joy);
+    }
+
+    #[test]
+    fn the_first_two_clicks_answer_the_part_of_her_body() {
+        let t = Instant::now();
+        let s = Duration::from_secs(1);
+        let mut p = Pokes::default();
+        assert_eq!(p.poke(t, Some(TouchPart::Face)), Emotion::Shy);
+        assert_eq!(p.poke(t + s, Some(TouchPart::Crown)), Emotion::Joy);
+        // From the third click of a series the series decides, whatever the part.
+        assert_eq!(p.poke(t + s * 2, Some(TouchPart::Crown)), Emotion::Wink);
+        assert_eq!(p.poke(t + s * 3, Some(TouchPart::Face)), Emotion::Surprise);
+        assert_eq!(p.poke(t + s * 4, Some(TouchPart::Hand)), Emotion::Angry);
+
+        let mut p = Pokes::default();
+        assert_eq!(p.poke(t, Some(TouchPart::Hand)), Emotion::Joy);
+        let mut p = Pokes::default();
+        assert_eq!(p.poke(t, Some(TouchPart::Other)), Emotion::Joy);
+        assert_eq!(p.poke(t + s, Some(TouchPart::Other)), Emotion::Shy);
+    }
+
+    #[test]
+    fn a_part_of_the_body_is_read_in_snake_case() {
+        let part: TouchPart = serde_json::from_str("\"crown\"").unwrap();
+        assert_eq!(part, TouchPart::Crown);
+        assert!(serde_json::from_str::<TouchPart>("\"chest\"").is_err());
     }
 
     #[test]
