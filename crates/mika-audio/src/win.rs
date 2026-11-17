@@ -831,6 +831,15 @@ impl Voice for WindowsVoice {
 mod tests {
     use super::*;
 
+    /// COM for the test thread, as the voice worker has it: `prepare` and
+    /// `decode` reach Media Foundation, which wants COM before `MFStartup`.
+    fn com() {
+        // SAFETY: COM for this test thread only; it ends with the thread.
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        }
+    }
+
     /// 16-bit mono at 24 kHz that starts loud.
     fn loud_wav(frames: usize) -> Vec<u8> {
         let mut pcm = Vec::new();
@@ -854,6 +863,7 @@ mod tests {
 
     #[test]
     fn the_levels_match_the_sound_that_plays() {
+        com();
         // 200 ms of sound at 24 kHz gets 150 ms of quiet in front: 350 ms, 18 steps.
         let src = loud_wav(4_800);
         let (play, levels) = prepare(&src);
@@ -870,6 +880,7 @@ mod tests {
 
     #[test]
     fn every_phrase_starts_with_quiet() {
+        com();
         let src = loud_wav(4_800);
         let out = prepare(&src).0;
         assert!(matches!(out, Cow::Owned(_)));
@@ -886,10 +897,7 @@ mod tests {
 
     #[test]
     fn a_compressed_sound_is_decoded_for_its_quiet() {
-        // SAFETY: COM for this test thread, as the voice worker does.
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-        }
+        com();
         let decoded = decode(&silent_mp3(40)).expect("MP3 is decoded");
         assert!(decoded.starts_with(b"RIFF"));
         // About a second of mono 16-bit sound at 44.1 kHz.
