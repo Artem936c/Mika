@@ -788,8 +788,23 @@ const SHELL_CLASSES: &[&str] = &[
     "Shell_SecondaryTrayWnd",
 ];
 
-/// True when the window in front is another program that is maximized or
-/// covers the whole monitor the island is on. `own` are our window handles.
+/// Whether a window takes the whole monitor, as a game or a video does.
+/// Rectangles are `(left, top, right, bottom)`. A maximized window is not
+/// counted even when it covers the monitor: the island strip stays above it.
+pub fn covers_monitor(
+    maximized: bool,
+    window: (i32, i32, i32, i32),
+    monitor: (i32, i32, i32, i32),
+) -> bool {
+    !maximized
+        && window.0 <= monitor.0
+        && window.1 <= monitor.1
+        && window.2 >= monitor.2
+        && window.3 >= monitor.3
+}
+
+/// True when the window in front is another program that covers the whole
+/// monitor the island is on. `own` are our window handles.
 pub fn front_app_fills_screen(island: isize, own: &[isize]) -> bool {
     use windows_sys::Win32::Foundation::RECT;
     use windows_sys::Win32::Graphics::Gdi::{
@@ -818,9 +833,6 @@ pub fn front_app_fills_screen(island: isize, own: &[isize]) -> bool {
         if its_monitor != our_monitor {
             return false;
         }
-        if IsZoomed(front) != 0 {
-            return true;
-        }
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..std::mem::zeroed()
@@ -830,7 +842,11 @@ pub fn front_app_fills_screen(island: isize, own: &[isize]) -> bool {
             return false;
         }
         let m = info.rcMonitor;
-        r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom
+        covers_monitor(
+            IsZoomed(front) != 0,
+            (r.left, r.top, r.right, r.bottom),
+            (m.left, m.top, m.right, m.bottom),
+        )
     }
 }
 
@@ -1216,6 +1232,19 @@ mod tests {
             stays_in_front(true, false, false, false, false, true),
             (true, false)
         );
+    }
+
+    #[test]
+    fn only_a_program_on_the_whole_monitor_hides_the_island() {
+        let monitor = (0, 0, 1920, 1080);
+        // A game or a video on the whole monitor.
+        assert!(covers_monitor(false, (0, 0, 1920, 1080), monitor));
+        // A maximized window hangs eight pixels over the work area: the island stays.
+        assert!(!covers_monitor(true, (-8, -8, 1928, 1040), monitor));
+        // The same with the taskbar hidden: maximized still is not full screen.
+        assert!(!covers_monitor(true, (-8, -8, 1928, 1088), monitor));
+        // An ordinary window.
+        assert!(!covers_monitor(false, (100, 100, 900, 700), monitor));
     }
 
     #[test]
