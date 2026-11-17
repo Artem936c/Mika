@@ -12,6 +12,7 @@ mika-audio.workspace = true
 mika-core.workspace = true
 mika-providers.workspace = true
 mika-tools.workspace = true
+async-trait.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 serde.workspace = true

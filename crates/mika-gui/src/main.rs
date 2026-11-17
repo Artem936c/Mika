@@ -22,6 +22,7 @@ mod rhythm;
 mod selection;
 mod settings;
 mod strings;
+mod talk_settings;
 mod tray;
 mod update;
 mod vosk;
@@ -384,6 +385,14 @@ fn main() {
             tray::install(app.handle(), &name)?;
             hotkeys::register_all(app.handle(), &background);
             let _ = background.app.set(app.handle().clone());
+            // Her settings change by conversation the way the pages change them (decision 0046).
+            background
+                .tool_env()
+                .shared
+                .settings
+                .set(Arc::new(talk_settings::TalkSettings::new(
+                    app.handle().clone(),
+                )));
             let _ = background.emotion.set(emotion_now.clone());
             background.start_background();
             spawn_notifier(app.handle().clone(), bus.clone(), background.clone());

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
+  import { listen } from '@tauri-apps/api/event';
   import Avatar from './Avatar.svelte';
   import { dragRegion } from './drag';
   import General from './General.svelte';
@@ -17,6 +19,7 @@
   import Providers from './settings/Providers.svelte';
   import Tools from './settings/Tools.svelte';
   import Voice from './settings/Voice.svelte';
+  import { changedByTalk } from './settings_talk';
 
   type Page = 'persona' | 'providers' | 'permissions' | 'tools' | 'memory' | 'extensions' | 'voice' | 'island' | 'hotkeys' | 'costs' | 'journal' | 'general';
 
@@ -45,6 +48,19 @@
   // svelte-ignore state_referenced_locally
   let page = $state<Page>(start);
   const current = $derived(PAGES.find((p) => p.id === page) ?? PAGES[0]);
+  // A setting changed by conversation: the open page is drawn anew with it (decision 0046).
+  let changes = $state(0);
+  onMount(() => {
+    let stop: (() => void) | undefined;
+    let gone = false;
+    listen('mika://ui', (e) => {
+      if (changedByTalk(e.payload)) changes += 1;
+    }).then((u) => (gone ? u() : (stop = u)));
+    return () => {
+      gone = true;
+      stop?.();
+    };
+  });
 </script>
 
 <svelte:window onkeydown={(e) => e.key === 'Escape' && onback()} />
@@ -68,7 +84,7 @@
   <section class="page">
     <h3 use:dragRegion title={t('chat.drag_title')}>{t(`settings.page.${page}`)}</h3>
     <p class="lead">{t(current.lead)}</p>
-    {#key page}
+    {#key `${page}:${changes}`}
       <div class="body">
         {#if page === 'persona'}
           <Persona />

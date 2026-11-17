@@ -197,6 +197,7 @@ async fn run() {
             rec,
             research: Arc::new(RwLock::new(config.research.clone())),
             research_runs: Default::default(),
+            settings: Default::default(),
         },
     );
     let mut registry = ToolRegistry::new();

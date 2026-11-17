@@ -505,6 +505,7 @@ impl Ctx {
                 text_model: Arc::new(speech.clone()),
                 research: Arc::new(RwLock::new(config.lock().research.clone())),
                 research_runs: Default::default(),
+                settings: Default::default(),
             },
         );
         let direct = mika_tools::direct::Direct::new(&env);

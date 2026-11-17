@@ -951,6 +951,7 @@ pub fn env_with(db: Arc<Db>, user_profile: &str) -> (ToolEnv, Arc<Fakes>) {
             text_model: fake(),
             research: Default::default(),
             research_runs: Default::default(),
+            settings: Default::default(),
         },
         db,
     };

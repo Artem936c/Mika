@@ -379,6 +379,15 @@ pub fn settings_changed(app: &AppHandle) {
     );
 }
 
+/// A setting changed by conversation (decision 0046). Every window reads its
+/// settings again, and an open settings page draws itself anew.
+pub fn settings_changed_by_talk(app: &AppHandle, key: &str) {
+    let _ = app.emit(
+        crate::tray::UI_CHANNEL,
+        serde_json::json!({ "action": "settings_changed", "by": "talk", "key": key }),
+    );
+}
+
 #[tauri::command]
 pub fn set_assistant_name(app: AppHandle, ctx: CtxState<'_>, value: String) -> Result<(), String> {
     let name = clean_name(&value)?;

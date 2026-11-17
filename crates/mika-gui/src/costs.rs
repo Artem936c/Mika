@@ -137,7 +137,7 @@ async fn fresh(ctx: Arc<Ctx>) -> Result<CostsView, String> {
 
 /// Changes the `[costs]` settings, saves them and tells the tracker. Off the
 /// main thread: a new price is applied to the calls that waited for one.
-async fn change(
+pub(crate) async fn change(
     ctx: Arc<Ctx>,
     edit: impl FnOnce(&mut CostsConfig) + Send + 'static,
 ) -> Result<CostsView, String> {

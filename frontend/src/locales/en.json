@@ -21,6 +21,8 @@
   "selection.close": "Dismiss",
   "error.name_empty": "The name cannot be empty",
   "error.name_long": "The name is longer than 24 characters",
+  "error.talk_volume": "Her voice is not in the Windows mixer yet: its volume can be changed after the first phrase she says",
+  "error.talk_setting": "This setting cannot be changed here",
   "state.idle": "Waiting",
   "state.listening": "Listening",
   "state.thinking": "Thinking",

@@ -556,4 +556,7 @@ pub struct Shared {
     /// When deep searches ran in this run of the app. It lives here, not in
     /// the tool: the registry is rebuilt, and the record must outlive it.
     pub research_runs: Arc<crate::research::ResearchRuns>,
+    /// Where her settings change by conversation (decision 0046). The
+    /// application fills it once it runs; empty, the tools say so.
+    pub settings: mika_core::settings::SettingsSlot,
 }

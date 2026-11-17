@@ -21,6 +21,8 @@
   "selection.close": "Убрать",
   "error.name_empty": "Имя не может быть пустым",
   "error.name_long": "Имя длиннее 24 символов",
+  "error.talk_volume": "Её голоса пока нет в микшере Windows: громкость голоса можно менять после первой сказанной фразы",
+  "error.talk_setting": "Эту настройку здесь не поменять",
   "state.idle": "Жду",
   "state.listening": "Слушаю",
   "state.thinking": "Думаю",

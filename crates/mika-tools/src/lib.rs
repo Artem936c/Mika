@@ -30,6 +30,7 @@ pub mod reminders;
 pub mod research;
 pub mod screen;
 pub mod search;
+pub mod settings;
 pub mod shell;
 pub mod sys;
 pub mod system;
@@ -232,6 +233,14 @@ const HINTS: &[(&str, &str)] = &[
         "помахать, поклониться, станцевать, показать жест телом",
     ),
     (
+        "settings_get",
+        "какие у тебя настройки, какой сейчас голос, громкость голоса, включён ли микрофон",
+    ),
+    (
+        "settings_set",
+        "говори тише, громче, быстрее, медленнее; смени голос, характер или язык; включи или выключи свою функцию: озвучку, активационную фразу, диктовку, микрофон, перерывы",
+    ),
+    (
         "journal_read",
         "почему у самой помощницы что-то не сработало, зависло или сломалось, какие были ошибки",
     ),
@@ -271,6 +280,13 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
         bus: env.shared.bus.clone(),
         motions: mika_core::paths::motions_dir(),
     }));
+    // Her own settings by conversation (decision 0046): about herself, in no group.
+    reg.register(Arc::new(settings::SettingsGetTool(
+        env.shared.settings.clone(),
+    )));
+    reg.register(Arc::new(settings::SettingsSetTool(
+        env.shared.settings.clone(),
+    )));
     reg.register(Arc::new(TaskPlanTool(env.shared.tasks.clone())));
     reg.register(Arc::new(TaskStepTool(env.shared.tasks.clone())));
 
@@ -604,7 +620,7 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register_all(&mut reg, &env, &[]);
         let specs = reg.specs();
-        assert_eq!(specs.len(), 110);
+        assert_eq!(specs.len(), 112);
         for s in specs {
             assert_eq!(s.parameters["type"], "object", "{}", s.name);
             assert!(!s.description.is_empty());
@@ -643,10 +659,12 @@ mod tests {
         let mut reg = ToolRegistry::new();
         let off: Vec<String> = GROUPS.iter().map(|g| g.to_string()).collect();
         register_all(&mut reg, &env, &off);
-        assert_eq!(reg.specs().len(), 4);
+        assert_eq!(reg.specs().len(), 6);
         assert!(reg.get("get_time").is_some() && reg.get("task_plan").is_some());
         // A gesture only moves the model on the screen: it belongs to no group.
         assert!(reg.get("avatar_gesture").is_some());
+        // Her own settings are about herself: no group either (decision 0046).
+        assert!(reg.get("settings_get").is_some() && reg.get("settings_set").is_some());
 
         let mut reg = ToolRegistry::new();
         register_all(&mut reg, &env, &["windows".into(), "screen".into()]);
