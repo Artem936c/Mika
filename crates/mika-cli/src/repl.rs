@@ -85,6 +85,7 @@ impl Renderer {
             Event::Timing { stage, ms } => format!("[time] {stage} {ms} ms"),
             Event::VoicePhrase { levels, .. } => format!("[voice] phrase, {} steps", levels.len()),
             Event::VoiceQuiet => "[voice] quiet".to_string(),
+            Event::PauseChanged { paused } => format!("[pause] {paused}"),
             Event::AvatarGesture { name, .. } => format!("[gesture] {name}"),
             Event::TaskUpdated { task } => {
                 let done = task

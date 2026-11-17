@@ -267,15 +267,25 @@ impl Ctx {
     }
 
     /// A line of her own in the chat; `said`, when given, sounds in its place.
+    /// During the pause after a full stop (decision 0045) a lively line or a
+    /// break is skipped and the rest only shows: nothing sounds.
     pub fn remark_said(&self, text: &str, kind: &str, said: Option<&str>) {
         if text.trim().is_empty() {
             return;
+        }
+        let pause = self.session.pause();
+        let paused = pause.is_on();
+        if paused {
+            if let Some(skipped) = mika_core::pause::held_in_pause(kind) {
+                pause.skip(skipped, "");
+                return;
+            }
         }
         self.bus.publish(Event::Remark {
             text: text.to_string(),
             kind: kind.to_string(),
         });
-        if let Some(said) = said.filter(|_| speaks(&self.speaker)) {
+        if let Some(said) = said.filter(|_| !paused && speaks(&self.speaker)) {
             self.voice
                 .speak(&mika_audio::speech::clean_for_speech(said));
         }

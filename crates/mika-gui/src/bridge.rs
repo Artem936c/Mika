@@ -88,12 +88,17 @@ pub fn poke_avatar(ctx: CtxState<'_>, part: Option<mika_core::emotion::TouchPart
     ctx.bus.publish(mika_core::Event::EmotionCue { emotion });
 }
 
-/// Stops the running reply, drops queued ones and denies an open question.
+/// The Stop button: a full stop, then the pause until she is addressed
+/// (decision 0045). `pause: false` (a new chat) stops without the pause.
 #[tauri::command]
-pub fn stop(ctx: CtxState<'_>) {
-    ctx.end_voice_dialog();
-    ctx.session.stop();
-    ctx.voice.stop();
+pub fn stop(ctx: CtxState<'_>, pause: Option<bool>) {
+    ctx.full_stop(pause.unwrap_or(true));
+}
+
+/// Whether she is in the pause after a full stop: the island shows it.
+#[tauri::command]
+pub fn get_paused(ctx: CtxState<'_>) -> bool {
+    ctx.session.pause().is_on()
 }
 
 #[derive(serde::Serialize)]

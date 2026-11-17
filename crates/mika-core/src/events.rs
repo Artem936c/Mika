@@ -103,7 +103,8 @@ pub enum Event {
     /// warning, a refused dictation or screen question, what she watched for,
     /// a line about a scenario, the end of a background job. `kind`: `break`,
     /// `focus`, `calendar`, `life`, `day`, `cost`, `dictation`, `screen_ask`,
-    /// `watch`, `trigger`, `job`.
+    /// `watch`, `trigger`, `job`, `stop` (what a full stop ended), `pause`
+    /// (what the pause skipped).
     Remark {
         text: String,
         kind: String,
@@ -146,6 +147,11 @@ pub enum Event {
     },
     /// The phrase that was sounding is over or was cut short.
     VoiceQuiet,
+    /// The pause after a full stop began or ended (decision 0045): while
+    /// it lasts she starts nothing on her own.
+    PauseChanged {
+        paused: bool,
+    },
     /// The avatar makes a gesture (decision 0040): one of her own by `name`,
     /// or an animation the user brought in, by its id in `motion`.
     AvatarGesture {

@@ -38,6 +38,7 @@
     noticeOf,
     opensChat,
     rectForShape,
+    reducePaused,
     reduceState,
     unionRect,
     viewShape,
@@ -74,6 +75,8 @@
   const NOTICE_MS = 9000;
 
   let current = $state<AssistantState>('idle');
+  /** The pause after a full stop: she starts nothing until called (decision 0045). */
+  let paused = $state(false);
   let view = $state<View>('island');
   let settingsStart = $state<'persona' | 'providers' | 'journal'>('persona');
   let items = $state<ChatItem[]>([]);
@@ -226,6 +229,7 @@
 
   function onEvent(payload: unknown) {
     current = reduceState(current, payload);
+    paused = reducePaused(paused, payload);
     emotion = reduceEmotion(emotion, payload);
     items = reduceChat(items, payload);
     pending = reducePending(pending, payload, Date.now());
@@ -324,6 +328,9 @@
     startVoice();
     startLive();
     invoke<AssistantState>('get_state').then((s) => (current = s));
+    invoke<boolean>('get_paused')
+      .then((p) => (paused = p === true))
+      .catch(() => {});
     invoke<unknown>('get_emotion').then((e) => {
       if (isEmotion(e)) emotion = e;
     });
@@ -450,7 +457,8 @@
       view = 'settings';
     }}
     onnew={async () => {
-      await invoke('stop');
+      // A new chat is not a «stop»: no pause after it.
+      await invoke('stop', { pause: false });
       await invoke('clear_history');
       items = [];
       loadJobs();
@@ -529,6 +537,7 @@
           timer={idle.reminder}
           track={idle.track}
           dictation={dictation?.phase ?? null}
+          {paused}
           onspeak={setSpeak}
         />
       </div>

@@ -259,6 +259,10 @@ fn fire(app: &AppHandle, id: &'static str, pressed: bool) {
     }
     log::info!("hotkey fired: id={id} pressed={pressed}");
     let ctx = || app.state::<Arc<Ctx>>().inner().clone();
+    // Every hotkey is the user calling her: the pause is over (decision 0045).
+    if pressed {
+        ctx().session.addressed("hotkey");
+    }
     match id {
         "chat" => crate::tray::open_chat(app),
         "listen" => {

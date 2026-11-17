@@ -135,6 +135,8 @@ pub async fn evening_summary_now(ctx: CtxState<'_>) -> Result<(), String> {
     if ctx.state() != AssistantState::Idle {
         return Err(tr("error.evening_busy"));
     }
+    // The user asked for it: the pause is over (decision 0045).
+    ctx.session.addressed("evening_summary_button");
     ctx.evening_summary()
         .await
         .map_err(|why| refusal_text(&why))

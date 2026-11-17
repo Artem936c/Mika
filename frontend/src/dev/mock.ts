@@ -39,6 +39,8 @@
 // has something to show. `&notice` stops in the chat with the notice of that run (its link opens the page), `&journal_empty`
 // is an empty journal, `&journal_fail` makes reading the next page and saving the settings fail, `&journal_cancel` closes
 // the save dialog without a file. `?mock=settings&page=journal` is the same page without the unclean run.
+// Full stop (decision 0045): scenario `paused` speaks, hears «стоп», says what stopped and shows the calm paused island;
+// `&inchat` shows it in the chat, `&addressed` sends a message after four seconds: the pause ends with the line of what it skipped.
 // `&lang=en` starts the preview in English; the language picker on `&page=general` and on `&welcome` switches it in place.
 
 import { mockIPC } from '@tauri-apps/api/mocks';
@@ -1024,6 +1026,8 @@ export async function install(scenario: string) {
     (cmd, args) => {
       const a = (args ?? {}) as Record<string, unknown>;
       switch (cmd) {
+        case 'get_paused':
+          return false;
         case 'get_state':
           return state;
         case 'get_emotion':
@@ -1674,6 +1678,27 @@ export async function install(scenario: string) {
       case 'reminder':
         send({ type: 'reminder_fired', id: 1, text: 'Выключить чайник', kind: 'remind', late_s: 0 });
         break;
+      case 'paused': {
+        if (params.has('inchat')) {
+          click('.iw');
+          await wait(700);
+        }
+        send({ type: 'user_text', text: 'Расскажи, что нового в мире' });
+        await say(REPLY);
+        await wait(900);
+        // «Стоп»: the reply and her voice end, the pause begins.
+        setState('idle');
+        send({ type: 'voice_quiet' });
+        send({ type: 'pause_changed', paused: true });
+        send({ type: 'remark', kind: 'stop', text: 'Остановилась: ответ, речь. Сама ничего не начну, пока не позовёшь.' });
+        if (params.has('addressed')) {
+          await wait(4000);
+          send({ type: 'pause_changed', paused: false });
+          send({ type: 'remark', kind: 'pause', text: 'Пока была пауза, я пропустила: сценарий «Наушники», напоминание о перерыве.' });
+          send({ type: 'user_text', text: 'Мика, продолжим' });
+        }
+        break;
+      }
       case 'tgvoice':
         // A voice message from Telegram looks like any message; the recognition time stands under the reply.
         click('.iw');

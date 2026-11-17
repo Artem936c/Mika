@@ -23,6 +23,7 @@
     timer = null,
     track = null,
     dictation = null,
+    paused = false,
     onspeak,
   }: {
     status: AssistantState;
@@ -43,6 +44,8 @@
     track?: { title: string; artist: string } | null;
     /** Where a dictation into another program is; null when none runs. */
     dictation?: DictationPhase | null;
+    /** The pause after a full stop: she waits to be called (decision 0045). */
+    paused?: boolean;
     onspeak: (v: boolean) => void;
   } = $props();
 
@@ -66,7 +69,13 @@
   const words = $derived(speakWords(reply, 110));
 </script>
 
-{#if status === 'idle'}
+{#if status === 'idle' && paused}
+  <div class="rowl">
+    <Avatar view="head" {emotion} size={30} />
+    <span class="name paused">{t('face.paused')}</span>
+    <span class="pad"></span>
+  </div>
+{:else if status === 'idle'}
   <div class="rowl">
     <Avatar view="head" {emotion} size={30} />
     {#if track}
@@ -146,6 +155,12 @@
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  /* Calm, not an alarm: the muted colour of the clock. */
+  .paused {
+    flex: 1;
+    color: var(--mute);
+    font-weight: 500;
   }
   .pad {
     width: 4px;

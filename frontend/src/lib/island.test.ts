@@ -13,6 +13,7 @@ import {
   noticeOf,
   foldsAway,
   opensChat,
+  reducePaused,
   reduceState,
   shapeFor,
   stateLabel,
@@ -146,6 +147,21 @@ describe('confirmShape', () => {
     // The tallest of both kinds still fits the canvas.
     const tallest = Math.max(confirmShape(long, true, true).height, confirmShape(Array(40).fill('строка').join('\n'), false, true).height);
     expect(14 + tallest).toBeLessThanOrEqual(600 - 20);
+  });
+});
+
+describe('reducePaused', () => {
+  it('follows pause_changed', () => {
+    expect(reducePaused(false, { type: 'pause_changed', paused: true })).toBe(true);
+    expect(reducePaused(true, { type: 'pause_changed', paused: false })).toBe(false);
+  });
+  it('ignores other events and malformed payloads', () => {
+    expect(reducePaused(true, { type: 'state_changed', from: 'idle', to: 'thinking' })).toBe(true);
+    expect(reducePaused(true, { type: 'pause_changed', paused: 'no' })).toBe(true);
+    expect(reducePaused(false, null)).toBe(false);
+  });
+  it('the paused line of the island is a text of the locales', () => {
+    expect(isMessageKey('face.paused')).toBe(true);
   });
 });
 

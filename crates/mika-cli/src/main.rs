@@ -276,6 +276,8 @@ async fn run() {
         config: Arc::new(move || events_config.clone()),
         windows_on: Arc::new(move || windows_on),
         paid_allowed: Arc::new(mika_core::costs::unattended_allowed),
+        // The debug client has no stop word: it never pauses (decision 0045).
+        paused: Arc::new(|_: &str| false),
         on_task: Arc::new(move |shown: &str, full: &str| scenarios.submit_task_as(shown, full)),
         on_tell: Arc::new(move |text: &str, kind: &str| {
             told.publish(Event::Remark {

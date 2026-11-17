@@ -164,6 +164,14 @@ impl Ctx {
                 t.app
             );
         }
+        // The pause after a full stop holds the reply too (decision 0045);
+        // the message itself shows as any notification, without a voice.
+        let held = held
+            || watched.is_some()
+                && self
+                    .session
+                    .pause()
+                    .skip(mika_core::pause::SkipKind::ChatReply, &t.title);
         if let Some(w) = watched.filter(|_| !held) {
             log::info!(
                 target: "events",
@@ -181,7 +189,7 @@ impl Ctx {
         }
         self.publish_notification(t);
         // Muted Windows hears nothing: the synthesizer is not asked for silence.
-        if read_aloud && crate::rhythm::speaks(&self.speaker) {
+        if read_aloud && crate::rhythm::speaks(&self.speaker) && !self.session.pause().is_on() {
             self.voice.speak(&spoken(t));
         }
     }
@@ -246,6 +254,26 @@ impl Ctx {
                             if due { "morning" } else { "evening" }
                         );
                     }
+                    continue;
+                }
+                // The pause after a full stop (decision 0045): the summary is
+                // skipped for the day and named when the pause ends.
+                let kind = if evening_due {
+                    mika_core::pause::SkipKind::EveningSummary
+                } else {
+                    mika_core::pause::SkipKind::MorningSummary
+                };
+                if ctx.session.pause().skip(kind, "") {
+                    let today = now.date().format("%Y-%m-%d").to_string();
+                    {
+                        let mut c = ctx.config.lock();
+                        if evening_due {
+                            c.briefing.evening_last_date = today;
+                        } else {
+                            c.briefing.last_date = today;
+                        }
+                    }
+                    let _ = ctx.save_config();
                     continue;
                 }
                 // The same test as the calendar reader's: on, with a link.

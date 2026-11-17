@@ -19,6 +19,7 @@ pub mod llm;
 pub mod marks;
 pub mod memory;
 pub mod paths;
+pub mod pause;
 pub mod policy;
 pub mod schedule;
 pub mod secrets;

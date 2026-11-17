@@ -802,6 +802,7 @@ impl Ctx {
         let config = self.config.clone();
         let tools = self.config.clone();
         let session = self.session.clone();
+        let held = self.session.clone();
         let me = Arc::downgrade(self);
         tauri::async_runtime::spawn(mika_tools::observe::run(mika_tools::observe::ServiceDeps {
             sensors: self.env.sensors.clone(),
@@ -822,6 +823,11 @@ impl Ctx {
             }),
             // With the budget reached a scenario does not run (decision 0028).
             paid_allowed: Arc::new(mika_core::costs::unattended_allowed),
+            // The pause after a full stop holds every run (decision 0045).
+            paused: Arc::new(move |name: &str| {
+                held.pause()
+                    .skip(mika_core::pause::SkipKind::Scenario, name)
+            }),
             // An ordinary task: every action of it asks as usual.
             on_task: Arc::new(move |shown: &str, full: &str| session.submit_task_as(shown, full)),
             on_tell: Arc::new(move |text: &str, kind: &str| {
@@ -1079,7 +1085,8 @@ impl Ctx {
                 c.voice.stt_language.clone(),
             )
         };
-        let phrases = mika_audio::wake::wake_phrases(&name);
+        // The name and the stop words (decision 0045); empty without a name.
+        let phrases = mika_audio::wake::grammar_phrases(&name);
         if !on || phrases.is_empty() {
             *self.wake_status.lock() = "off".into();
             return;
@@ -1117,24 +1124,15 @@ impl Ctx {
         }
     }
 
-    /// The wake phrase was heard: stop talking, come forward, listen.
+    /// The wake phrase was heard: stop talking, come forward, listen. A stop
+    /// word stops everything while she is busy (decision 0045).
     fn on_wake(self: &Arc<Self>, heard: &str) {
-        if self.is_recording() {
+        let name = self.config.lock().assistant.wake_phrase.clone();
+        if mika_audio::wake::heard_kind(heard, &name) == Some(mika_audio::wake::HeardKind::Stop) {
+            self.on_stop_word(heard);
             return;
         }
-        let name = self.config.lock().assistant.wake_phrase.clone();
-        let speaking = self.state.get() == AssistantState::Speaking || self.voice.busy();
-        if mika_audio::wake::heard_kind(heard, &name) == Some(mika_audio::wake::HeardKind::Stop) {
-            let word = mika_audio::wake::stop_word(heard).unwrap_or_default();
-            if speaking && !mika_audio::wake::is_echo(word, &self.speaking.lock()) {
-                log::info!(target: "voice", "stop word heard while speaking, she stops");
-                self.end_voice_dialog();
-                // A reply still being written would keep adding sentences.
-                if self.state.get() == AssistantState::Speaking {
-                    self.session.stop();
-                }
-                self.voice.stop();
-            }
+        if self.is_recording() {
             return;
         }
         if self.state.get() == AssistantState::Speaking
@@ -1149,11 +1147,66 @@ impl Ctx {
             "wake phrase heard: heard={}",
             mika_core::journal::content(heard)
         );
+        self.session.addressed("wake_phrase");
         if let Some(app) = self.app.get() {
             crate::window::summon(app);
         }
         let ctx = self.clone();
         tauri::async_runtime::spawn(async move { ctx.listen_and_submit().await });
+    }
+
+    /// A stop word without the name: a full stop, if she is busy and the
+    /// word is not her own voice in the speakers.
+    fn on_stop_word(&self, heard: &str) {
+        use mika_core::pause::{stop_word_acts, Busy};
+        let word = mika_audio::wake::stop_word(heard).unwrap_or_default();
+        let dictation = self.dictation.lock().is_some();
+        let busy = Busy {
+            state: self.state.get(),
+            voice: self.voice.busy(),
+            listening: self.is_recording() && !dictation,
+            dictation,
+            jobs: !self.jobs.active().is_empty(),
+        };
+        let echo = mika_audio::wake::is_echo(word, &self.speaking.lock());
+        if !stop_word_acts(busy, mika_audio::wake::only_stop_words(heard), echo) {
+            log::debug!(
+                target: "voice",
+                "stop word ignored: state={} voice={} listening={} dictation={} jobs={} echo={echo}",
+                busy.state.as_str(),
+                busy.voice,
+                busy.listening,
+                busy.dictation,
+                busy.jobs
+            );
+            return;
+        }
+        log::info!(
+            target: "voice",
+            "stop word heard, she stops everything: state={}",
+            busy.state.as_str()
+        );
+        self.full_stop(true);
+    }
+
+    /// Stops everything (decision 0045): the reply and the queued ones, a
+    /// task with its tool call, an open question, her voice and a phrase
+    /// being recorded, the voice dialog, every background job. With `pause`
+    /// she then starts nothing by herself until the user addresses her.
+    /// The stop word and the Stop button of the chat come here.
+    pub fn full_stop(&self, pause: bool) -> mika_core::pause::StopReport {
+        let report = mika_core::pause::StopReport {
+            speech: self.state.get() == AssistantState::Speaking || self.voice.busy(),
+            listening: self.is_recording(),
+            ..Default::default()
+        };
+        self.end_voice_dialog();
+        self.cancel_listening();
+        let report = self.session.full_stop(report, Some(&self.jobs), pause);
+        // A retelling still being made and the sentences already queued.
+        self.speaker.cancel();
+        self.voice.stop();
+        report
     }
 
     /// Looks for a newer version if an update address is set. Never downloads.
@@ -1235,8 +1288,16 @@ impl Ctx {
         } else {
             self.state.set(rest);
         }
+        // A full stop while the phrase is recognised drops it (decision 0045).
+        let stopped = self.session.stop_token();
         let asked = std::time::Instant::now();
         let text = self.live.transcribe(&wav).await;
+        if stopped.is_cancelled() {
+            if self.state.get() == AssistantState::Thinking {
+                self.state.set(AssistantState::Idle);
+            }
+            return Err(String::new());
+        }
         if text.is_ok() {
             let ms = asked.elapsed().as_millis() as u64;
             log::debug!(target: "voice", "spoken phrase recognised: ms={ms}");
@@ -1258,6 +1319,8 @@ impl Ctx {
     /// Records a phrase and hands it to the assistant as a voice message.
     /// Problems go to the chat as an error line.
     pub async fn listen_and_submit(&self) {
+        // The user asked her to listen: the pause is over (decision 0045).
+        self.session.addressed("listen");
         self.listen_once(false).await;
     }
 

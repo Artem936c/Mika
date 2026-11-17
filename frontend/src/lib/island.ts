@@ -128,6 +128,14 @@ export function viewShape(view: View, state: AssistantState, wide: boolean): Isl
   return shapeFor(state);
 }
 
+/** Whether she is in the pause after a full stop (decision 0045): follows `pause_changed`. */
+export function reducePaused(current: boolean, event: unknown): boolean {
+  if (typeof event !== 'object' || event === null) return current;
+  const e = event as { type?: unknown; paused?: unknown };
+  if (e.type === 'pause_changed' && typeof e.paused === 'boolean') return e.paused;
+  return current;
+}
+
 export function reduceState(current: AssistantState, event: unknown): AssistantState {
   if (typeof event !== 'object' || event === null) return current;
   const e = event as { type?: unknown; to?: unknown };

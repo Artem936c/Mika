@@ -61,7 +61,7 @@ pub fn has_name(heard: &str, name: &str) -> bool {
     !name.is_empty() && heard.windows(name.len()).any(|w| w == name.as_slice())
 }
 
-/// Words that stop her speech. They act only while she speaks.
+/// Words that stop her: a full stop while she is busy (decision 0045).
 pub const STOP_WORDS: &[&str] = &[
     "стоп",
     "хватит",
@@ -72,21 +72,54 @@ pub const STOP_WORDS: &[&str] = &[
     "остановись",
 ];
 
+/// The phrases the Windows recognizer listens for: the ways to say the name
+/// and the stop words (decision 0045). Empty without a name.
+pub fn grammar_phrases(name: &str) -> Vec<String> {
+    let mut phrases = wake_phrases(name);
+    if phrases.is_empty() {
+        return phrases;
+    }
+    for word in STOP_WORDS {
+        if !phrases.iter().any(|p| p == word) {
+            phrases.push(word.to_string());
+        }
+    }
+    phrases
+}
+
+/// Words of what the recognizer heard, lower case, without punctuation and
+/// without the `[unk]` of Vosk.
+fn heard_words(heard: &str) -> impl Iterator<Item = String> + '_ {
+    heard
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && *w != "unk")
+        .map(str::to_lowercase)
+}
+
+/// True when the phrase has stop words and nothing else.
+pub fn only_stop_words(heard: &str) -> bool {
+    let mut any = false;
+    for word in heard_words(heard) {
+        if !STOP_WORDS.contains(&word.as_str()) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
 /// What a heard phrase asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeardKind {
     /// The name: listen to the user.
     Name,
-    /// A stop word without the name: stop talking.
+    /// A stop word without the name: stop everything.
     Stop,
 }
 
 /// The stop word in the phrase, as a whole word.
 pub fn stop_word(heard: &str) -> Option<&'static str> {
-    heard
-        .split_whitespace()
-        .map(str::to_lowercase)
-        .find_map(|w| STOP_WORDS.iter().find(|s| **s == w).copied())
+    heard_words(heard).find_map(|w| STOP_WORDS.iter().find(|s| **s == w).copied())
 }
 
 /// The name wins over a stop word: «Мика, стоп» is a call.
@@ -137,7 +170,7 @@ pub struct WakeSetup {
     pub engine: WakeEngine,
     /// What wakes her: «мика».
     pub name: String,
-    /// The ways to say it, from `wake_phrases`, for the Windows recognizer.
+    /// What the Windows recognizer listens for, from `grammar_phrases`.
     pub phrases: Vec<String>,
     pub mic: Arc<SystemMicrophone>,
     pub on_wake: OnWake,
@@ -523,6 +556,37 @@ mod tests {
         assert!(is_echo("Мика", "Меня зовут МИКА, чем помочь?"));
         assert!(!is_echo("Мика", "Сегодня минус десять."));
         assert!(!is_echo("", "что угодно"));
+    }
+
+    #[test]
+    fn the_windows_grammar_holds_the_name_phrases_and_the_stop_words() {
+        let g = grammar_phrases("Мика");
+        for p in wake_phrases("Мика") {
+            assert!(g.contains(&p), "{p}");
+        }
+        for w in STOP_WORDS {
+            assert!(g.contains(&w.to_string()), "{w}");
+        }
+        // Each phrase once.
+        let mut unique = g.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), g.len());
+        // Without a name nothing wakes her, and the grammar is empty.
+        assert!(grammar_phrases("  ").is_empty());
+    }
+
+    #[test]
+    fn a_phrase_of_stop_words_only() {
+        assert!(only_stop_words("стоп"));
+        assert!(only_stop_words("Хватит, хватит!"));
+        assert!(only_stop_words("[unk] остановись"));
+        assert!(!only_stop_words("сколько хватит бензина"));
+        assert!(!only_stop_words("стопка"));
+        assert!(!only_stop_words(""));
+        assert!(!only_stop_words("[unk]"));
+        // The Windows recognizer gives the word with a capital and a dot.
+        assert_eq!(stop_word("Стоп."), Some("стоп"));
     }
 
     #[test]

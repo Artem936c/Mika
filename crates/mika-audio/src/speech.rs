@@ -1104,6 +1104,8 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
     // A question about an action is open: what the user says answers it, and
     // the reply goes on with its task.
     let mut confirming = false;
+    // The pause after a full stop (decision 0045): reminders only show.
+    let mut paused = false;
     let say = |text: &str| {
         let clean = clean_for_speech(text);
         if !clean.is_empty() && switch.heard() {
@@ -1149,6 +1151,7 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
         };
         match &event {
             Event::ConfirmRequested { .. } => confirming = true,
+            Event::PauseChanged { paused: now } => paused = *now,
             Event::ConfirmResolved { .. }
             | Event::StateChanged {
                 to: AssistantState::Idle,
@@ -1301,7 +1304,7 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
                 text,
                 kind: ReminderKind::Remind,
                 ..
-            } => say(&format!("Напоминаю: {text}")),
+            } if !paused => say(&format!("Напоминаю: {text}")),
             _ => {}
         }
     }
@@ -1502,6 +1505,27 @@ mod tests {
                 "Напоминаю: чайник"
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_reminder_is_not_said_during_the_pause() {
+        let remind = |text: &str| Event::ReminderFired {
+            id: 1,
+            text: text.into(),
+            kind: ReminderKind::Remind,
+            late_s: 0,
+        };
+        let v = run(
+            vec![
+                Event::PauseChanged { paused: true },
+                remind("чайник"),
+                Event::PauseChanged { paused: false },
+                remind("цветы"),
+            ],
+            true,
+        )
+        .await;
+        assert_eq!(*v.said.lock(), vec!["Напоминаю: цветы"]);
     }
 
     #[tokio::test]

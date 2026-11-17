@@ -878,6 +878,11 @@ impl Agent {
         self.turn.try_lock().is_err()
     }
 
+    /// Whether a multi-step task with a plan is unfinished.
+    pub fn task_active(&self) -> bool {
+        self.tasks.read().as_ref().is_some_and(TaskBoard::active)
+    }
+
     fn commit(&self, msgs: Vec<ChatMessage>) {
         if let Some((db, conv)) = &self.store {
             for m in &msgs {

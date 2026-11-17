@@ -12,6 +12,7 @@ use crate::confirm::{
     parse_answer, voice_answer, ConfirmError, Confirmations, DecidedBy, VoiceAnswer,
 };
 use crate::events::{Event, EventBus};
+use crate::pause::{skipped_line, Pause, SkipKind, StopReport, REMARK_PAUSE, REMARK_STOP};
 
 /// Said in the chat when something else is typed while a question about an action is open.
 pub fn answer_hint() -> String {
@@ -38,6 +39,15 @@ pub enum Origin {
     Telegram,
     /// Said into the microphone.
     Voice,
+}
+
+/// How the user addressed her, as the journal names it.
+fn origin_name(origin: Origin) -> &'static str {
+    match origin {
+        Origin::Local => "window",
+        Origin::Telegram => "telegram",
+        Origin::Voice => "voice",
+    }
 }
 
 /// What started a turn, as the journal names it.
@@ -105,6 +115,8 @@ pub struct Session {
     /// One turn at a time, in the order they were asked for. A turn takes
     /// the origin when it starts, not when it is queued (decision 0031).
     turns: tokio::sync::Mutex<()>,
+    /// The pause after a full stop (decision 0045).
+    pause: Pause,
 }
 
 impl Session {
@@ -117,7 +129,76 @@ impl Session {
             commands: Mutex::new(None),
             origin: Mutex::new(Origin::Local),
             turns: tokio::sync::Mutex::new(()),
+            pause: Pause::default(),
         })
+    }
+
+    /// The pause after a full stop: what she would start by herself asks it first.
+    pub fn pause(&self) -> &Pause {
+        &self.pause
+    }
+
+    /// Stops everything (decision 0045): the running reply and the queued
+    /// ones, a task with its tool call, an open question (denied), every
+    /// background job of `jobs` (a recording saves its file). `report`
+    /// comes with what the caller stopped itself: her voice, a recording of
+    /// the microphone. With `pause` the pause begins. One line in the chat
+    /// says what was stopped; without the pause it comes only when something was.
+    pub fn full_stop(
+        &self,
+        mut report: StopReport,
+        jobs: Option<&crate::bgjobs::JobBoard>,
+        pause: bool,
+    ) -> StopReport {
+        report.reply = self.agent.turn_running() || self.turns.try_lock().is_err();
+        report.task = self.agent.task_active();
+        report.confirm = self.confirms.pending().is_some();
+        self.stop();
+        for job in jobs.map(|j| j.stop_all()).unwrap_or_default() {
+            if job.live {
+                report.recording = true;
+            } else {
+                report.jobs += 1;
+            }
+        }
+        let began = pause && self.pause.begin();
+        log::info!(
+            "full stop: stopped={} pause={}",
+            report.names(),
+            if began {
+                "began"
+            } else if pause {
+                "on"
+            } else {
+                "off"
+            }
+        );
+        if began {
+            self.bus.publish(Event::PauseChanged { paused: true });
+        }
+        if pause || !report.is_empty() {
+            self.bus.publish(Event::Remark {
+                text: report.line(pause),
+                kind: REMARK_STOP.into(),
+            });
+        }
+        report
+    }
+
+    /// The user addressed her: the pause ends, and one line tells what it
+    /// skipped. `by` names how, for the journal. Without a pause nothing happens.
+    pub fn addressed(&self, by: &str) {
+        let Some(skipped) = self.pause.end() else {
+            return;
+        };
+        log::info!("pause ended: by={by} skipped={}", skipped.len());
+        self.bus.publish(Event::PauseChanged { paused: false });
+        if let Some(text) = skipped_line(&skipped) {
+            self.bus.publish(Event::Remark {
+                text,
+                kind: REMARK_PAUSE.into(),
+            });
+        }
     }
 
     /// Turns on user commands: a message equal to a command name runs the command.
@@ -195,6 +276,14 @@ impl Session {
             return;
         }
         let shown = shown.trim().to_string();
+        // Nothing of her own starts during the pause (decision 0045).
+        let kind = match source {
+            Source::Scenario => SkipKind::Scenario,
+            _ => SkipKind::Task,
+        };
+        if self.pause.skip(kind, &shown) {
+            return;
+        }
         // The token of now: a "stop" that comes before this turn drops it.
         let token = self.cancel.lock().clone();
         tokio::spawn(self.clone().turn(Origin::Local, source, shown, text, token));
@@ -219,6 +308,7 @@ impl Session {
         if text.is_empty() {
             return Submitted::Empty;
         }
+        self.addressed(origin_name(origin));
         let by = match origin {
             Origin::Local => DecidedBy::Chat,
             Origin::Telegram => DecidedBy::Telegram,
@@ -299,6 +389,7 @@ impl Session {
         if text.is_empty() {
             return Some(Submitted::Empty);
         }
+        self.addressed(origin_name(origin));
         if self.confirms.pending().is_some() {
             return None;
         }
@@ -351,6 +442,7 @@ impl Session {
         if shown.is_empty() {
             return Submitted::Empty;
         }
+        self.addressed("direct");
         if self.confirms.pending().is_some() {
             self.bus.publish(Event::AssistantText {
                 text: answer_hint(),
@@ -774,6 +866,137 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e, Event::AssistantText { .. })));
+    }
+
+    fn drain(rx: &mut tokio::sync::broadcast::Receiver<Event>) -> Vec<Event> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn remark_of(events: &[Event], kind: &str) -> Option<String> {
+        events.iter().find_map(|e| match e {
+            Event::Remark { text, kind: k } if k == kind => Some(text.clone()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_full_stop_ends_the_turn_denies_the_question_and_pauses() {
+        let (s, bus, state) = session();
+        s.submit("который час");
+        wait_pending(&s).await;
+        let mut rx = bus.subscribe();
+        let report = s.full_stop(
+            StopReport {
+                speech: true,
+                ..Default::default()
+            },
+            None,
+            true,
+        );
+        assert!(
+            report.reply && report.confirm && report.speech,
+            "{report:?}"
+        );
+        assert!(s.confirms.pending().is_none());
+        assert!(s.pause().is_on());
+        wait_idle(&state).await;
+        let events = drain(&mut rx);
+        assert!(events.contains(&Event::PauseChanged { paused: true }));
+        assert_eq!(remark_of(&events, REMARK_STOP), Some(report.line(true)));
+        // A second stop during the pause changes nothing about it.
+        let mut rx = bus.subscribe();
+        s.full_stop(StopReport::default(), None, true);
+        assert!(!drain(&mut rx).contains(&Event::PauseChanged { paused: true }));
+    }
+
+    #[tokio::test]
+    async fn a_full_stop_stops_every_background_job() {
+        let (s, bus, _state) = session();
+        let jobs = crate::bgjobs::JobBoard::new(bus.clone());
+        let live = jobs
+            .submit(
+                crate::bgjobs::JobSpec::live("screen_record", "rec", Duration::from_secs(5)),
+                Box::new(|ctx: crate::bgjobs::JobCtx| {
+                    Box::pin(async move {
+                        ctx.cancel.cancelled().await;
+                        Ok(crate::tools::ToolOutput::new("Запись сохранена."))
+                    })
+                }),
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let report = s.full_stop(StopReport::default(), Some(&jobs), true);
+        assert!(report.recording);
+        assert_eq!(report.jobs, 0);
+        let ended = jobs
+            .wait(live.job.id, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(ended.state, crate::bgjobs::JobState::Done);
+    }
+
+    #[tokio::test]
+    async fn a_stop_without_the_pause_says_nothing_when_nothing_ran() {
+        let (s, bus, _state) = session();
+        let mut rx = bus.subscribe();
+        let report = s.full_stop(StopReport::default(), None, false);
+        assert!(report.is_empty());
+        assert!(!s.pause().is_on());
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn during_the_pause_tasks_start_nothing_and_a_message_ends_it() {
+        let (s, bus, state) = session();
+        s.full_stop(StopReport::default(), None, true);
+        let mut rx = bus.subscribe();
+        s.submit_task("полить цветы");
+        s.submit_task_as("⚡ Сценарий «Наушники»", "Сработал мой сценарий");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(drain(&mut rx).is_empty(), "nothing started");
+        assert!(s.pause().is_on());
+
+        assert_eq!(
+            s.submit_from("привет", Origin::Telegram),
+            Submitted::Started
+        );
+        assert!(!s.pause().is_on());
+        let events = drain(&mut rx);
+        assert_eq!(events.first(), Some(&Event::PauseChanged { paused: false }));
+        let line = remark_of(&events, REMARK_PAUSE).expect("the line of what was skipped");
+        assert!(line.contains("«полить цветы»"), "{line}");
+        assert!(line.contains("«⚡ Сценарий «Наушники»»"), "{line}");
+        s.stop();
+        wait_idle(&state).await;
+    }
+
+    #[tokio::test]
+    async fn a_pause_that_skipped_nothing_ends_without_a_line() {
+        let (s, bus, _state) = session();
+        let mut rx = bus.subscribe();
+        // No pause: being addressed changes nothing.
+        s.addressed("test");
+        assert!(drain(&mut rx).is_empty());
+        s.full_stop(StopReport::default(), None, true);
+        let mut rx = bus.subscribe();
+        s.addressed("test");
+        assert_eq!(drain(&mut rx), vec![Event::PauseChanged { paused: false }]);
+    }
+
+    #[tokio::test]
+    async fn a_direct_turn_and_a_voice_message_end_the_pause() {
+        let (s, _bus, state) = session();
+        s.full_stop(StopReport::default(), None, true);
+        s.submit_direct("вопрос про экран", async {
+            Ok("ответ".to_string())
+        });
+        assert!(!s.pause().is_on());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_idle(&state).await;
+        s.full_stop(StopReport::default(), None, true);
+        assert!(s.submit_new_from("голосовое", Origin::Telegram).is_some());
+        assert!(!s.pause().is_on());
+        s.stop();
     }
 
     #[tokio::test]

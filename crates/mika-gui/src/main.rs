@@ -183,6 +183,7 @@ fn main() {
             bridge::set_island_rect,
             bridge::send_message,
             bridge::stop,
+            bridge::get_paused,
             bridge::poke_avatar,
             catalog::list_models,
             catalog::list_voices,

@@ -669,6 +669,23 @@ impl JobBoard {
         }
     }
 
+    /// Stops every job that waits or works (decision 0045): a waiting one
+    /// leaves the queue, a working one is told to stop, a recording saves its
+    /// file as its own Stop does. Returns the jobs it asked to stop, as they
+    /// were; one already stopping is not among them. New jobs are taken.
+    pub fn stop_all(&self) -> Vec<JobView> {
+        let asked: Vec<JobView> = self
+            .active()
+            .into_iter()
+            .filter(|j| j.state != JobState::Stopping)
+            .filter(|j| self.stop(j.id).is_ok())
+            .collect();
+        if !asked.is_empty() {
+            log::info!("every job asked to stop: jobs={}", asked.len());
+        }
+        asked
+    }
+
     /// The app is closing: nothing new is taken (`JobError::Closed`), every
     /// job is stopped, and this waits until none is active or `timeout` has passed.
     pub async fn shutdown(&self, timeout: Duration) {
@@ -1390,6 +1407,54 @@ mod tests {
         gate.notify_one();
         b.wait(hold.job.id, WAIT).await.unwrap();
         assert!(!ran.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn stop_all_stops_every_job_and_a_recording_saves_its_file() {
+        let (b, _rx) = board();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let never = Arc::new(tokio::sync::Notify::new());
+        let running = b
+            .submit(
+                JobSpec::queued("t", "a"),
+                gated(never.clone(), Ok(ToolOutput::new("a")), log.clone(), "a"),
+            )
+            .unwrap();
+        let waiting = b
+            .submit(
+                JobSpec::queued("t", "b"),
+                gated(never.clone(), Ok(ToolOutput::new("b")), log.clone(), "b"),
+            )
+            .unwrap();
+        let live = b
+            .submit(
+                JobSpec::live("screen_record", "rec", Duration::from_secs(5)),
+                Box::new(|ctx: JobCtx| {
+                    Box::pin(async move {
+                        ctx.cancel.cancelled().await;
+                        Ok(ToolOutput::new("Запись сохранена."))
+                    })
+                }),
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let stopped = b.stop_all();
+        let mut ids: Vec<JobId> = stopped.iter().map(|j| j.id).collect();
+        ids.sort();
+        assert_eq!(ids, vec![running.job.id, waiting.job.id, live.job.id]);
+        assert_eq!(stopped.iter().filter(|j| j.live).count(), 1);
+        let ended = b.wait(live.job.id, WAIT).await.unwrap();
+        assert_eq!(ended.state, JobState::Done, "a recording is saved");
+        b.wait(running.job.id, WAIT).await.unwrap();
+        assert!(b.active().is_empty());
+        assert_eq!(b.get(waiting.job.id).unwrap().state, JobState::Stopped);
+        // The board stays open: a full stop is not the app closing.
+        assert!(b
+            .submit(JobSpec::queued("t", "c"), quick(Ok(ToolOutput::new(""))))
+            .is_ok());
+        // Nothing active: nothing to stop.
+        let (empty, _rx) = board();
+        assert!(empty.stop_all().is_empty());
     }
 
     #[tokio::test]

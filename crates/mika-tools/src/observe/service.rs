@@ -62,6 +62,10 @@ pub struct ServiceDeps {
     /// decision 0028 (`mika_core::costs::unattended_allowed`). Asked once for
     /// every scenario that is about to run; false skips that run.
     pub paid_allowed: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// She is in the pause after a full stop (decision 0045). Asked with the
+    /// name of every scenario that is about to run; true skips that run, and
+    /// the app writes it into the list of what the pause skipped.
+    pub paused: Arc<dyn Fn(&str) -> bool + Send + Sync>,
     /// Runs a scenario: the line the chat shows and the full text for the model.
     pub on_task: Handler,
     /// Tells the user something without the model: the text and the remark kind.
@@ -435,6 +439,12 @@ impl Service {
                 }
             },
         };
+        // The pause after a full stop (decision 0045) holds it like the
+        // budget below: the app keeps it in the list of what was skipped.
+        if (self.deps.paused)(&t.name) {
+            log::info!("scenario skipped: id={} reason=paused", t.id);
+            return;
+        }
         // A run is a paid request to the model that nobody asked for just
         // now: with the budget reached it is skipped. Checked before the
         // limits, so a skipped run takes no place in the hour, does not start
@@ -577,6 +587,7 @@ mod tests {
             config: Arc::new(move || c.lock().clone()),
             windows_on: Arc::new(move || on.load(Ordering::Relaxed)),
             paid_allowed: Arc::new(|| true),
+            paused: Arc::new(|_: &str| false),
             on_task: Arc::new(move |shown: &str, full: &str| {
                 t.lock().push((shown.into(), full.into()))
             }),
@@ -918,6 +929,43 @@ mod tests {
         start(&mut r, 3600).await;
         assert_eq!(r.tasks.lock().len(), 3);
         assert_eq!(r.told.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_pause_after_a_stop_skips_runs_and_counts_none_of_them() {
+        let mut r = rig();
+        let t = r.scenario("Браузер", TriggerEvent::AppStarted, "chrome.exe");
+        let paused = Arc::new(AtomicBool::new(true));
+        let held: Lines = Default::default();
+        let (on, names) = (paused.clone(), held.clone());
+        r.service.deps.paused = Arc::new(move |name: &str| {
+            let on = on.load(Ordering::Relaxed);
+            if on {
+                names.lock().push((name.into(), String::new()));
+            }
+            on
+        });
+        r.run(&[]);
+        r.service.tick(0, DAY).await;
+        r.run(&["chrome.exe"]);
+        r.service.tick(5, DAY).await;
+        assert!(r.tasks.lock().is_empty());
+        assert_eq!(
+            held.lock().len(),
+            1,
+            "the skipped run is handed over with its name"
+        );
+        assert_eq!(held.lock()[0].0, "Браузер");
+        let now = r.triggers.get(t.id).unwrap().unwrap();
+        assert_eq!((now.fired_at, now.fired_today(DAY)), (0, 0));
+        assert!(r.triggers.runs_since(0).unwrap().is_empty());
+        // The pause is over: the next event runs at once.
+        paused.store(false, Ordering::Relaxed);
+        r.run(&[]);
+        r.service.tick(10, DAY).await;
+        r.run(&["chrome.exe"]);
+        r.service.tick(15, DAY).await;
+        assert_eq!(r.tasks.lock().len(), 1);
     }
 
     #[tokio::test]
