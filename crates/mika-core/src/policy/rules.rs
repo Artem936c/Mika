@@ -33,6 +33,51 @@ impl RuleDecision {
     }
 }
 
+/// A class of calls that one "always" rule covers whole (decision 0044).
+/// Only the tool's own assessment puts a call into a class: the rule is
+/// stored as a pattern no call scope is matched against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleClass {
+    /// `run_shell` lines that only tell about the system
+    /// (`CommandRisk::system_info`).
+    SystemInfo,
+}
+
+impl RuleClass {
+    /// What starts the pattern of every class rule.
+    pub const PREFIX: &'static str = "class:";
+
+    const ALL: [RuleClass; 1] = [RuleClass::SystemInfo];
+
+    /// The pattern of the rule that covers this class.
+    pub fn pattern(self) -> &'static str {
+        match self {
+            RuleClass::SystemInfo => "class:system-info",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuleClass::SystemInfo => "system_info",
+        }
+    }
+
+    /// The class a rule pattern stands for, letter case aside.
+    pub fn from_pattern(pattern: &str) -> Option<RuleClass> {
+        Self::ALL
+            .into_iter()
+            .find(|c| c.pattern().eq_ignore_ascii_case(pattern))
+    }
+}
+
+/// Whether a pattern is written as a class rule, known class or not.
+fn is_class_pattern(pattern: &str) -> bool {
+    pattern
+        .get(..RuleClass::PREFIX.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(RuleClass::PREFIX))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Rule {
     pub id: i64,
@@ -171,14 +216,37 @@ impl RuleStore {
     /// scenario with its limits). No such rule is made here (`forever_block`),
     /// but a backup from elsewhere can bring one, and a permanent allow must
     /// never cover more than the question it was given for showed.
+    ///
+    /// An allow of a class (`class:...`) never covers a scope here, even one
+    /// with the same text: only `find_class` reads it.
     pub fn find(&self, tool: &str, scope: &str) -> Result<Option<RuleDecision>, PolicyError> {
         let covers = |r: &Rule| match r.decision {
             RuleDecision::Deny => pattern_matches(&r.pattern, scope),
-            RuleDecision::Allow => r.pattern.to_lowercase() == scope.to_lowercase(),
+            RuleDecision::Allow => {
+                !is_class_pattern(&r.pattern) && r.pattern.to_lowercase() == scope.to_lowercase()
+            }
         };
         let mut found = None;
         for r in self.list()?.into_iter().filter(|r| r.tool == tool) {
             if covers(&r) {
+                if r.decision == RuleDecision::Deny {
+                    return Ok(Some(RuleDecision::Deny));
+                }
+                found = Some(RuleDecision::Allow);
+            }
+        }
+        Ok(found)
+    }
+
+    /// The rule of a whole class for a tool: an allow or a deny made for it.
+    pub fn find_class(
+        &self,
+        tool: &str,
+        class: RuleClass,
+    ) -> Result<Option<RuleDecision>, PolicyError> {
+        let mut found = None;
+        for r in self.list()?.into_iter().filter(|r| r.tool == tool) {
+            if RuleClass::from_pattern(&r.pattern) == Some(class) {
                 if r.decision == RuleDecision::Deny {
                     return Ok(Some(RuleDecision::Deny));
                 }
@@ -336,6 +404,51 @@ mod tests {
             s.find("av_folder", "compress:c:/videos").unwrap(),
             Some(RuleDecision::Deny)
         );
+    }
+
+    #[test]
+    fn a_class_rule_is_found_only_by_its_class() {
+        let s = store();
+        let class = RuleClass::SystemInfo;
+        s.add(
+            "run_shell",
+            class.pattern(),
+            RuleDecision::Allow,
+            RiskLevel::Medium,
+        )
+        .unwrap();
+        assert_eq!(
+            s.find_class("run_shell", class).unwrap(),
+            Some(RuleDecision::Allow)
+        );
+        assert_eq!(s.find_class("other", class).unwrap(), None);
+        // A call whose own scope happens to be the text of the class rule is
+        // not covered: only the classifier puts a call into the class.
+        assert_eq!(s.find("run_shell", class.pattern()).unwrap(), None);
+        assert_eq!(s.find("run_shell", "get-process").unwrap(), None);
+        // A deny made by hand for the class closes it.
+        s.add(
+            "run_shell",
+            class.pattern(),
+            RuleDecision::Deny,
+            RiskLevel::Medium,
+        )
+        .unwrap();
+        assert_eq!(
+            s.find_class("run_shell", class).unwrap(),
+            Some(RuleDecision::Deny)
+        );
+    }
+
+    #[test]
+    fn a_class_has_a_fixed_pattern() {
+        assert_eq!(RuleClass::SystemInfo.pattern(), "class:system-info");
+        assert_eq!(
+            RuleClass::from_pattern("CLASS:System-Info"),
+            Some(RuleClass::SystemInfo)
+        );
+        assert_eq!(RuleClass::from_pattern("class:other"), None);
+        assert_eq!(RuleClass::from_pattern("get-process"), None);
     }
 
     #[test]

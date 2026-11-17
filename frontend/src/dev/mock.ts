@@ -57,6 +57,14 @@ const ASSESSMENTS = {
     reason: 'Только читает список файлов. Ничего не меняет.',
     scope: 'get-childitem',
   },
+  sysinfo: {
+    level: 'medium',
+    summary: 'Выполнить команду PowerShell',
+    target: 'Get-Process | Sort-Object CPU -Descending | Select-Object -First 5',
+    reason: 'команда только читает данные',
+    scope: 'get-process | sort-object cpu -descending | select-object -first 5',
+    rule_class: 'system_info',
+  },
   high: {
     level: 'high',
     summary: 'Удалить всё из папки «Загрузки»',
@@ -391,15 +399,16 @@ const BACKUP_PREVIEW = {
     { id: 'commands', in_file: 2, here: 0, available: true, selected: true },
     { id: 'scenarios', in_file: 3, here: 1, available: true, selected: true },
     { id: 'rules_deny', in_file: 1, here: 0, available: true, selected: true },
-    { id: 'rules_allow', in_file: 3, here: 1, available: true, selected: false },
+    { id: 'rules_allow', in_file: 4, here: 1, available: true, selected: false },
     { id: 'secrets', in_file: 5, here: 2, available: true, selected: true },
   ],
   allow_rules: [
     { tool: 'open_app', pattern: 'проводник' },
     { tool: 'run_shell', pattern: 'get-childitem' },
+    { tool: 'run_shell', pattern: 'class:system-info' },
     { tool: 'av_convert', pattern: String.raw`c:\видео -> c:\видео` },
   ],
-  allow_rules_total: 3,
+  allow_rules_total: 4,
   allow_rules_dropped: 0,
   tasks: [
     { text: 'Расскажи погоду и что в календаре', due_at: 1794366000, repeat: 'daily' },
@@ -1077,6 +1086,7 @@ export async function install(scenario: string) {
           return [
             { id: 1, tool: 'open_app', pattern: 'проводник', decision: 'allow', created_at: '2026-11-10T22:00:00+03:00' },
             { id: 2, tool: 'run_shell', pattern: 'get-childitem', decision: 'allow', created_at: '2026-11-10T22:05:00+03:00' },
+            { id: 4, tool: 'run_shell', pattern: 'class:system-info', decision: 'allow', created_at: '2026-11-17T10:00:00+05:00' },
             { id: 3, tool: 'kill_process', pattern: 'explorer.exe', decision: 'deny', created_at: '2026-11-10T22:07:00+03:00' },
           ];
         case 'recent_audit':
@@ -2065,6 +2075,7 @@ export async function install(scenario: string) {
         break;
       }
       case 'confirm':
+      case 'sysinfo':
       case 'high':
       case 'long': {
         if (params.has('inchat')) {

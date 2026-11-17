@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use mika_core::gate::Approval;
 use mika_core::llm::ToolSpec;
 use mika_core::policy::command::{classify_command, Shell};
+use mika_core::policy::RuleClass;
 use mika_core::tools::{arg_str, arg_str_opt, spec, Assessment, Tool, ToolError, ToolOutput};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -79,14 +80,21 @@ impl Tool for RunShellTool {
             Shell::PowerShell => "PowerShell",
             Shell::Cmd => "cmd",
         };
-        Ok(Assessment::new(
+        let a = Assessment::new(
             risk.level,
             format!("Выполнить команду {name}"),
             command,
             risk.reasons.join("; "),
         )
         .with_scope(risk.normalized)
-        .with_spoken("Выполнить команду"))
+        .with_spoken("Выполнить команду");
+        // One "always" covers every line that only tells about the system
+        // (decision 0044); other lines keep the rule of the exact command.
+        Ok(if risk.system_info {
+            a.with_rule_class(RuleClass::SystemInfo)
+        } else {
+            a
+        })
     }
 
     async fn run(
@@ -159,6 +167,28 @@ mod tests {
         assert!(t
             .assess(&json!({"shell": "bash", "command": "ls"}))
             .is_err());
+    }
+
+    #[test]
+    fn system_info_commands_carry_their_class() {
+        let (e, _) = env();
+        let t = RunShellTool(e.runner);
+        let class = |args: Value| t.assess(&args).unwrap().rule_class;
+        assert_eq!(
+            class(json!({"command": "Get-Process"})),
+            Some(RuleClass::SystemInfo)
+        );
+        assert_eq!(
+            class(json!({"shell": "cmd", "command": "ipconfig /all"})),
+            Some(RuleClass::SystemInfo)
+        );
+        // Contents, the environment and high risk keep the exact command.
+        assert_eq!(class(json!({"command": "Get-Content x.txt"})), None);
+        assert_eq!(class(json!({"command": "Get-ChildItem Env:"})), None);
+        assert_eq!(class(json!({"command": "Remove-Item C:\\x"})), None);
+        // The scope stays the command: a deny of one line still works.
+        let a = t.assess(&json!({"command": "Get-Process"})).unwrap();
+        assert_eq!(a.scope, "get-process");
     }
 
     #[tokio::test]

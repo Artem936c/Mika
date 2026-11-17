@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { alwaysTitle, confirmHead, reducePending, secondsLeft, untranslated, type Pending } from './confirm';
+import { alwaysLabel, alwaysTitle, confirmHead, reducePending, secondsLeft, untranslated, type Pending } from './confirm';
 import { isMessageKey } from './i18n';
 
 const assessment = { level: 'medium', summary: 'Открыть', target: 'notepad', reason: 'запуск', scope: 'notepad' };
@@ -56,6 +56,22 @@ describe('card texts', () => {
     for (const level of ['low', 'medium', 'high'] as const) {
       expect(isMessageKey(confirmHead(level)), level).toBe(true);
     }
+  });
+
+  it('names the class on the "always" button of a system information command', () => {
+    const info: Pending = {
+      ...pending('medium', true),
+      assessment: { level: 'medium', summary: 's', target: 'Get-Process', reason: 'r', scope: 'get-process', rule_class: 'system_info' },
+    };
+    expect(alwaysLabel(info)).toBe('confirm.always_system_info');
+    expect(alwaysTitle(info)).toBe('confirm.always_title_system_info');
+    expect(alwaysLabel(pending('medium', true))).toBe('confirm.always');
+    for (const key of ['confirm.always_system_info', 'confirm.always_title_system_info']) {
+      expect(isMessageKey(key), key).toBe(true);
+    }
+    // The class comes in with the event.
+    const p = reducePending(null, { ...req, assessment: info.assessment }, 0) as Pending;
+    expect(alwaysLabel(p)).toBe('confirm.always_system_info');
   });
 
   it('explains why "always" is not offered', () => {

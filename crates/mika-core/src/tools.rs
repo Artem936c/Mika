@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use crate::events::{Event, EventBus};
 use crate::gate::Approval;
 use crate::llm::ToolSpec;
+use crate::policy::RuleClass;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -48,6 +49,10 @@ pub struct Assessment {
     /// asks with it, and a high-risk action is approved by saying it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spoken: Option<String>,
+    /// The class of calls this one belongs to. "Always" then allows the
+    /// whole class with one rule (decision 0044).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_class: Option<RuleClass>,
 }
 
 impl Assessment {
@@ -64,6 +69,7 @@ impl Assessment {
             reason: reason.into(),
             scope: "*".into(),
             spoken: None,
+            rule_class: None,
         }
     }
 
@@ -74,6 +80,11 @@ impl Assessment {
 
     pub fn with_spoken(mut self, spoken: impl Into<String>) -> Self {
         self.spoken = Some(spoken.into());
+        self
+    }
+
+    pub fn with_rule_class(mut self, class: RuleClass) -> Self {
+        self.rule_class = Some(class);
         self
     }
 

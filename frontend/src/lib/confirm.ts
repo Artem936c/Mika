@@ -10,6 +10,8 @@ export interface Assessment {
   target: string;
   reason: string;
   scope: string;
+  /** A class of calls one "always" rule covers whole (decision 0044). */
+  rule_class?: 'system_info';
 }
 
 export interface Pending {
@@ -35,9 +37,16 @@ export function confirmHead(level: RiskLevel): MessageKey {
   return `confirm.head_${level}`;
 }
 
+/** Text of the "always" button: it names the class when the rule would cover one. */
+export function alwaysLabel(p: Pending): MessageKey {
+  return p.assessment.rule_class === 'system_info' ? 'confirm.always_system_info' : 'confirm.always';
+}
+
 /** Why "allow always" is offered or not, as a tooltip. */
 export function alwaysTitle(p: Pending): MessageKey {
-  if (p.allowAlways) return 'confirm.always_title';
+  if (p.allowAlways) {
+    return p.assessment.rule_class === 'system_info' ? 'confirm.always_title_system_info' : 'confirm.always_title';
+  }
   return p.assessment.level === 'high' ? 'confirm.always_high' : 'confirm.always_wide';
 }
 

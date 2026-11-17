@@ -2,6 +2,7 @@
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import { isMessageKey, t } from './i18n';
+  import { ruleLabel } from './rules';
 
   let { name }: { name: string } = $props();
 
@@ -60,7 +61,11 @@
   {#each rules as r (r.id)}
     <div class="perm">
       <span class="tool">{r.tool}</span>
-      <code title={r.pattern}>{r.pattern}</code>
+      {#if ruleLabel(r.pattern)}
+        <span class="named" title={r.pattern}>{t(ruleLabel(r.pattern)!)}</span>
+      {:else}
+        <code title={r.pattern}>{r.pattern}</code>
+      {/if}
       <div class="seg">
         {#if r.decision === 'allow'}
           <button class="on">{t('permissions.always')}</button>
@@ -126,6 +131,14 @@
   .tool {
     flex: none;
     font-weight: 700;
+    font-size: 13px;
+  }
+  .named {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-size: 13px;
   }
   code {

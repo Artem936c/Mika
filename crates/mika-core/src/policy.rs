@@ -7,9 +7,9 @@ pub mod paths;
 pub mod rules;
 
 pub use gate::PolicyGate;
-pub use rules::{AuditEntry, AuditLog, Rule, RuleDecision, RuleStore};
+pub use rules::{AuditEntry, AuditLog, Rule, RuleClass, RuleDecision, RuleStore};
 
-use crate::tools::RiskLevel;
+use crate::tools::{Assessment, RiskLevel};
 
 pub const HIGH_RISK_FOREVER: &str = "действие высокого риска нельзя разрешить навсегда";
 pub const WILDCARD_FOREVER: &str =
@@ -25,6 +25,23 @@ pub fn forever_block(level: RiskLevel, scope: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// The pattern an "always" answer saves for this call: the class when the
+/// tool put the call into one, the call's own scope otherwise.
+pub fn always_pattern(a: &Assessment) -> &str {
+    match a.rule_class {
+        Some(class) => class.pattern(),
+        None => &a.scope,
+    }
+}
+
+/// `forever_block` for the rule an "always" answer would really save.
+/// A class rule is wide on purpose: the class is bounded by the tool's own
+/// classifier, not by text from the arguments, so the `*` check of the scope
+/// does not apply to it. High risk stays refused.
+pub fn forever_block_for(a: &Assessment) -> Option<&'static str> {
+    forever_block(a.level, always_pattern(a))
 }
 
 #[derive(Debug, thiserror::Error)]

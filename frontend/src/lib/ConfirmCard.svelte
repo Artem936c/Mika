@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Icon from './Icon.svelte';
-  import { alwaysTitle, confirmHead, secondsLeft, showsWhole, untranslated, type Pending } from './confirm';
+  import { alwaysLabel, alwaysTitle, confirmHead, secondsLeft, showsWhole, untranslated, type Pending } from './confirm';
   import { t } from './i18n';
   import { CONFIRM_LINES, confirmTargetHeight } from './island';
   import { lang } from './locale.svelte';
@@ -45,7 +45,7 @@
   <div class="acts">
     <button class="bt pri" onclick={() => onanswer('once')}><Icon name="check" />{t('confirm.once')}</button>
     <button class="bt" disabled={!pending.allowAlways} title={t(alwaysTitle(pending))} onclick={() => onanswer('always')}>
-      {t('confirm.always')}
+      {t(alwaysLabel(pending))}
     </button>
     <button class="bt no" onclick={() => onanswer('deny')}>{t('confirm.deny')}</button>
   </div>

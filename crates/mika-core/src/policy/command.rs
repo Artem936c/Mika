@@ -24,6 +24,11 @@ pub struct CommandRisk {
     pub reasons: Vec<String>,
     /// Lower case, escapes removed, single spaces. Used as the rule scope.
     pub normalized: String,
+    /// A medium line that only tells about the system: processes, services,
+    /// network, disks, names of files. It reads no contents of files, the
+    /// registry, the clipboard or the environment, and names nothing secret.
+    /// One "always" rule covers all such lines (decision 0044).
+    pub system_info: bool,
 }
 
 /// Commands that only read. Everything not here is treated as a change.
@@ -108,6 +113,61 @@ const READ_ONLY: &[&str] = &[
     "comp",
     "vol",
     "driverquery",
+];
+
+/// Commands that print what is inside something rather than what there is:
+/// files, the registry, logs, the clipboard, variables and the environment
+/// (`set` lists the environment in cmd). A key may sit in any of them.
+/// `switch` reads a file with `-file`.
+const CONTENT_READERS: &[&str] = &[
+    "cat",
+    "gc",
+    "type",
+    "get-content",
+    "select-string",
+    "sls",
+    "findstr",
+    "find",
+    "more",
+    "fc",
+    "comp",
+    "import-csv",
+    "ipcsv",
+    "import-clixml",
+    "get-itemproperty",
+    "gp",
+    "get-itempropertyvalue",
+    "gpv",
+    "get-winevent",
+    "get-eventlog",
+    "get-history",
+    "get-bitlockervolume",
+    "get-clipboard",
+    "gcb",
+    "get-variable",
+    "gv",
+    "set",
+    "switch",
+];
+
+/// cmd only: there `sort a.txt` prints the file. In PowerShell it is Sort-Object.
+const CMD_CONTENT_READERS: &[&str] = &["sort"];
+
+/// Words that name something secret. Anywhere in the line, any letter case.
+/// `keyprotector` holds the BitLocker recovery key, a process `commandline`
+/// may hold a key passed to a program.
+pub const SECRET_WORDS: &[&str] = &[
+    "secret",
+    "credential",
+    "password",
+    "passwd",
+    "passphrase",
+    "token",
+    "apikey",
+    "api_key",
+    "api-key",
+    "keyprotector",
+    "commandline",
 ];
 
 /// Language keywords: not commands, their bodies are checked separately.
@@ -331,6 +391,42 @@ fn tokens(normalized: &str) -> impl Iterator<Item = &str> {
         .map(|t| t.strip_suffix(".exe").unwrap_or(t))
 }
 
+/// Whether a medium line only tells about the system. See `CommandRisk::system_info`.
+fn is_system_info(shell: Shell, normalized: &str) -> bool {
+    static REGISTRY: OnceLock<Regex> = OnceLock::new();
+    static PROVIDER_VAR: OnceLock<Regex> = OnceLock::new();
+    static DELAYED: OnceLock<Regex> = OnceLock::new();
+    let reader = tokens(normalized).any(|t| {
+        CONTENT_READERS.contains(&t) || (shell == Shell::Cmd && CMD_CONTENT_READERS.contains(&t))
+    });
+    if reader || SECRET_WORDS.iter().any(|w| normalized.contains(w)) {
+        return false;
+    }
+    // Drives of the environment and the variables, input from a file.
+    if ["env:", "variable:", "<"]
+        .iter()
+        .any(|m| normalized.contains(m))
+    {
+        return false;
+    }
+    // `HKCU:\...` shows the values of a key, not just its name.
+    if re(&REGISTRY, r"(^|[^a-z0-9_])hk(cu|lm|cr|u|cc):").is_match(normalized) {
+        return false;
+    }
+    // `$env:X`, `${c:\notes.txt}`: a variable of a drive reads its contents.
+    if re(&PROVIDER_VAR, r"\$\{?[a-z0-9_?]+:").is_match(normalized) {
+        return false;
+    }
+    // cmd expands `%NAME%` and `!NAME!` into the values of the environment;
+    // `for %a in (...)` reads files.
+    if shell == Shell::Cmd
+        && (normalized.contains('%') || re(&DELAYED, r"![^!\s]+!").is_match(normalized))
+    {
+        return false;
+    }
+    true
+}
+
 pub fn classify_command(shell: Shell, command: &str) -> CommandRisk {
     let normalized = normalize(command);
     let mut reasons: Vec<String> = Vec::new();
@@ -345,6 +441,7 @@ pub fn classify_command(shell: Shell, command: &str) -> CommandRisk {
             level: RiskLevel::High,
             reasons: vec!["пустая команда".into()],
             normalized,
+            system_info: false,
         };
     }
 
@@ -383,10 +480,12 @@ pub fn classify_command(shell: Shell, command: &str) -> CommandRisk {
     } else {
         RiskLevel::High
     };
+    let system_info = level == RiskLevel::Medium && is_system_info(shell, &normalized);
     CommandRisk {
         level,
         reasons,
         normalized,
+        system_info,
     }
 }
 
@@ -520,6 +619,126 @@ mod tests {
         for (shell, cmd, expected) in table {
             let r = classify_command(*shell, cmd);
             assert_eq!(r.level, *expected, "{cmd:?}: {:?}", r.reasons);
+        }
+    }
+
+    #[test]
+    fn system_info_table() {
+        let yes: &[(Shell, &str)] = &[
+            (Ps, "Get-Process"),
+            (Cmd, "tasklist"),
+            (Cmd, "ipconfig /all"),
+            (Ps, r"Get-ChildItem C:\"),
+            (Ps, r"Get-ChildItem C:\*.txt"),
+            (Ps, "dir"),
+            (Cmd, r"dir C:\Users && ver"),
+            (Cmd, "ping ya.ru"),
+            (Ps, "Test-Connection ya.ru -Count 1 2>$null"),
+            (
+                Ps,
+                "Get-Service | Where-Object { $_.Status -eq 'Running' } | Select-Object Name",
+            ),
+            (
+                Ps,
+                "Get-Process | Sort-Object CPU -Descending | Select-Object -First 5",
+            ),
+            (Ps, "Get-CimInstance Win32_OperatingSystem | Format-List"),
+            (Ps, "Get-Date -Format 'HH:mm'"),
+            (Cmd, "systeminfo"),
+            (Cmd, "whoami"),
+            (Cmd, "hostname"),
+            (Cmd, "netstat -ano"),
+            (Ps, "Get-NetIPAddress | ft"),
+            (Ps, "Get-PSDrive"),
+            (Ps, "gps | measure"),
+            (Cmd, "tree C:\\Projects"),
+        ];
+        let no: &[(Shell, &str)] = &[
+            // contents of files and the registry
+            (Ps, "Get-Content x.txt"),
+            (Ps, r"Get-Content C:\notes.txt | Select-String error"),
+            (Ps, "gc x.txt"),
+            (Ps, "cat x.txt"),
+            (Ps, "type a.txt"),
+            (Cmd, "type a.txt"),
+            (Cmd, "findstr x a.txt"),
+            (Cmd, "tasklist | findstr chrome"),
+            (Cmd, r#"find "x" a.txt"#),
+            (Cmd, "more a.txt"),
+            (Cmd, "fc a.txt b.txt"),
+            (Cmd, "comp a.txt b.txt"),
+            (Cmd, "sort a.txt"),
+            (Cmd, "sort < a.txt"),
+            (Ps, "Get-ChildItem | Select-String key"),
+            (Ps, r"get-itemproperty HKCU:\Software\X"),
+            (Ps, r"Get-ItemPropertyValue HKLM:\Software\X -Name Y"),
+            (Ps, r"Get-ChildItem HKCU:\Software"),
+            (Ps, r"Get-Item hklm:\software\x"),
+            (Ps, r"echo ${c:\notes.txt}"),
+            (
+                Ps,
+                "Get-WinEvent -LogName Microsoft-Windows-PowerShell/Operational",
+            ),
+            (Ps, "Get-EventLog -LogName Application -Newest 5"),
+            (Ps, "(Get-BitLockerVolume C:).KeyProtector"),
+            (Ps, r"switch -file C:\notes.txt { {$true} { $_ } }"),
+            (
+                Ps,
+                "Get-CimInstance Win32_Process | Select-Object Name, CommandLine",
+            ),
+            // clipboard
+            (Ps, "Get-Clipboard"),
+            (Ps, "gcb"),
+            // environment and variables
+            (Ps, "Get-ChildItem Env:"),
+            (Ps, "dir env:"),
+            (Ps, "ls Env:OPENAI_API_KEY"),
+            (Ps, "echo $env:PATH"),
+            (Ps, "Write-Output ${env:USERNAME}"),
+            (Ps, "Get-Variable"),
+            (Ps, "gv"),
+            (Ps, "dir variable:"),
+            (Cmd, "set"),
+            (Cmd, "set PATH"),
+            (Cmd, "echo %OPENAI_API_KEY%"),
+            (Cmd, "echo !KEY!"),
+            // secrets by name
+            (Ps, "Get-Secret github"),
+            (Ps, "Get-SecretInfo"),
+            (Ps, "Get-StoredCredential -Target x"),
+            (Ps, r"Get-ChildItem C:\Users\me\passwords"),
+            (Ps, r"Get-ChildItem C:\keys\api_key"),
+            (Ps, r"dir C:\x\apikey.txt"),
+            (Ps, r"Test-Path C:\token.json"),
+            (Ps, r"dir C:\passwd"),
+            // anything high
+            (Ps, r"Remove-Item C:\temp -Recurse"),
+            (Cmd, "notepad"),
+            (Ps, "Get-Date; Remove-Item C:\\x"),
+            (Ps, ""),
+        ];
+        for (shell, cmd) in yes {
+            let r = classify_command(*shell, cmd);
+            assert_eq!(r.level, Medium, "{cmd:?}: {:?}", r.reasons);
+            assert!(r.system_info, "{cmd:?} must be system information");
+        }
+        for (shell, cmd) in no {
+            let r = classify_command(*shell, cmd);
+            assert!(!r.system_info, "{cmd:?} must not be system information");
+        }
+    }
+
+    #[test]
+    fn content_readers_stay_medium() {
+        // Reading a file is still a medium question; it only asks each time.
+        for (shell, cmd) in [
+            (Ps, "Get-Content x.txt"),
+            (Cmd, "type a.txt"),
+            (Ps, "Get-Clipboard"),
+        ] {
+            let r = classify_command(shell, cmd);
+            assert_eq!(r.level, Medium, "{cmd:?}");
+            assert!(!r.system_info, "{cmd:?}");
         }
     }
 

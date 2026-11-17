@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::events::{Event, EventBus};
-use crate::policy::forever_block;
+use crate::policy::forever_block_for;
 use crate::state::{AssistantState, StateHandle};
 use crate::tools::Assessment;
 #[cfg(test)]
@@ -129,7 +129,7 @@ impl Confirmations {
             id,
             tool: tool.into(),
             assessment: assessment.clone(),
-            allow_always: forever_block(assessment.level, &assessment.scope).is_none(),
+            allow_always: forever_block_for(assessment).is_none(),
         };
         *self.pending.lock() = Some(Pending {
             view: view.clone(),
@@ -183,7 +183,7 @@ impl Confirmations {
             return Err(ConfirmError::NotPending);
         };
         if answer == Answer::Always {
-            if let Some(why) = forever_block(p.view.assessment.level, &p.view.assessment.scope) {
+            if let Some(why) = forever_block_for(&p.view.assessment) {
                 return Err(ConfirmError::ForeverNotAllowed(why));
             }
         }
@@ -1249,6 +1249,36 @@ mod tests {
         ));
         c.answer(p.id, Answer::Once, DecidedBy::Button).unwrap();
         assert_eq!(task.await.unwrap().0, Answer::Once);
+    }
+
+    #[test]
+    fn voice_always_on_a_class_card_is_the_same_always() {
+        let a = risk(RiskLevel::Medium, "Выполнить команду")
+            .with_rule_class(crate::policy::RuleClass::SystemInfo);
+        assert_eq!(
+            voice_answer("Всегда разрешай", &a),
+            VoiceAnswer::Answer(Answer::Always)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_class_offers_always_even_with_a_star_in_the_command() {
+        let (c, _state, _rx) = setup();
+        let c2 = c.clone();
+        let task = tokio::spawn(async move {
+            let a = assessment(RiskLevel::Medium)
+                .with_scope(r"get-childitem c:\*.txt")
+                .with_rule_class(crate::policy::RuleClass::SystemInfo);
+            c2.ask("run_shell", &a, CONFIRM_TIMEOUT).await
+        });
+        while c.pending().is_none() {
+            tokio::task::yield_now().await;
+        }
+        let p = c.pending().unwrap();
+        // The rule would be the class, not the command with its `*`.
+        assert!(p.allow_always);
+        c.answer(p.id, Answer::Always, DecidedBy::Voice).unwrap();
+        assert_eq!(task.await.unwrap(), (Answer::Always, DecidedBy::Voice));
     }
 
     #[tokio::test]

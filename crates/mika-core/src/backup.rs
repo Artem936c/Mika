@@ -2379,6 +2379,37 @@ mod tests {
     }
 
     #[test]
+    fn a_class_rule_is_shown_and_comes_back_only_when_ticked() {
+        let old = Pc::empty();
+        old.db
+            .with(|c| {
+                c.execute(
+                    "INSERT INTO rules (tool, pattern, decision, created_at)
+                     VALUES ('run_shell', ?1, 'allow', '2026-11-17T10:00:00+05:00')",
+                    [crate::policy::RuleClass::SystemInfo.pattern()],
+                )
+            })
+            .unwrap();
+        let (file, _) = export_bytes(&old, None);
+        let new = Pc::empty();
+        let seen = preview_of(&file, None, &new).unwrap();
+        assert_eq!(
+            seen.allow_rules,
+            vec![RulePreview {
+                tool: "run_shell".into(),
+                pattern: "class:system-info".into()
+            }]
+        );
+        let allows = category(&seen, Category::RulesAllow);
+        assert!(allows.available && !allows.selected);
+        let sql = "SELECT tool, pattern, decision FROM rules";
+        restore_of(&file, None, &new, &[Category::Notes]).unwrap();
+        assert!(rows_of(&new.db, sql).is_empty());
+        restore_of(&file, None, &new, &[Category::RulesAllow]).unwrap();
+        assert_eq!(rows_of(&new.db, sql), rows_of(&old.db, sql));
+    }
+
+    #[test]
     fn a_newer_schema_and_unknown_parts_are_reported() {
         let file = plain_file(&[
             r#"{"t":"begin","schema":99}"#,

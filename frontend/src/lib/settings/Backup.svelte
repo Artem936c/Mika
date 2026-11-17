@@ -27,6 +27,7 @@
   import { actionLabel, pauseLabel, whenLabel } from '../events';
   import { t } from '../i18n';
   import { dateLocale } from '../locale.svelte';
+  import { ruleLabel } from '../rules';
 
   let { name, mode = 'full' }: { name: string; mode?: 'full' | 'import' } = $props();
 
@@ -359,7 +360,11 @@
             <div class="under">
               {#if c.available}<p class="sub">{t('backup.rules_allow_sub', { name })}</p>{/if}
               {#each preview.allow_rules as r}
-                <div class="mono">{r.tool} · {r.pattern}</div>
+                {#if ruleLabel(r.pattern)}
+                  <div title={r.pattern}>{r.tool} · {t(ruleLabel(r.pattern)!)}</div>
+                {:else}
+                  <div class="mono">{r.tool} · {r.pattern}</div>
+                {/if}
               {/each}
               {#if preview.allow_rules_total > preview.allow_rules.length}
                 <p class="sub">{t('backup.rules_more', { count: preview.allow_rules_total - preview.allow_rules.length })}</p>
