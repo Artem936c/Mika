@@ -41,6 +41,9 @@
 // the save dialog without a file. `?mock=settings&page=journal` is the same page without the unclean run.
 // Full stop (decision 0045): scenario `paused` speaks, hears «стоп», says what stopped and shows the calm paused island;
 // `&inchat` shows it in the chat, `&addressed` sends a message after four seconds: the pause ends with the line of what it skipped.
+// Skills (decision 0047): scenario `skills` does three actions in a row and shows the chip «Сохранить как навык» under the
+// reply; a click saves the skill (`&stale` makes the recording old, so the click is refused). The extensions page lists
+// the skills with their steps; `&noskills` shows none, `&nosuggest` has the offers switched off.
 // `&lang=en` starts the preview in English; the language picker on `&page=general` and on `&welcome` switches it in place.
 
 import { mockIPC } from '@tauri-apps/api/mocks';
@@ -635,8 +638,46 @@ function mockStill(name: string): string {
 
 const MOCK_STILL_NAMES = [...MOCK_EMOTIONS.flatMap((e) => [e, `${e}-talk`]), 'full'];
 
+/** A skill as the extensions page gets it. */
+interface MockSkill {
+  id: number;
+  name: string;
+  description: string;
+  params: { name: string; about: string }[];
+  steps: { tool: string; args: Record<string, unknown> }[];
+}
+
+const MORNING_SKILL: MockSkill = {
+  id: 3,
+  name: 'Утро',
+  description: 'почта, погода и тише звук',
+  params: [],
+  steps: [
+    { tool: 'open_url', args: { url: 'https://mail.example.com' } },
+    { tool: 'get_weather', args: { city: 'Омск' } },
+    { tool: 'volume', args: { action: 'set', level: 30 } },
+  ],
+};
+
+let mockSkills: MockSkill[] = [
+  {
+    id: 1,
+    name: 'Открой проект',
+    description: 'программа, папка проекта и музыка',
+    params: [{ name: 'app', about: 'какую программу' }],
+    steps: [
+      { tool: 'open_app', args: { name: '{{app}}' } },
+      { tool: 'open_path', args: { path: 'C:\\Users\\me\\Projects\\site' } },
+      { tool: 'media_control', args: { action: 'play' } },
+    ],
+  },
+];
+let skillOffers = true;
+
 export async function install(scenario: string) {
   const params = new URLSearchParams(location.search);
+  if (params.has('noskills')) mockSkills = [];
+  if (params.has('nosuggest')) skillOffers = false;
   document.body.style.background =
     'radial-gradient(760px 520px at 16% 108%,#51308f 0,transparent 62%),radial-gradient(700px 520px at 88% 104%,#b0437f 0,transparent 60%),radial-gradient(900px 500px at 60% -10%,#16436e 0,transparent 62%),linear-gradient(#0c0f1c,#131022)';
   let state = 'idle';
@@ -1278,6 +1319,30 @@ export async function install(scenario: string) {
           return 1536;
         case 'list_commands':
           return [{ id: 1, name: 'Рабочий режим', prompt: 'Открой Блокнот, калькулятор и сайт почты' }];
+        case 'list_skills':
+          return structuredClone({ skills: mockSkills, suggest: skillOffers });
+        case 'delete_skill': {
+          const before = mockSkills.length;
+          mockSkills = mockSkills.filter((s) => s.name.toLowerCase() !== String(a.name).toLowerCase());
+          return mockSkills.length < before;
+        }
+        case 'set_skill_offers':
+          skillOffers = a.on === true;
+          return null;
+        case 'skill_offer_accept': {
+          if (params.has('stale')) throw 'Эти шаги уже сменились новыми. Попроси словами сохранить навык из последних действий.';
+          void (async () => {
+            send({ type: 'user_text', text: 'Сохрани это как навык' });
+            setState('thinking');
+            send({ type: 'tool_started', id: 's1', name: 'skill_save', summary: 'Сохранить навык «Утро»' });
+            await wait(500);
+            send({ type: 'tool_finished', id: 's1', name: 'skill_save', ok: true, output: 'Навык «Утро» сохранён.', elapsed_ms: 40 });
+            mockSkills = [...mockSkills, MORNING_SKILL];
+            await say('Сохранила навык «Утро». Напиши «утро», и я повторю эти шаги.');
+            setState('idle');
+          })();
+          return null;
+        }
         case 'list_reminders':
           return [
             { id: 1, due_at: Math.floor(Date.now() / 1000) + 581, text: 'Выключить чайник', kind: 'remind', repeat: 'none' },
@@ -1678,6 +1743,28 @@ export async function install(scenario: string) {
       case 'reminder':
         send({ type: 'reminder_fired', id: 1, text: 'Выключить чайник', kind: 'remind', late_s: 0 });
         break;
+      case 'skills': {
+        // Three actions in a row without an error: the chip comes under the reply.
+        click('.iw');
+        await wait(700);
+        send({ type: 'user_text', text: 'Открой почту и Telegram, скажи погоду и сделай потише' });
+        setState('thinking');
+        const steps: [string, string, string][] = [
+          ['c1', 'open_url', 'Открыть сайт в браузере'],
+          ['c2', 'open_app', 'Запустить Telegram'],
+          ['c3', 'get_weather', 'Поиск погоды'],
+          ['c4', 'volume', 'Громкость 30%'],
+        ];
+        for (const [id, tool, summary] of steps) {
+          send({ type: 'tool_started', id, name: tool, summary });
+          await wait(300);
+          send({ type: 'tool_finished', id, name: tool, ok: true, output: '', elapsed_ms: 300 });
+        }
+        await say('Открыла почту и Telegram, на улице +3 и пасмурно, звук сделала тише.');
+        setState('idle');
+        send({ type: 'skill_offer', id: 1, actions: 3 });
+        break;
+      }
       case 'paused': {
         if (params.has('inchat')) {
           click('.iw');

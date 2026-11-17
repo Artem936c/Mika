@@ -144,6 +144,15 @@ const MIGRATIONS: &[&str] = &[
         amount INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX day_log_day ON day_log(day, id);",
+    // Skills (decision 0047): `params` and `steps` are JSON.
+    "CREATE TABLE skills (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        key TEXT NOT NULL UNIQUE,
+        description TEXT NOT NULL,
+        params TEXT NOT NULL,
+        steps TEXT NOT NULL
+    );",
 ];
 
 /// Conversations put aside by "new conversation" get this prefix.

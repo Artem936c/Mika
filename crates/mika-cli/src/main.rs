@@ -198,6 +198,7 @@ async fn run() {
             research: Arc::new(RwLock::new(config.research.clone())),
             research_runs: Default::default(),
             settings: Default::default(),
+            skills: Default::default(),
         },
     );
     let mut registry = ToolRegistry::new();
@@ -234,6 +235,8 @@ async fn run() {
     }));
     agent.set_recall(Arc::new(memory));
     agent.set_task_board(task_board);
+    env.shared.skills.set_offers(config.skills.suggest);
+    agent.set_skill_book(env.shared.skills.clone());
     let agent = Arc::new(agent);
     let hinted = Arc::downgrade(&agent);
     agent.add_prompt_extra(Arc::new(move || {
@@ -244,6 +247,7 @@ async fn run() {
     let session = Session::new(agent, confirms, bus.clone());
     let commands = CommandStore::new(db.clone());
     session.set_commands(commands.clone());
+    session.set_skills(mika_core::skills::SkillStore::new(db.clone()));
     let tasks = session.clone();
     // Fired reminders and finished tasks go into the day log.
     tokio::spawn(mika_core::daylog::run_recorder(

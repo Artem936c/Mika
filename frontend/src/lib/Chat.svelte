@@ -63,6 +63,7 @@
     onselectionclose = () => {},
     screenAsk = null,
     onscreenaskclose = () => {},
+    onskill = () => {},
   }: {
     items: ChatItem[];
     status: AssistantState;
@@ -110,6 +111,8 @@
     /** A picture of a window that waits for the user's question. */
     screenAsk?: ScreenAsk | null;
     onscreenaskclose?: () => void;
+    /** The chip under a reply: save the recording `id` as a skill (decision 0047). */
+    onskill?: (id: number) => void;
     /** The unsent text; it outlives the chat when the island folds. */
     draft?: string;
   } = $props();
@@ -244,6 +247,10 @@
           {:else if it.kind === 'assistant'}
             <!-- One line: the bubble keeps whitespace (pre-wrap). -->
             <div class="bub a" class:pending={it.pending}>{#each inlineMarkup(it.text) as s, j (j)}{#if s.kind === 'code'}<code>{s.text}</code>{:else if s.kind === 'bold'}<b>{s.text}</b>{:else}{s.text}{/if}{/each}</div>
+            {#if it.offer !== undefined && !busy}
+              {@const offer = it.offer}
+              <button class="offer" title={t('chat.skill_offer_title')} onclick={() => onskill(offer)}><Icon name="star" size={13} /><span>{t('chat.skill_offer')}</span></button>
+            {/if}
           {:else if it.kind === 'tool'}
             <div class="stp" class:fail={it.ok === false} title={it.name}>
               {#if it.pending}
@@ -541,6 +548,30 @@
     50% {
       opacity: 0;
     }
+  }
+  /* The offer to save the last steps as a skill, under the reply. */
+  .offer {
+    align-self: flex-start;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: -2px;
+    padding: 5px 11px;
+    border-radius: 999px;
+    border: 1px solid rgba(143, 125, 255, 0.35);
+    background: rgba(143, 125, 255, 0.1);
+    color: var(--v);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .offer:hover {
+    background: rgba(143, 125, 255, 0.18);
+  }
+  .offer:focus-visible {
+    outline: 2px solid rgba(143, 125, 255, 0.7);
+    outline-offset: 2px;
   }
   .stp {
     display: flex;

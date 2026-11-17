@@ -13,6 +13,7 @@ use crate::confirm::{
 };
 use crate::events::{Event, EventBus};
 use crate::pause::{skipped_line, Pause, SkipKind, StopReport, REMARK_PAUSE, REMARK_STOP};
+use crate::skills::SkillStore;
 
 /// Said in the chat when something else is typed while a question about an action is open.
 pub fn answer_hint() -> String {
@@ -111,6 +112,7 @@ pub struct Session {
     bus: EventBus,
     cancel: Mutex<CancellationToken>,
     commands: Mutex<Option<CommandStore>>,
+    skills: Mutex<Option<SkillStore>>,
     origin: Mutex<Origin>,
     /// One turn at a time, in the order they were asked for. A turn takes
     /// the origin when it starts, not when it is queued (decision 0031).
@@ -127,6 +129,7 @@ impl Session {
             bus,
             cancel: Mutex::new(CancellationToken::new()),
             commands: Mutex::new(None),
+            skills: Mutex::new(None),
             origin: Mutex::new(Origin::Local),
             turns: tokio::sync::Mutex::new(()),
             pause: Pause::default(),
@@ -204,6 +207,52 @@ impl Session {
     /// Turns on user commands: a message equal to a command name runs the command.
     pub fn set_commands(&self, store: CommandStore) {
         *self.commands.lock() = Some(store);
+    }
+
+    /// Turns on skills by name: a message equal to a skill name asks her to
+    /// run it (decision 0047).
+    pub fn set_skills(&self, store: SkillStore) {
+        *self.skills.lock() = Some(store);
+    }
+
+    /// What the model gets for a message: the instruction of the command or
+    /// of the skill of that name, or the message itself. A command and a
+    /// skill never share a name; one restored from a copy may, and then the
+    /// command wins.
+    fn expanded(&self, text: &str) -> String {
+        if let Some(c) = self.commands.lock().as_ref().and_then(|c| c.find(text)) {
+            return expand(&c);
+        }
+        if let Some(skill) = self.skills.lock().as_ref().and_then(|s| s.find(text)) {
+            return crate::skills::expand(&skill);
+        }
+        text.to_string()
+    }
+
+    /// Starts a turn from this computer whose chat line is `shown` while the
+    /// model gets `text`: a button of the chat, such as «Сохранить как
+    /// навык». It never answers an open question: then it only reminds of it.
+    /// Must run inside a tokio runtime.
+    pub fn submit_shown(self: &Arc<Self>, shown: &str, text: &str) -> Submitted {
+        let shown = shown.trim().to_string();
+        let text = text.trim().to_string();
+        if shown.is_empty() || text.is_empty() {
+            return Submitted::Empty;
+        }
+        self.addressed("button");
+        if self.confirms.pending().is_some() {
+            self.bus.publish(Event::AssistantText {
+                text: answer_hint(),
+                spoken: None,
+            });
+            return Submitted::Hinted;
+        }
+        let token = self.cancel.lock().clone();
+        tokio::spawn(
+            self.clone()
+                .turn(Origin::Local, Source::Window, shown, text, token),
+        );
+        Submitted::Started
     }
 
     pub fn origin(&self) -> Origin {
@@ -368,11 +417,7 @@ impl Session {
         }
         let token = self.cancel.lock().clone();
         let shown = text.to_string();
-        let command = self.commands.lock().as_ref().and_then(|c| c.find(text));
-        let full = command
-            .as_ref()
-            .map(expand)
-            .unwrap_or_else(|| shown.clone());
+        let full = self.expanded(text);
         tokio::spawn(
             self.clone()
                 .turn(origin, Source::of(origin), shown, full, token),
@@ -395,11 +440,7 @@ impl Session {
         }
         let token = self.cancel.lock().clone();
         let shown = text.to_string();
-        let command = self.commands.lock().as_ref().and_then(|c| c.find(text));
-        let full = command
-            .as_ref()
-            .map(expand)
-            .unwrap_or_else(|| shown.clone());
+        let full = self.expanded(text);
         // Through `turn`, like every other turn: it waits for the turn before
         // it and takes the origin when it starts (decision 0031).
         tokio::spawn(
@@ -686,6 +727,76 @@ mod tests {
         assert!(events.iter().any(
             |e| matches!(e, Event::AssistantText { text, .. } if text.ends_with("Выключи звук"))
         ));
+    }
+
+    fn echo_session(db: Arc<Db>) -> (Arc<Session>, EventBus, StateHandle) {
+        let bus = EventBus::new(64);
+        let state = StateHandle::new(bus.clone());
+        let confirms = Confirmations::new(bus.clone(), state.clone());
+        let gate: Arc<dyn Gate> = Arc::new(PolicyGate::new(
+            RuleStore::new(db.clone()),
+            AuditLog::new(db),
+            confirms.clone(),
+        ));
+        let agent = Arc::new(Agent::new(
+            Arc::new(EchoLast),
+            Arc::new(ToolRegistry::new()),
+            gate,
+            bus.clone(),
+            state.clone(),
+            "s".into(),
+        ));
+        (Session::new(agent, confirms, bus.clone()), bus, state)
+    }
+
+    #[tokio::test]
+    async fn a_skill_name_asks_her_to_run_the_skill() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (s, bus, state) = echo_session(db.clone());
+        let skills = crate::skills::SkillStore::new(db);
+        skills
+            .save(crate::skills::NewSkill {
+                name: "Утро".into(),
+                description: String::new(),
+                params: vec![],
+                steps: vec![crate::skills::SkillStep {
+                    tool: "get_time".into(),
+                    args: serde_json::json!({}),
+                }],
+            })
+            .unwrap();
+        s.set_skills(skills);
+        let mut rx = bus.subscribe();
+        assert_eq!(s.submit("утро"), Submitted::Started);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_idle(&state).await;
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.contains(&Event::UserText {
+            text: "утро".into()
+        }));
+        assert!(events.iter().any(
+            |e| matches!(e, Event::AssistantText { text, .. } if text.contains("skill_run") && text.contains("«Утро»"))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_shown_request_sends_its_full_text_and_never_answers_a_question() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (s, bus, state) = echo_session(db);
+        let mut rx = bus.subscribe();
+        assert_eq!(
+            s.submit_shown("Сохрани это как навык", "Сохрани это как навык\n\nшаги"),
+            Submitted::Started
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_idle(&state).await;
+        let events: Vec<Event> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events.contains(&Event::UserText {
+            text: "Сохрани это как навык".into()
+        }));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::AssistantText { text, .. } if text.ends_with("шаги"))));
     }
 
     #[tokio::test]

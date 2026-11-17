@@ -147,6 +147,13 @@ pub enum Event {
     },
     /// The phrase that was sounding is over or was cut short.
     VoiceQuiet,
+    /// The last turn did at least three actions without an error: the chat
+    /// offers under the reply to save them as a skill (decision 0047). `id`
+    /// names the recording, so a late click saves nothing else.
+    SkillOffer {
+        id: u64,
+        actions: usize,
+    },
     /// The pause after a full stop began or ended (decision 0045): while
     /// it lasts she starts nothing on her own.
     PauseChanged {

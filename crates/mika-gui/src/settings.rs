@@ -711,6 +711,74 @@ pub fn delete_command(ctx: CtxState<'_>, name: String) -> Result<bool, String> {
     ctx.commands.delete(&name).map_err(|e| e.to_string())
 }
 
+// ---- skills (decision 0047) ----
+
+#[derive(serde::Serialize)]
+pub struct SkillsView {
+    skills: Vec<mika_core::skills::Skill>,
+    /// Offer after a turn of three actions to save them as a skill.
+    suggest: bool,
+}
+
+#[tauri::command]
+pub fn list_skills(ctx: CtxState<'_>) -> Result<SkillsView, String> {
+    let skills = mika_core::skills::SkillStore::new(ctx.db.clone())
+        .list()
+        .map_err(|e| e.to_string())?;
+    Ok(SkillsView {
+        skills,
+        suggest: ctx.config.lock().skills.suggest,
+    })
+}
+
+#[tauri::command]
+pub fn delete_skill(ctx: CtxState<'_>, name: String) -> Result<bool, String> {
+    let gone = mika_core::skills::SkillStore::new(ctx.db.clone())
+        .delete(&name)
+        .map_err(|e| e.to_string())?;
+    if gone {
+        log::info!(
+            target: "tool",
+            "skill deleted on the page: name={}",
+            mika_core::journal::content(&name)
+        );
+    }
+    Ok(gone)
+}
+
+#[tauri::command]
+pub fn set_skill_offers(ctx: CtxState<'_>, on: bool) -> Result<(), String> {
+    ctx.config.lock().skills.suggest = on;
+    ctx.tool_env().shared.skills.set_offers(on);
+    ctx.save_config()
+}
+
+/// The chip under a reply: she is asked to save the recording `id` as a
+/// skill. A recording that a newer turn replaced is not saved.
+#[tauri::command]
+pub fn skill_offer_accept(ctx: CtxState<'_>, id: u64) -> Result<(), String> {
+    let recording = ctx
+        .tool_env()
+        .shared
+        .skills
+        .last()
+        .filter(|r| r.id == id)
+        .ok_or_else(|| mika_core::i18n::tr("skills.offer_stale"))?;
+    let shown = mika_core::i18n::tr("skills.save_request");
+    let text = mika_core::skills::save_request(&shown, &recording);
+    log::info!(
+        target: "tool",
+        "skill offer taken: recording={id} steps={}",
+        recording.steps.len()
+    );
+    ctx.end_voice_dialog();
+    let session = ctx.session.clone();
+    tauri::async_runtime::spawn(async move {
+        session.submit_shown(&shown, &text);
+    });
+    Ok(())
+}
+
 // ---- MCP ----
 
 #[derive(serde::Serialize)]

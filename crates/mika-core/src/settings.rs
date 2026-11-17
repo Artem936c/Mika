@@ -343,6 +343,14 @@ pub const SETTINGS: &[Setting] = &[
         at_pc_only: false,
     },
     Setting {
+        key: "skills.suggest",
+        name: "предложения сохранить навык",
+        about: "после трёх действий подряд предлагать сохранить их как навык",
+        kind: Kind::Switch,
+        risk: COMFORT,
+        at_pc_only: false,
+    },
+    Setting {
         key: "island.hide_in_games",
         name: "скрытие острова в играх",
         about: "прятать островок, пока впереди полноэкранная программа",
@@ -464,6 +472,7 @@ pub fn read(config: &Config, key: &str) -> Option<Value> {
         "rhythm.breaks" => on(rhythm.breaks),
         "rhythm.break_every_min" => number(rhythm.break_every_min as f64, 1.0),
         "island.hide_in_games" => on(config.island.hide_in_games),
+        "skills.suggest" => on(config.skills.suggest),
         "avatar.in_island" => on(config.avatar.in_island),
         "avatar.on_desktop" => on(config.avatar.on_desktop),
         "i18n.language" => text(
@@ -811,6 +820,9 @@ mod tests {
             RiskLevel::Low
         );
         assert_eq!(low("voice.follow_up", OFF, ON), RiskLevel::Medium);
+        // Offers to save a skill only suggest: low both ways (decision 0047).
+        assert_eq!(low("skills.suggest", OFF, ON), RiskLevel::Low);
+        assert_eq!(low("skills.suggest", ON, OFF), RiskLevel::Low);
         assert_eq!(low("voice.follow_up", ON, OFF), RiskLevel::Low);
         assert_eq!(
             low(

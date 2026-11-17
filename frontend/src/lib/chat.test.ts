@@ -15,6 +15,7 @@ import {
   refreshJobs,
   speakWords,
   tailWords,
+  takeOffer,
   toolLabel,
   weekdayShort,
   type ChatItem,
@@ -494,6 +495,42 @@ describe('toolLabel', () => {
       expect(isMessageKey(toolLabel(name)), name).toBe(true);
       expect(toolLabel(name)).not.toBe('tool.other');
     }
+  });
+});
+
+describe('skill offer', () => {
+  const reply = [
+    { type: 'user_text', text: 'Рабочий режим' },
+    { type: 'assistant_delta', text: 'Готово' },
+    { type: 'assistant_text', text: 'Готово' },
+  ];
+
+  it('puts the chip under the reply it came after', () => {
+    const items = run([...reply, { type: 'timing', stage: 'llm', ms: 300 }, { type: 'skill_offer', id: 7, actions: 3 }]);
+    const answer = items.find((it) => it.kind === 'assistant');
+    expect(answer?.offer).toBe(7);
+    expect(items.filter((it) => it.offer !== undefined)).toHaveLength(1);
+  });
+
+  it('is dropped when taken or when the next message comes', () => {
+    const items = run([...reply, { type: 'skill_offer', id: 7, actions: 3 }]);
+    expect(takeOffer(items, 8)).toBe(items);
+    expect(takeOffer(items, 7).some((it) => it.offer !== undefined)).toBe(false);
+    const next = run([{ type: 'user_text', text: 'Сохрани это как навык' }], items);
+    expect(next.some((it) => it.offer !== undefined)).toBe(false);
+  });
+
+  it('ignores an offer without a reply or with a bad id', () => {
+    expect(run([{ type: 'skill_offer', id: 1, actions: 3 }])).toEqual([]);
+    const items = run([...reply, { type: 'skill_offer', id: 'x', actions: 3 }]);
+    expect(items.some((it) => it.offer !== undefined)).toBe(false);
+  });
+
+  it('names the skill tools as one group', () => {
+    for (const name of ['skill_save', 'skill_run', 'skill_list', 'skill_delete']) {
+      expect(toolLabel(name)).toBe('tool.skill');
+    }
+    expect(isMessageKey('tool.skill')).toBe(true);
   });
 });
 

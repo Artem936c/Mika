@@ -506,6 +506,7 @@ impl Ctx {
                 research: Arc::new(RwLock::new(config.lock().research.clone())),
                 research_runs: Default::default(),
                 settings: Default::default(),
+                skills: Default::default(),
             },
         );
         let direct = mika_tools::direct::Direct::new(&env);
@@ -530,6 +531,9 @@ impl Ctx {
         }));
         agent.set_recall(Arc::new(memory.clone()));
         agent.set_task_board(task_board);
+        // What a turn did, for a skill (decision 0047).
+        env.shared.skills.set_offers(config.lock().skills.suggest);
+        agent.set_skill_book(env.shared.skills.clone());
         // Replies are marked up for the voice while the settings allow it:
         // read at every step, so a change applies to the next one. Where
         // the turn came from is known once the session exists.
@@ -581,6 +585,7 @@ impl Ctx {
         let session = Session::new(agent, confirms, bus.clone());
         let _ = asked_from.set(Arc::downgrade(&session));
         session.set_commands(commands.clone());
+        session.set_skills(mika_core::skills::SkillStore::new(db.clone()));
         // A background job keeps where the turn that started it came from:
         // the end of a job asked for in Telegram is told there, the end of
         // any other never leaves this computer.

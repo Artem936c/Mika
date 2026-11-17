@@ -86,6 +86,9 @@ impl Renderer {
             Event::VoicePhrase { levels, .. } => format!("[voice] phrase, {} steps", levels.len()),
             Event::VoiceQuiet => "[voice] quiet".to_string(),
             Event::PauseChanged { paused } => format!("[pause] {paused}"),
+            Event::SkillOffer { actions, .. } => format!(
+                "[skill] {actions} действия подряд: скажи «сохрани это как навык», чтобы повторять их по имени"
+            ),
             Event::AvatarGesture { name, .. } => format!("[gesture] {name}"),
             Event::TaskUpdated { task } => {
                 let done = task

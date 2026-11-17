@@ -141,6 +141,14 @@ pub const EXPORTED: &[TableSpec] = &[
         skip_columns: &[],
         keep_ids: true,
     },
+    // Skills travel with the commands, under the same tick (decision 0047):
+    // both are what the user saved to run by name.
+    TableSpec {
+        name: SKILLS,
+        category: Category::Commands,
+        skip_columns: &[],
+        keep_ids: true,
+    },
     // Scenarios by event. The switch and the counters stay behind: a
     // scenario lands off, and its pause and day count are those this PC
     // remembers for its name. The key is made from the name again. The
@@ -183,6 +191,7 @@ pub const SKIPPED: &[&str] = &[
 const RULES: &str = "rules";
 const REMINDERS: &str = "reminders";
 const SCENARIOS: &str = "triggers";
+const SKILLS: &str = "skills";
 /// Longest time stamp of a scenario from a file, characters.
 const MAX_STAMP: usize = 64;
 /// Names of the file's commands a walk remembers, to tell which scenarios
@@ -516,6 +525,21 @@ impl Section {
                     && filled("key")
                     && self.text(cells, "key").map(str::to_string)
                         == self.text(cells, "name").map(crate::confirm::clean)
+            }
+            // The checks of `SkillStore::save`: no step of a skill runs a
+            // skill, and its parameters are those of its steps.
+            SKILLS => {
+                let text = |column: &str| self.text(cells, column).unwrap_or_default();
+                ["name", "key", "description", "params", "steps"]
+                    .iter()
+                    .all(|c| self.text(cells, c).is_some())
+                    && crate::skills::row_is_valid(
+                        text("name"),
+                        text("key"),
+                        text("description"),
+                        text("params"),
+                        text("steps"),
+                    )
             }
             REMINDERS => return self.check_reminder(cells),
             RULES => return self.check_rule(cells),
@@ -1322,6 +1346,7 @@ pub(crate) mod tests {
                 "todos",
                 "reminders",
                 "commands",
+                "skills",
                 "triggers",
                 "rules"
             ]
@@ -2237,6 +2262,42 @@ pub(crate) mod tests {
             rows_of(&target, "SELECT repeat FROM reminders"),
             [r#"Ok(Text("every:5"))"#]
         );
+    }
+
+    #[test]
+    fn skills_travel_with_the_commands_and_only_as_the_app_writes_them() {
+        let lines: Vec<&str> = vec![
+            BEGIN,
+            r#"{"t":"table","name":"skills","columns":["id","name","key","description","params","steps"]}"#,
+            r#"{"t":"row","v":[1,"Утро","утро","погода и почта","[]","[{\"tool\":\"get_weather\",\"args\":{}}]"]}"#,
+            // A skill that runs a skill, a key that is not the name, steps that do not parse,
+            // a placeholder nobody declared.
+            r#"{"t":"row","v":[2,"Петля","петля","","[]","[{\"tool\":\"skill_run\",\"args\":{\"name\":\"Петля\"}}]"]}"#,
+            r#"{"t":"row","v":[3,"Вечер","утро","","[]","[{\"tool\":\"get_time\",\"args\":{}}]"]}"#,
+            r#"{"t":"row","v":[4,"Ночь","ночь","","[]","not json"]}"#,
+            r#"{"t":"row","v":[5,"Открой","открой","","[]","[{\"tool\":\"open_app\",\"args\":{\"name\":\"{{app}}\"}}]"]}"#,
+        ];
+        let end = format!(r#"{{"t":"end","lines":{}}}"#, lines.len());
+        let mut lines = lines;
+        lines.push(&end);
+        let payload = gz(&lines);
+
+        let target = Db::open_in_memory().unwrap();
+        let seen = walk(&target, &payload, None).unwrap();
+        assert_eq!(seen.valid, [(Category::Commands, 1)].into());
+        assert_eq!(seen.dropped_rows, 4);
+
+        let left = restore(&target, &payload, &[Category::Notes]);
+        assert!(left.written.is_empty());
+        assert!(rows_of(&target, "SELECT name FROM skills").is_empty());
+
+        let outcome = restore(&target, &payload, &[Category::Commands]);
+        assert_eq!(outcome.written, [(Category::Commands, 1)].into());
+        let skill = crate::skills::SkillStore::new(std::sync::Arc::new(target))
+            .find("утро")
+            .unwrap();
+        assert_eq!(skill.steps[0].tool, "get_weather");
+        assert_eq!(skill.description, "погода и почта");
     }
 
     #[test]

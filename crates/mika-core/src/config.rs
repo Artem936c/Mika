@@ -34,6 +34,21 @@ pub struct Config {
     pub docs: DocsConfig,
     pub research: ResearchConfig,
     pub log: LogConfig,
+    pub skills: SkillsConfig,
+}
+
+/// Skills (decision 0047).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillsConfig {
+    /// After a turn of three actions or more, offer to save them as a skill.
+    pub suggest: bool,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self { suggest: true }
+    }
 }
 
 /// The journal (decision 0036): what is written and how long it is kept.

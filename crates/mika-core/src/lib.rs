@@ -25,6 +25,7 @@ pub mod schedule;
 pub mod secrets;
 pub mod session;
 pub mod settings;
+pub mod skills;
 pub mod sound;
 pub mod sound_capture;
 pub mod speech_cache;

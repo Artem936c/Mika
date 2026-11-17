@@ -10,7 +10,7 @@
   import Welcome from './lib/Welcome.svelte';
   import { isEmotion, reduceEmotion, type Emotion } from './lib/avatar';
   import { listJobs, recordingOf, reduceJobsSeen, reduceRecording, type JobsSeen } from './lib/bgjobs';
-  import { addJobs, fromHistory, reduceChat, refreshJobs, type ChatItem } from './lib/chat';
+  import { addJobs, fromHistory, reduceChat, refreshJobs, takeOffer, type ChatItem } from './lib/chat';
   import { reducePending, showsWhole, untranslated, type Pending } from './lib/confirm';
   import { selectionFrom, type Selection } from './lib/selection';
   import {
@@ -448,6 +448,10 @@
     oncrashclose={closeCrash}
     onanswer={answer}
     onsend={(text) => invoke('send_message', { text })}
+    onskill={(id) => {
+      items = takeOffer(items, id);
+      invoke('skill_offer_accept', { id }).catch((e) => (items = reduceChat(items, { type: 'error', message: String(e) })));
+    }}
     onstop={() => invoke('stop')}
     onclose={() => {
       if (!windowed) view = 'island';

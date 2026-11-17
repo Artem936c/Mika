@@ -32,6 +32,7 @@ pub mod screen;
 pub mod search;
 pub mod settings;
 pub mod shell;
+pub mod skills;
 pub mod sys;
 pub mod system;
 pub mod todos;
@@ -133,6 +134,12 @@ const HINTS: &[(&str, &str)] = &[
     ),
     ("generate_image", "нарисовать картинку"),
     ("command_save", "сохранить свою команду из нескольких шагов"),
+    (
+        "skill_save",
+        "сохрани это как навык, запомни этот порядок действий, чтобы повторять по имени",
+    ),
+    ("skill_run", "выполнить сохранённый навык"),
+    ("skill_list", "какие есть навыки"),
     (
         "browser_open",
         "найти, прочитать или сделать что-то на сайте самой (нажать, заполнить); open_url только показывает сайт пользователю",
@@ -599,6 +606,15 @@ pub fn register_all(reg: &mut ToolRegistry, env: &ToolEnv, disabled: &[String]) 
         reg.register(Arc::new(commands::CommandSaveTool(commands.clone())));
         reg.register(Arc::new(commands::CommandListTool(commands.clone())));
         reg.register(Arc::new(commands::CommandDeleteTool(commands)));
+        // Skills (decision 0047): her own routines, saved by her and run by name.
+        let skills = mika_core::skills::SkillStore::new(env.db.clone());
+        reg.register(Arc::new(skills::SkillSaveTool {
+            store: skills.clone(),
+            book: env.shared.skills.clone(),
+        }));
+        reg.register(Arc::new(skills::SkillListTool(skills.clone())));
+        reg.register(Arc::new(skills::SkillDeleteTool(skills.clone())));
+        reg.register(Arc::new(skills::SkillRunTool(skills)));
     }
 
     if on("rdp") {
@@ -620,7 +636,7 @@ mod tests {
         let mut reg = ToolRegistry::new();
         register_all(&mut reg, &env, &[]);
         let specs = reg.specs();
-        assert_eq!(specs.len(), 112);
+        assert_eq!(specs.len(), 116);
         for s in specs {
             assert_eq!(s.parameters["type"], "object", "{}", s.name);
             assert!(!s.description.is_empty());

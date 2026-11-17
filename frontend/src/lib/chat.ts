@@ -25,6 +25,8 @@ export interface ChatItem {
   done?: boolean;
   /** Share done of a running tool, 0..100, when the tool reports it. */
   progress?: number;
+  /** Under a reply: the recording it may save as a skill (decision 0047). */
+  offer?: number;
 }
 
 /** Stages of a reply: speech to text, first piece of the answer, first sound. */
@@ -202,6 +204,21 @@ function str(v: unknown): string | null {
   return typeof v === 'string' ? v : null;
 }
 
+/** The chat without the chip of an offer: taken, or made old by a new message. */
+function dropOffers(items: ChatItem[]): ChatItem[] {
+  if (!items.some((it) => it.offer !== undefined)) return items;
+  return items.map((it) => {
+    if (it.offer === undefined) return it;
+    const { offer: _taken, ...rest } = it;
+    return rest;
+  });
+}
+
+/** The chat once the chip of recording `id` was clicked. */
+export function takeOffer(items: ChatItem[], id: number): ChatItem[] {
+  return items.some((it) => it.offer === id) ? dropOffers(items) : items;
+}
+
 function finishStreaming(items: ChatItem[]): ChatItem[] {
   return items.map((it) => (it.kind === 'assistant' && it.pending ? { ...it, pending: false } : it));
 }
@@ -218,7 +235,7 @@ export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
   switch (e.type) {
     case 'user_text': {
       const text = str(e.text);
-      return text === null ? items : [...dropStaleTimings(finishStreaming(items)), { kind: 'user', text }];
+      return text === null ? items : [...dropStaleTimings(finishStreaming(dropOffers(items))), { kind: 'user', text }];
     }
     case 'timing': {
       if (!isStage(e.stage) || !num(e.ms)) return items;
@@ -264,6 +281,16 @@ export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
       const idx = items.findIndex((it) => it.kind === 'assistant' && it.pending);
       if (idx >= 0) return settleTimings(finishStreaming(items));
       return text ? settleTimings([...items, { kind: 'assistant', text }]) : items;
+    }
+    case 'skill_offer': {
+      // The chip goes under the last reply; only one stands at a time.
+      if (!num(e.id)) return items;
+      let at = items.length - 1;
+      while (at >= 0 && items[at].kind !== 'assistant') at -= 1;
+      if (at < 0) return items;
+      const next = dropOffers(items).slice();
+      next[at] = { ...next[at], offer: e.id };
+      return next;
     }
     case 'tool_started': {
       const id = str(e.id);
@@ -445,6 +472,10 @@ const TOOL_GROUPS: Record<string, MessageKey> = {
   command_save: 'tool.command',
   command_list: 'tool.command',
   command_delete: 'tool.command',
+  skill_save: 'tool.skill',
+  skill_list: 'tool.skill',
+  skill_delete: 'tool.skill',
+  skill_run: 'tool.skill',
   trigger_create: 'tool.events',
   trigger_list: 'tool.events',
   trigger_delete: 'tool.events',

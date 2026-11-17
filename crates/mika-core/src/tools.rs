@@ -108,6 +108,18 @@ pub struct ToolOutput {
     pub text: String,
     /// Structured result for a chat card. The LLM gets only `text`.
     pub data: Option<serde_json::Value>,
+    /// Steps of a skill for the agent loop to run next, each one through
+    /// the gate (decision 0047). Only `skill_run` gives them.
+    pub replay: Option<Replay>,
+}
+
+/// The steps of a skill, parameters filled, that the agent loop runs one
+/// by one after the call that gave them. A tool cannot run another tool:
+/// the loop does, with the same assessment and gate as for the model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Replay {
+    pub skill: String,
+    pub steps: Vec<crate::skills::SkillStep>,
 }
 
 impl ToolOutput {
@@ -115,11 +127,17 @@ impl ToolOutput {
         Self {
             text: text.into(),
             data: None,
+            replay: None,
         }
     }
 
     pub fn with_data(mut self, data: serde_json::Value) -> Self {
         self.data = Some(data);
+        self
+    }
+
+    pub fn with_replay(mut self, replay: Replay) -> Self {
+        self.replay = Some(replay);
         self
     }
 }

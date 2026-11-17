@@ -217,6 +217,7 @@ impl SettingsPort for TalkSettings {
                 let r = &config.rhythm;
                 page::set_rhythm(state(), r.breaks, minutes.round() as u32, r.lively)
             }
+            ("skills.suggest", Value::Bool(on)) => page::set_skill_offers(state(), *on),
             ("island.hide_in_games", Value::Bool(on)) => {
                 page::set_island_settings(state(), config.island.city.clone(), *on)
             }

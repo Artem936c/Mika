@@ -17,10 +17,11 @@ use crate::llm::{
 };
 use crate::marks::MarkFilter;
 use crate::memory::Recall;
+use crate::skills::{is_read, SkillBook};
 use crate::state::{AssistantState, StateHandle};
 use crate::storage::Db;
 use crate::task::{TaskBoard, TASK_MAX_STEPS};
-use crate::tools::{with_progress, RiskLevel, ToolError, ToolRegistry};
+use crate::tools::{with_progress, Replay, RiskLevel, ToolError, ToolRegistry};
 
 /// LLM calls per user message. A task with a plan gets `task::TASK_MAX_STEPS`.
 pub const MAX_STEPS: usize = 14;
@@ -580,7 +581,31 @@ pub struct Agent {
     turn: tokio::sync::Mutex<()>,
     /// Plan of the message being answered; with a plan the step limit is higher.
     tasks: RwLock<Option<TaskBoard>>,
+    /// What the turn did, for a skill (decision 0047); nothing is recorded while unset.
+    skills: RwLock<Option<SkillBook>>,
 }
+
+/// How one call ended.
+struct Done {
+    ok: bool,
+    /// For the model: the output or what went wrong.
+    text: String,
+    /// The steps of a skill the call gave, to run next.
+    replay: Option<Replay>,
+}
+
+impl Done {
+    fn failed(text: String) -> Self {
+        Self {
+            ok: false,
+            text,
+            replay: None,
+        }
+    }
+}
+
+/// Output of one step of a skill in the answer to the model, characters.
+const MAX_STEP_RESULT: usize = 1_500;
 
 impl Agent {
     pub fn new(
@@ -606,7 +631,14 @@ impl Agent {
             store: None,
             turn: tokio::sync::Mutex::new(()),
             tasks: RwLock::new(None),
+            skills: RwLock::new(None),
         }
+    }
+
+    /// The book the turns write their calls to, for skills (decision 0047).
+    pub fn set_skill_book(&self, book: SkillBook) {
+        book.set_registry(&self.registry());
+        *self.skills.write() = Some(book);
     }
 
     /// The board that `task_plan` and `task_step` write to.
@@ -643,6 +675,9 @@ impl Agent {
 
     /// Replaces the tool set, for example when an MCP server connects.
     pub fn set_registry(&self, registry: Arc<ToolRegistry>) {
+        if let Some(book) = self.skills.read().as_ref() {
+            book.set_registry(&registry);
+        }
         *self.registry.write() = registry;
     }
 
@@ -750,12 +785,17 @@ impl Agent {
         if let Some(b) = &board {
             b.clear();
         }
+        let book = self.skills.read().clone();
+        if let Some(b) = &book {
+            b.begin_turn();
+        }
         let mut new_msgs = vec![ChatMessage::user(text)];
         let mut stats = TurnStats::default();
         let result = self.run_steps(&mut new_msgs, &cancel, &mut stats).await;
         if let Some(b) = &board {
             b.finish(result.is_err());
         }
+        let offer = book.and_then(|b| b.end_turn(result.is_ok()));
         let (level, line) = turn_line(
             &result,
             stats,
@@ -771,6 +811,20 @@ impl Agent {
                     text: reply.clone(),
                     spoken: spoken.clone(),
                 });
+                // Under the reply, never before it.
+                if let Some(o) = offer {
+                    log::info!(
+                        target: "tool",
+                        "skill offered: {}recording={} actions={}",
+                        crate::journal::turn_field(),
+                        o.id,
+                        o.actions
+                    );
+                    self.bus.publish(Event::SkillOffer {
+                        id: o.id,
+                        actions: o.actions,
+                    });
+                }
             }
             Err(AgentError::Cancelled) => {}
             Err(e) => {
@@ -1233,14 +1287,112 @@ impl Agent {
 
     /// Runs one tool call. Always returns text for the LLM, errors included.
     /// With voice marks on (`marked`), marks that leaked into its text for
-    /// people are cut first.
+    /// people are cut first. A call that gives the steps of a skill has
+    /// them run next, each one through the gate (decision 0047).
     async fn execute(&self, call: &ToolCall, cancel: &CancellationToken, marked: bool) -> String {
+        let done = self.run_call(call, cancel, marked, false).await;
+        match done.replay {
+            Some(replay) if done.ok => {
+                let report = self.replay(call, replay, cancel).await;
+                truncate(&format!("{}\n{report}", done.text), MAX_TOOL_RESULT)
+            }
+            _ => done.text,
+        }
+    }
+
+    /// Runs the steps of a skill one by one, each as a call of its own:
+    /// assessed, through the gate, shown in the chat, written to the
+    /// journal. Stops at the first step that is refused or fails and tells
+    /// the model which one and why, so it can go on by hand.
+    async fn replay(&self, call: &ToolCall, replay: Replay, cancel: &CancellationToken) -> String {
+        let total = replay.steps.len();
+        let mut lines = Vec::with_capacity(total);
+        let mut done = 0;
+        let mut stopped_at = None;
+        for (i, step) in replay.steps.iter().enumerate() {
+            let n = i + 1;
+            if cancel.is_cancelled() {
+                stopped_at = Some(n);
+                lines.push(format!("{n}. {} — остановлено пользователем", step.tool));
+                break;
+            }
+            let step_call = ToolCall {
+                id: format!("{}-step{n}", call.id),
+                name: step.tool.clone(),
+                arguments: step.args.clone(),
+            };
+            let result = self.run_call(&step_call, cancel, false, true).await;
+            let output = truncate(&result.text, MAX_STEP_RESULT);
+            if result.ok {
+                done += 1;
+                lines.push(format!("{n}. {} — готово: {output}", step.tool));
+            } else {
+                stopped_at = Some(n);
+                lines.push(format!("{n}. {} — не выполнено: {output}", step.tool));
+                break;
+            }
+        }
+        let rest: Vec<String> = replay
+            .steps
+            .iter()
+            .enumerate()
+            .skip(stopped_at.unwrap_or(total))
+            .map(|(i, s)| format!("{}. {}", i + 1, s.tool))
+            .collect();
+        let level = if stopped_at.is_some() {
+            log::Level::Warn
+        } else {
+            log::Level::Info
+        };
+        log::log!(
+            target: "tool",
+            level,
+            "skill run finished: {}skill={} steps={total} done={done} stopped_at={}",
+            crate::journal::turn_field(),
+            crate::journal::content(&replay.skill),
+            stopped_at.map_or("-".to_string(), |n| n.to_string())
+        );
+        let mut report = format!(
+            "Навык «{}»: выполнено шагов {done} из {total}.\n{}",
+            replay.skill,
+            lines.join("\n")
+        );
+        if !rest.is_empty() {
+            report.push_str(&format!(
+                "\nНе запускались: {}. Если нужно, доделай их сама по одному или скажи пользователю, что помешало.",
+                rest.join(", ")
+            ));
+        }
+        report
+    }
+
+    /// One call: assessment, gate, run, the chat rows and the journal
+    /// record. `replayed` marks a step of a skill: it is not recorded for
+    /// a skill again, and steps it would give are not run.
+    async fn run_call(
+        &self,
+        call: &ToolCall,
+        cancel: &CancellationToken,
+        marked: bool,
+        replayed: bool,
+    ) -> Done {
         let started = Instant::now();
+        let book = if replayed {
+            None
+        } else {
+            self.skills.read().clone()
+        };
+        let fail = |text: String| {
+            if let Some(b) = &book {
+                b.note_failure();
+            }
+            Done::failed(text)
+        };
         let Some(tool) = self.registry().get(&call.name) else {
             let msg = format!("Ошибка: инструмента `{}` нет.", call.name);
             let note = CallNote::new("unknown_tool");
             self.finish(call, false, &msg, None, started, &note, None);
-            return msg;
+            return fail(msg);
         };
         let args = match &call.arguments {
             Value::Null => Value::Object(Default::default()),
@@ -1263,7 +1415,7 @@ impl Agent {
                 let msg = format!("Ошибка: {message}");
                 let note = CallNote::new("not_ready").error(&message, content);
                 self.finish(call, false, &msg, Some(data), started, &note, logged_args);
-                return msg;
+                return fail(msg);
             }
             Err(e) => {
                 let msg = format!("Ошибка: {e}");
@@ -1273,7 +1425,7 @@ impl Agent {
                 };
                 let note = CallNote::new(outcome).error(&e, content);
                 self.finish(call, false, &msg, None, started, &note, logged_args);
-                return msg;
+                return fail(msg);
             }
         };
         let risk = assessment.level;
@@ -1299,7 +1451,7 @@ impl Agent {
                 let said = if stopped { "stopped" } else { "denied" };
                 let note = CallNote::new(said).risk(risk).decision(said);
                 self.finish(call, false, &msg, None, started, &note, logged_args);
-                return msg;
+                return fail(msg);
             }
         };
         let decided = CallNote::new("ok").risk(risk).decision(approval.how());
@@ -1310,11 +1462,14 @@ impl Agent {
         );
         self.state.set(AssistantState::Thinking);
         // "Stop" ends the wait for any tool, even one that does not watch its token.
+        // Kept for the recording: `run` takes the arguments.
+        let recorded_args = book.as_ref().map(|_| args.clone());
         let run = with_progress(
             call.id.clone(),
             self.bus.clone(),
             tool.run(args, approval, cancel.child_token()),
         );
+        let mut replay = None;
         let (ok, text, data, note) = tokio::select! {
             _ = cancel.cancelled() => (
                 false,
@@ -1323,7 +1478,13 @@ impl Agent {
                 decided.outcome("stopped"),
             ),
             r = run => match r {
-                Ok(out) => (true, out.text, out.data, decided),
+                Ok(out) => {
+                    // A step never starts more steps: no skill runs a skill.
+                    if !replayed {
+                        replay = out.replay;
+                    }
+                    (true, out.text, out.data, decided)
+                }
                 Err(ToolError::NotReady { message, data }) => {
                     let note = decided.outcome("not_ready").error(&message, content);
                     (false, format!("Ошибка: {message}"), Some(data), note)
@@ -1341,7 +1502,17 @@ impl Agent {
             },
         };
         self.finish(call, ok, &text, data, started, &note, logged_args);
-        truncate(&text, MAX_TOOL_RESULT)
+        if let Some(b) = &book {
+            match (ok, recorded_args) {
+                (true, Some(args)) => b.record(&call.name, &args, is_read(&call.name, risk)),
+                _ => b.note_failure(),
+            }
+        }
+        Done {
+            ok,
+            text: truncate(&text, MAX_TOOL_RESULT),
+            replay,
+        }
     }
 
     /// Tells the chat that a call has ended and writes its record.
@@ -3408,5 +3579,308 @@ Actually, I'll call generate_image.
         }));
         assert_eq!(state.get(), AssistantState::Idle);
         assert!(!a.turn_running());
+    }
+
+    // ---- skills (decision 0047) ----
+
+    /// A tool of a given name and risk that counts its runs.
+    struct Act {
+        name: &'static str,
+        level: RiskLevel,
+        runs: Arc<Mutex<Vec<Value>>>,
+    }
+
+    #[async_trait]
+    impl crate::tools::Tool for Act {
+        fn spec(&self) -> crate::llm::ToolSpec {
+            crate::tools::spec(self.name, "test", json!({"type": "object"}))
+        }
+        fn assess(&self, _: &Value) -> Result<crate::tools::Assessment, ToolError> {
+            Ok(crate::tools::Assessment::new(
+                self.level, self.name, "t", "r",
+            ))
+        }
+        async fn run(
+            &self,
+            args: Value,
+            _: crate::gate::Approval,
+            _: CancellationToken,
+        ) -> Result<crate::tools::ToolOutput, ToolError> {
+            self.runs.lock().push(args);
+            Ok(crate::tools::ToolOutput::new(format!(
+                "{} сделано",
+                self.name
+            )))
+        }
+    }
+
+    /// Stands for `skill_run`: hands its steps to the loop.
+    struct FakeSkillRun(Vec<crate::skills::SkillStep>);
+
+    #[async_trait]
+    impl crate::tools::Tool for FakeSkillRun {
+        fn spec(&self) -> crate::llm::ToolSpec {
+            crate::tools::spec("skill_run", "test", json!({"type": "object"}))
+        }
+        fn assess(&self, _: &Value) -> Result<crate::tools::Assessment, ToolError> {
+            Ok(crate::tools::Assessment::new(
+                RiskLevel::Low,
+                "навык",
+                "t",
+                "r",
+            ))
+        }
+        async fn run(
+            &self,
+            _: Value,
+            _: crate::gate::Approval,
+            _: CancellationToken,
+        ) -> Result<crate::tools::ToolOutput, ToolError> {
+            Ok(
+                crate::tools::ToolOutput::new("Навык «Утро»").with_replay(crate::tools::Replay {
+                    skill: "Утро".into(),
+                    steps: self.0.clone(),
+                }),
+            )
+        }
+    }
+
+    /// Approves everything but the tools it was told to refuse, and
+    /// remembers what it was asked and at which risk.
+    struct Watching {
+        refuse: &'static [&'static str],
+        asked: Mutex<Vec<(String, RiskLevel)>>,
+    }
+
+    #[async_trait]
+    impl Gate for Watching {
+        async fn check(&self, tool: &str, _: &Value, a: &crate::tools::Assessment) -> GateDecision {
+            self.asked.lock().push((tool.to_string(), a.level));
+            if self.refuse.contains(&tool) {
+                GateDecision::Denied("пользователь отклонил".into())
+            } else {
+                GateDecision::Approved(crate::gate::Approval::given("test"))
+            }
+        }
+    }
+
+    type Runs = Arc<Mutex<Vec<Value>>>;
+
+    fn act(reg: &mut ToolRegistry, name: &'static str, level: RiskLevel) -> Runs {
+        let runs: Runs = Arc::default();
+        reg.register(Arc::new(Act {
+            name,
+            level,
+            runs: runs.clone(),
+        }));
+        runs
+    }
+
+    fn skill_agent(
+        p: Arc<FakeProvider>,
+        reg: ToolRegistry,
+        gate: Arc<dyn Gate>,
+    ) -> (Agent, crate::skills::SkillBook, Receiver<Event>) {
+        let bus = EventBus::new(256);
+        let rx = bus.subscribe();
+        let a = Agent::new(
+            p,
+            Arc::new(reg),
+            gate,
+            bus.clone(),
+            StateHandle::new(bus),
+            "sys".into(),
+        );
+        let book = crate::skills::SkillBook::default();
+        a.set_skill_book(book.clone());
+        (a, book, rx)
+    }
+
+    fn step(tool: &str, args: Value) -> crate::skills::SkillStep {
+        crate::skills::SkillStep {
+            tool: tool.into(),
+            args,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_of_three_actions_is_recorded_and_offered_after_the_reply() {
+        let p = FakeProvider::new(vec![
+            Some(vec![
+                call("c1", "open_app", json!({"name": "notepad"})),
+                call("c2", "get_time", json!({})),
+                call("c3", "volume", json!({"level": 30})),
+                call("c4", "open_url", json!({"url": "https://mail.example"})),
+            ]),
+            Some(vec![text("Готово")]),
+        ]);
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(TimeTool));
+        act(&mut reg, "open_app", RiskLevel::Medium);
+        act(&mut reg, "volume", RiskLevel::Low);
+        act(&mut reg, "open_url", RiskLevel::Medium);
+        let gate = Arc::new(Watching {
+            refuse: &[],
+            asked: Mutex::default(),
+        });
+        let (a, book, mut rx) = skill_agent(p, reg, gate);
+        a.handle("рабочий режим", CancellationToken::new())
+            .await
+            .unwrap();
+        let last = book.last().expect("the turn is recorded");
+        let tools: Vec<&str> = last.steps.iter().map(|s| s.tool.as_str()).collect();
+        assert_eq!(tools, ["open_app", "get_time", "volume", "open_url"]);
+        assert_eq!(last.steps[0].args, json!({"name": "notepad"}));
+        assert!(last.steps[1].read && !last.steps[2].read);
+        let ev = drain(&mut rx);
+        let reply = ev
+            .iter()
+            .position(|e| matches!(e, Event::AssistantText { .. }))
+            .unwrap();
+        let offer = ev
+            .iter()
+            .position(|e| matches!(e, Event::SkillOffer { id, actions: 3 } if *id == last.id))
+            .expect("the offer comes");
+        assert!(offer > reply, "under the reply");
+    }
+
+    #[tokio::test]
+    async fn refused_and_failed_calls_are_not_recorded_and_stop_the_offer() {
+        let p = FakeProvider::new(vec![
+            Some(vec![
+                call("c1", "open_app", json!({})),
+                call("c2", "volume", json!({})),
+                call("c3", "open_url", json!({})),
+                call("c4", "kill_process", json!({})),
+                call("c5", "nothing_here", json!({})),
+            ]),
+            Some(vec![text("Почти")]),
+        ]);
+        let mut reg = ToolRegistry::new();
+        act(&mut reg, "open_app", RiskLevel::Medium);
+        act(&mut reg, "volume", RiskLevel::Low);
+        act(&mut reg, "open_url", RiskLevel::Medium);
+        act(&mut reg, "kill_process", RiskLevel::High);
+        let gate = Arc::new(Watching {
+            refuse: &["kill_process"],
+            asked: Mutex::default(),
+        });
+        let (a, book, mut rx) = skill_agent(p, reg, gate);
+        a.handle("x", CancellationToken::new()).await.unwrap();
+        let tools: Vec<String> = book
+            .last()
+            .unwrap()
+            .steps
+            .into_iter()
+            .map(|s| s.tool)
+            .collect();
+        assert_eq!(tools, ["open_app", "volume", "open_url"]);
+        assert!(!drain(&mut rx)
+            .iter()
+            .any(|e| matches!(e, Event::SkillOffer { .. })));
+    }
+
+    #[tokio::test]
+    async fn skill_steps_run_one_by_one_through_the_gate_and_stop_at_a_refusal() {
+        let p = FakeProvider::new(vec![
+            Some(vec![call("c1", "skill_run", json!({"name": "Утро"}))]),
+            Some(vec![text("Второй шаг ты не разрешил")]),
+        ]);
+        let mut reg = ToolRegistry::new();
+        let first = act(&mut reg, "open_app", RiskLevel::Low);
+        let second = act(&mut reg, "run_shell", RiskLevel::High);
+        let third = act(&mut reg, "open_url", RiskLevel::Medium);
+        reg.register(Arc::new(FakeSkillRun(vec![
+            step("open_app", json!({"name": "notepad"})),
+            step("run_shell", json!({"command": "Get-Date"})),
+            step("open_url", json!({"url": "https://example.com"})),
+        ])));
+        let gate = Arc::new(Watching {
+            refuse: &["run_shell"],
+            asked: Mutex::default(),
+        });
+        let (a, book, mut rx) = skill_agent(p.clone(), reg, gate.clone());
+        a.handle("утро", CancellationToken::new()).await.unwrap();
+        // Each step was asked for on its own, the high one at its own risk.
+        assert_eq!(
+            *gate.asked.lock(),
+            vec![
+                ("skill_run".to_string(), RiskLevel::Low),
+                ("open_app".to_string(), RiskLevel::Low),
+                ("run_shell".to_string(), RiskLevel::High),
+            ]
+        );
+        assert_eq!(*first.lock(), vec![json!({"name": "notepad"})]);
+        assert!(second.lock().is_empty() && third.lock().is_empty());
+        let result = &tool_results(&p.requests.lock()[1])[0];
+        assert!(result.contains("1 из 3"), "{result}");
+        assert!(result.contains("2. run_shell"), "{result}");
+        assert!(result.contains("пользователь отклонил"), "{result}");
+        assert!(result.contains("3. open_url"), "{result}");
+        // Every step has its own row in the chat.
+        let ev = drain(&mut rx);
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e, Event::ToolFinished { id, ok: true, .. } if id == "c1-step1")));
+        assert!(ev
+            .iter()
+            .any(|e| matches!(e, Event::ToolFinished { id, ok: false, .. } if id == "c1-step2")));
+        // A replay is no new recording and offers nothing.
+        assert_eq!(book.last(), None);
+        assert!(!ev.iter().any(|e| matches!(e, Event::SkillOffer { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_high_step_of_a_skill_asks_the_user_and_offers_no_always() {
+        use crate::confirm::{Answer, Confirmations, DecidedBy};
+        use crate::policy::{AuditLog, PolicyGate, RuleStore};
+
+        let p = FakeProvider::new(vec![
+            Some(vec![call("c1", "skill_run", json!({}))]),
+            Some(vec![text("Хорошо")]),
+        ]);
+        let mut reg = ToolRegistry::new();
+        let shell = act(&mut reg, "run_shell", RiskLevel::High);
+        reg.register(Arc::new(FakeSkillRun(vec![step(
+            "run_shell",
+            json!({"command": "Remove-Item x"}),
+        )])));
+        let bus = EventBus::new(256);
+        let state = StateHandle::new(bus.clone());
+        let db = Arc::new(crate::storage::Db::open_in_memory().unwrap());
+        let confirms = Confirmations::new(bus.clone(), state.clone());
+        let gate = Arc::new(PolicyGate::new(
+            RuleStore::new(db.clone()),
+            AuditLog::new(db),
+            confirms.clone(),
+        ));
+        let a = Agent::new(p.clone(), Arc::new(reg), gate, bus, state, "s".into());
+        a.set_skill_book(crate::skills::SkillBook::default());
+        let asking = confirms.clone();
+        let answer = tokio::spawn(async move {
+            let mut asked = Vec::new();
+            for _ in 0..1000 {
+                if let Some(q) = asking.pending() {
+                    asked.push(q.tool.clone());
+                    if q.tool == "run_shell" {
+                        assert!(!q.allow_always, "a high step is never allowed forever");
+                        asking
+                            .answer(q.id, Answer::Deny, DecidedBy::Button)
+                            .unwrap();
+                        return asked;
+                    }
+                    asking
+                        .answer(q.id, Answer::Once, DecidedBy::Button)
+                        .unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            asked
+        });
+        a.handle("x", CancellationToken::new()).await.unwrap();
+        // The skill itself, then its high step on its own card.
+        assert_eq!(answer.await.unwrap(), ["skill_run", "run_shell"]);
+        assert!(shell.lock().is_empty());
+        assert!(tool_results(&p.requests.lock()[1])[0].contains("0 из 1"));
     }
 }

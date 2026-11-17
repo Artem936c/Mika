@@ -559,4 +559,7 @@ pub struct Shared {
     /// Where her settings change by conversation (decision 0046). The
     /// application fills it once it runs; empty, the tools say so.
     pub settings: mika_core::settings::SettingsSlot,
+    /// What the last turn did, for a skill (decision 0047). The agent
+    /// writes it; the skill tools read it.
+    pub skills: mika_core::skills::SkillBook,
 }

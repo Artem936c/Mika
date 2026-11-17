@@ -11,6 +11,18 @@
     name: string;
     prompt: string;
   }
+  /** A skill she saved (decision 0047): steps of tools with their arguments. */
+  interface Skill {
+    id: number;
+    name: string;
+    description: string;
+    params: { name: string; about: string }[];
+    steps: { tool: string; args: Record<string, unknown> }[];
+  }
+  interface Skills {
+    skills: Skill[];
+    suggest: boolean;
+  }
   interface Reminder {
     id: number;
     due_at: number;
@@ -42,6 +54,7 @@
   }
 
   let commands = $state<Command[]>([]);
+  let skills = $state<Skills>({ skills: [], suggest: true });
   let reminders = $state<Reminder[]>([]);
   let servers = $state<McpServer[]>([]);
   let tg = $state<Telegram | null>(null);
@@ -61,8 +74,9 @@
 
   async function load() {
     try {
-      [commands, reminders, servers, tg] = await Promise.all([
+      [commands, skills, reminders, servers, tg] = await Promise.all([
         invoke<Command[]>('list_commands'),
+        invoke<Skills>('list_skills'),
         invoke<Reminder[]>('list_reminders'),
         invoke<McpServer[]>('list_mcp'),
         invoke<Telegram>('get_telegram'),
@@ -147,6 +161,12 @@
     }
   }
 
+  /** One step for the list: the tool and its arguments in short. */
+  function stepLine(step: Skill['steps'][number], n: number): string {
+    const args = Object.keys(step.args ?? {}).length ? ' ' + JSON.stringify(step.args) : '';
+    return `${n}. ${step.tool}${args}`;
+  }
+
   function when(dueAt: number): string {
     return new Date(dueAt * 1000).toLocaleString(dateLocale(), { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
   }
@@ -176,6 +196,28 @@
   <textarea class="fld" rows="2" bind:value={cmdPrompt} maxlength="2000" placeholder={t('ext.command_prompt')}></textarea>
   <button class="bt" onclick={addCommand} disabled={!cmdName.trim() || !cmdPrompt.trim()}>{t('ext.command_add')}</button>
 </div>
+
+<div class="lbl">{t('ext.skills')}</div>
+<p class="hint">{t('ext.skills_sub')}</p>
+{#if skills.skills.length === 0}
+  <p class="hint">{t('ext.skills_none')}</p>
+{/if}
+{#each skills.skills as s (s.id)}
+  <div class="item skill">
+    <div class="txt">
+      <b>{s.name}</b>
+      {#if s.description}<small>{s.description}</small>{/if}
+      {#if s.params.length}<small>{t('ext.skill_params', { list: s.params.map((p) => (p.about ? `${p.name} (${p.about})` : p.name)).join(', ') })}</small>{/if}
+      <ol class="steps">
+        {#each s.steps as step, i (i)}
+          <li title={stepLine(step, i + 1)}>{stepLine(step, i + 1)}</li>
+        {/each}
+      </ol>
+    </div>
+    <button class="ib" title={t('ext.remove')} aria-label={t('ext.remove')} onclick={() => run('delete_skill', { name: s.name })}><Icon name="x" size={14} /></button>
+  </div>
+{/each}
+<Switch checked={skills.suggest} title={t('ext.skills_suggest')} sub={t('ext.skills_suggest_sub')} onchange={(v) => run('set_skill_offers', { on: v })} />
 
 <div class="lbl">{t('ext.schedule')}</div>
 {#if reminders.length === 0}
@@ -287,6 +329,23 @@
   .item .ib {
     width: 26px;
     height: 26px;
+  }
+  .item.skill {
+    align-items: flex-start;
+  }
+  .steps {
+    margin: 4px 0 0;
+    padding-left: 0;
+    list-style: none;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--mute);
+  }
+  .steps li {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    user-select: text;
   }
   .tag {
     font-style: normal;

@@ -27,6 +27,8 @@ pub enum CommandError {
     BadName,
     #[error("у команды должен быть текст, до 2000 символов")]
     BadPrompt,
+    #[error("имя «{0}» уже занято навыком, выбери другое")]
+    NameTaken(String),
     #[error("команды недоступны: {0}")]
     Db(String),
 }
@@ -58,13 +60,26 @@ impl CommandStore {
         if prompt.is_empty() || prompt.chars().count() > MAX_COMMAND_PROMPT {
             return Err(CommandError::BadPrompt);
         }
-        self.db.with(|c| {
+        // One name for one thing: a skill of this name keeps it (decision 0047).
+        let saved = self.db.with(|c| {
+            let taken: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM skills WHERE key = ?1)",
+                [&key],
+                |r| r.get(0),
+            )?;
+            if taken {
+                return Ok(false);
+            }
             c.execute(
                 "INSERT INTO commands (name, key, prompt) VALUES (?1, ?2, ?3)
                  ON CONFLICT(key) DO UPDATE SET name = ?1, prompt = ?3",
                 params![name, key, prompt],
-            )
+            )?;
+            Ok(true)
         })?;
+        if !saved {
+            return Err(CommandError::NameTaken(name.to_string()));
+        }
         Ok(())
     }
 
@@ -165,6 +180,27 @@ mod tests {
         assert_eq!(
             s.save(&"я".repeat(MAX_COMMAND_NAME + 1), "x"),
             Err(CommandError::BadName)
+        );
+    }
+
+    #[test]
+    fn a_command_cannot_take_the_name_of_a_skill() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        crate::skills::SkillStore::new(db.clone())
+            .save(crate::skills::NewSkill {
+                name: "Утро".into(),
+                description: String::new(),
+                params: vec![],
+                steps: vec![crate::skills::SkillStep {
+                    tool: "get_time".into(),
+                    args: serde_json::json!({}),
+                }],
+            })
+            .unwrap();
+        let s = CommandStore::new(db);
+        assert_eq!(
+            s.save("утро!", "Расскажи погоду"),
+            Err(CommandError::NameTaken("утро!".into()))
         );
     }
 
