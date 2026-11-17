@@ -29,6 +29,7 @@
 
   let {
     items,
+    draft = $bindable(''),
     status,
     name,
     speak,
@@ -109,9 +110,9 @@
     /** A picture of a window that waits for the user's question. */
     screenAsk?: ScreenAsk | null;
     onscreenaskclose?: () => void;
+    /** The unsent text; it outlives the chat when the island folds. */
+    draft?: string;
   } = $props();
-
-  let draft = $state('');
 
   /** When the desktop avatar was last told the user types, ms. */
   let typingToldAt = 0;

@@ -193,3 +193,26 @@ const CONTROLS = 'button, a, input, textarea, select, label, [role="button"]';
 export function opensChat(target: { closest(selector: string): unknown } | null): boolean {
   return !target?.closest(CONTROLS);
 }
+
+/** How long the open chat of the island stays unfocused and quiet before it folds. */
+export const FOLD_AFTER_MS = 4000;
+
+export interface FoldCheck {
+  view: View;
+  /** The main window is an ordinary window, not the island. */
+  windowed: boolean;
+  /** The window lost focus since the chat opened and has not got it back. */
+  away: boolean;
+  state: AssistantState;
+  /** A question waits on the user: a confirmation, a screen question, a dictation. */
+  asking: boolean;
+}
+
+/**
+ * Whether the open chat of the island folds back into the island: the user went
+ * to another window and nothing goes on in it. The settings and the welcome stay
+ * open, the user may be copying a key from elsewhere.
+ */
+export function foldsAway(s: FoldCheck): boolean {
+  return !s.windowed && s.view === 'chat' && s.away && s.state === 'idle' && !s.asking;
+}

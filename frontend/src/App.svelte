@@ -31,8 +31,10 @@
   import { lang } from './lib/locale.svelte';
   import { reduceTask, type TaskView } from './lib/task';
   import {
+    FOLD_AFTER_MS,
     ISLAND_SHAPES,
     confirmShape,
+    foldsAway,
     noticeOf,
     opensChat,
     rectForShape,
@@ -106,6 +108,30 @@
   let recording = $state<number | null>(null);
   /** Newest state of every background job the events told about. */
   let jobsSeen: JobsSeen = {};
+  /** The unsent text of the chat, kept while the island is folded. */
+  let draft = $state('');
+  /** The window lost focus since the chat opened and has not got it back. */
+  let away = $state(false);
+
+  // A new panel starts with the user at it, whatever the focus was before.
+  $effect(() => {
+    void view;
+    away = false;
+  });
+
+  // The user went elsewhere and nothing goes on: the chat folds into the island.
+  $effect(() => {
+    const folds = foldsAway({
+      view,
+      windowed,
+      away,
+      state: current,
+      asking: pending !== null || screenAsk !== null || dictation !== null,
+    });
+    if (!folds) return;
+    const timer = setTimeout(() => (view = 'island'), FOLD_AFTER_MS);
+    return () => clearTimeout(timer);
+  });
 
   // The state can say "awaiting" a moment before the question itself arrives.
   const faceState: AssistantState = $derived(
@@ -348,7 +374,13 @@
       if (i >= 0 && i < ORDER.length) invoke('debug_set_state', { next: ORDER[i] });
     };
     addEventListener('keydown', onKey);
+    const onBlur = () => (away = true);
+    const onFocus = () => (away = false);
+    addEventListener('blur', onBlur);
+    addEventListener('focus', onFocus);
     return () => {
+      removeEventListener('blur', onBlur);
+      removeEventListener('focus', onFocus);
       clearInterval(idleTimer);
       clearTimeout(noticeTimer);
       unlisten?.();
@@ -392,6 +424,7 @@
 {#snippet chatPanel()}
   <Chat
     {items}
+    bind:draft
     status={current}
     {name}
     {speak}

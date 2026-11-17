@@ -11,6 +11,7 @@ import {
   confirmTargetHeight,
   islandRect,
   noticeOf,
+  foldsAway,
   opensChat,
   reduceState,
   shapeFor,
@@ -209,5 +210,31 @@ describe('noticeOf', () => {
     expect(noticeOf({ type: 'remark', text: '  ', kind: 'calendar' })).toBeNull();
     expect(noticeOf({ type: 'assistant_delta', text: 'привет' })).toBeNull();
     expect(noticeOf(null)).toBeNull();
+  });
+});
+
+describe('foldsAway', () => {
+  const quiet = { view: 'chat' as const, windowed: false, away: true, state: 'idle' as const, asking: false };
+
+  it('folds the open chat of the island once it lost focus and nothing goes on', () => {
+    expect(foldsAway(quiet)).toBe(true);
+  });
+
+  it('keeps the chat while it has focus or never lost it', () => {
+    expect(foldsAway({ ...quiet, away: false })).toBe(false);
+  });
+
+  it('keeps the chat while she listens, thinks, speaks or waits for an answer', () => {
+    for (const state of ['listening', 'thinking', 'speaking', 'awaiting_confirm'] as const) {
+      expect(foldsAway({ ...quiet, state })).toBe(false);
+    }
+    expect(foldsAway({ ...quiet, asking: true })).toBe(false);
+  });
+
+  it('keeps the ordinary window, the settings and the welcome', () => {
+    expect(foldsAway({ ...quiet, windowed: true })).toBe(false);
+    expect(foldsAway({ ...quiet, view: 'settings' })).toBe(false);
+    expect(foldsAway({ ...quiet, view: 'welcome' })).toBe(false);
+    expect(foldsAway({ ...quiet, view: 'island' })).toBe(false);
   });
 });
