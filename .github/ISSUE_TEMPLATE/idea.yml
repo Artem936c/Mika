@@ -1,0 +1,21 @@
+name: Идея / Feature request
+description: Чего не хватает Мике / Something Mika should do
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую задачу решаем / What problem does it solve
+      description: Что ты хочешь сделать и что сейчас мешает / What you want to do and what gets in the way now
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Как это могло бы работать / How it could work
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Как обходишься сейчас / How you manage today

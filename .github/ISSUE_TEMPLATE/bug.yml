@@ -1,0 +1,56 @@
+name: Ошибка / Bug
+description: Что-то работает не так / Something does not work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Уязвимости сюда не пиши: для них есть [приватная форма](https://github.com/Artem936c/Mika/security/advisories/new).
+        Please report vulnerabilities [privately](https://github.com/Artem936c/Mika/security/advisories/new), not here.
+  - type: input
+    id: version
+    attributes:
+      label: Версия Мики / Mika version
+      description: Настройки → «Общие» / Settings → General
+      placeholder: "0.4.8"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows
+      placeholder: "Windows 11 24H2"
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Провайдер и модель / Provider and model
+      description: Если ошибка связана с ответами Мики / If the bug is about her replies
+      placeholder: "RouterAI, google/gemma-4-26b-a4b-it"
+  - type: textarea
+    id: steps
+    attributes:
+      label: Что делал / Steps to reproduce
+      placeholder: |
+        1. Открыл чат щелчком по островку
+        2. Попросил …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Что ожидал и что получилось / Expected and actual result
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Журнал / Log
+      description: |
+        Настройки → «Журнал» → «Сохранить в файл», затем перетащи файл сюда. Просмотри его перед отправкой: ключи вычищаются, но тексты разговоров остаются, если их запись включена.
+        Settings → Log → Save to a file, then drop the file here. Review it first: keys are scrubbed, but conversation texts stay when their logging is on.
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Скриншоты / Screenshots
