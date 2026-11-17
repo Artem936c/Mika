@@ -19,9 +19,9 @@ use windows::Storage::Streams::{
 };
 use windows::Win32::Media::MediaFoundation::{
     IMFAttributes, IMFSample, MFAudioFormat_PCM, MFCreateMFByteStreamOnStreamEx, MFCreateMediaType,
-    MFCreateSourceReaderFromByteStream, MFMediaType_Audio, MFShutdown, MFStartup,
-    MF_BYTESTREAM_CONTENT_TYPE, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS,
-    MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+    MFCreateSourceReaderFromByteStream, MFMediaType_Audio, MFStartup, MF_BYTESTREAM_CONTENT_TYPE,
+    MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
+    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
 };
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
@@ -478,23 +478,19 @@ impl Drop for QuietOnDrop {
     }
 }
 
-/// Media Foundation, started for as long as this lives.
-struct MediaFoundation;
-
-impl MediaFoundation {
-    fn start() -> windows::core::Result<Self> {
+/// Starts Media Foundation once for the whole process; it is never shut down.
+/// Shutting it down and starting it again on another thread, as a replaced
+/// voice worker would, crashes the process with an access violation.
+fn media_foundation() -> windows::core::Result<()> {
+    static STARTED: Mutex<bool> = Mutex::new(false);
+    let mut started = STARTED.lock();
+    if !*started {
         // MF_VERSION and MFSTARTUP_LITE: no network sources are needed.
-        // SAFETY: paired with `MFShutdown` in `drop`.
+        // SAFETY: a plain call; the process keeps Media Foundation until it exits.
         unsafe { MFStartup(0x0002_0070, 1)? };
-        Ok(Self)
+        *started = true;
     }
-}
-
-impl Drop for MediaFoundation {
-    fn drop(&mut self) {
-        // SAFETY: `MFStartup` succeeded in `start`.
-        let _ = unsafe { MFShutdown() };
-    }
+    Ok(())
 }
 
 /// The first audio stream of a source reader.
@@ -504,7 +500,7 @@ const END_OF_STREAM: u32 = 2;
 
 /// A compressed sound, MP3, Ogg or FLAC, as a WAV file of 16-bit samples.
 fn decode(bytes: &[u8]) -> windows::core::Result<Vec<u8>> {
-    let _mf = MediaFoundation::start()?;
+    media_foundation()?;
     let stream = memory_stream(bytes)?;
     // SAFETY: plain Media Foundation calls on objects owned here; the
     // locked buffer is read only while it is locked.
@@ -893,6 +889,20 @@ mod tests {
         assert_eq!(quiet, *out);
         // Bytes that are no sound are played as they are.
         assert!(matches!(prepare(b"no sound here").0, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_sound_is_decoded_again_on_a_new_thread() {
+        // The voice worker can be replaced; the new one decodes on a new thread.
+        for _ in 0..3 {
+            std::thread::spawn(|| {
+                com();
+                assert!(decode(&silent_mp3(40)).is_ok());
+                assert!(decode(b"no sound here").is_err());
+            })
+            .join()
+            .unwrap();
+        }
     }
 
     #[test]
