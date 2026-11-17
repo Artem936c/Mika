@@ -132,14 +132,17 @@ pub enum Event {
     Error {
         message: String,
     },
-    /// A phrase of the voice starts to sound now (decision 0040). `levels` is
-    /// its loudness every `frame_ms`, 0..=255 of its loudest moment; empty
-    /// when the sound could not be read. Never written to the journal: it
-    /// carries what she says.
+    /// A phrase of the voice sounds now (decision 0040). `levels` is its
+    /// loudness every `frame_ms`, 0..=255 of its loudest moment; empty when
+    /// the sound could not be read. `played_ms` is how far the sound already
+    /// got: the lips start there. Never written to the journal: it carries
+    /// what she says.
     VoicePhrase {
         text: String,
         frame_ms: u32,
         levels: Vec<u8>,
+        #[serde(default)]
+        played_ms: u32,
     },
     /// The phrase that was sounding is over or was cut short.
     VoiceQuiet,
@@ -202,10 +205,12 @@ mod tests {
             text: "Привет!".into(),
             frame_ms: 20,
             levels: vec![0, 128, 255],
+            played_ms: 35,
         };
         let json = serde_json::to_value(&phrase).unwrap();
         assert_eq!(json["type"], "voice_phrase");
         assert_eq!(json["frame_ms"], 20);
+        assert_eq!(json["played_ms"], 35);
         assert_eq!(json["levels"], serde_json::json!([0, 128, 255]));
         let quiet = serde_json::to_value(Event::VoiceQuiet).unwrap();
         assert_eq!(quiet, serde_json::json!({ "type": "voice_quiet" }));

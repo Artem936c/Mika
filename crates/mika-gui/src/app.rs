@@ -767,10 +767,12 @@ impl Ctx {
                     text,
                     frame_ms,
                     levels,
+                    played_ms,
                 } => mika_core::Event::VoicePhrase {
                     text,
                     frame_ms,
                     levels,
+                    played_ms,
                 },
                 mika_audio::lips::LipCue::Quiet => mika_core::Event::VoiceQuiet,
             });

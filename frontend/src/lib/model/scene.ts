@@ -54,6 +54,7 @@ import {
   nextAutoPose,
   saccade,
   sampleTimeline,
+  windowLean,
   speechStrength,
   twiceBlink,
   ZERO_TRUNK,
@@ -695,8 +696,8 @@ class LiveScene implements Scene {
       move = gestureAt(this.gestureKind, now - this.gestureStart);
       if (!move) this.gestureKind = null;
     }
-    // A window on the move: she leans against it, then rights herself in about 600 ms.
-    const wantLean = Math.max(-8, Math.min(8, -this.drift.vx / 150));
+    // A window on the move: her top stays behind, then she rights herself in about 600 ms.
+    const wantLean = windowLean(this.drift.vx);
     this.drift.lean = approach(this.drift.lean, wantLean, dt, 120);
     this.drift.vx = approach(this.drift.vx, 0, dt, 150);
     this.drift.shift = approach(this.drift.shift, -this.drift.vx / 20000, dt, 200);

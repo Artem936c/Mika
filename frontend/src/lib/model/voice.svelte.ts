@@ -1,6 +1,7 @@
 // What the voice is saying right now, for the lips of the avatar (decision
 // 0040). Rust tells the window when a phrase starts to sound, with its
-// loudness every few milliseconds, and when it falls quiet. One per window.
+// loudness every few milliseconds and how far the sound already got, and
+// when it falls quiet. One per window.
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -74,6 +75,7 @@ export function onVoiceEvent(payload: unknown, now = performance.now()) {
     text?: unknown;
     frame_ms?: unknown;
     levels?: unknown;
+    played_ms?: unknown;
   };
   if (e?.type === 'voice_quiet') {
     phrase = null;
@@ -84,13 +86,15 @@ export function onVoiceEvent(payload: unknown, now = performance.now()) {
   const frameMs = typeof e.frame_ms === 'number' && e.frame_ms > 0 ? e.frame_ms : 20;
   const levels = Array.isArray(e.levels) ? e.levels.filter((l): l is number => typeof l === 'number') : [];
   const flat = levels.length === 0;
+  // The sound was already this far when the word came: the track starts there.
+  const played = typeof e.played_ms === 'number' && e.played_ms > 0 ? e.played_ms : 0;
   phrase = {
     text,
     frameMs,
     levels,
     track: flat ? flatTrack(text, MS_PER_CHAR, frameMs) : lipTrack(text, levels, frameMs),
     flat,
-    startedAt: now,
+    startedAt: now - played,
   };
 }
 

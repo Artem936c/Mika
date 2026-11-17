@@ -44,6 +44,21 @@ export function sampleTimeline(tl: Timeline, ms: number): { pose: RigPose; weigh
   return { pose, weight };
 }
 
+// ---- a window on the move ----
+
+/** The steepest lean of a moving window, degrees. */
+const MAX_WINDOW_LEAN = 8;
+
+/**
+ * How far her top leans while the window moves at `vx` pixels a second,
+ * degrees about Z. Her feet go with the window and her top stays behind: a
+ * window moving right tips her to the left of the screen, which is a
+ * positive turn for a VRM 1.0 rig that faces the user.
+ */
+export function windowLean(vx: number): number {
+  return Math.max(-MAX_WINDOW_LEAN, Math.min(MAX_WINDOW_LEAN, vx / 150)) + 0;
+}
+
 // ---- standing still ----
 
 /** The body follows a new pose in about 400 ms. */

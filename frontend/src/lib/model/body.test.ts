@@ -22,7 +22,9 @@ import {
   speechStrength,
   ZERO_TRUNK,
   type Timeline,
+  windowLean,
 } from './body';
+import { mix } from './rig';
 
 describe('idle', () => {
   it('shifts the weight slowly and only a little', () => {
@@ -177,5 +179,40 @@ describe('a whole turn', () => {
     const tl = GESTURES.spin;
     expect(sampleTimeline(tl, tl.ms * 0.1)!.weight).toBe(1);
     expect(sampleTimeline(tl, tl.ms * 0.9)!.weight).toBe(1);
+  });
+});
+
+describe('a whole turn seen from the front', () => {
+  /** Her turn on screen, -180..180: 0 faces the user, ±180 shows her back. */
+  const facing = (y: number) => ((((y + 180) % 360) + 360) % 360) - 180;
+
+  it('never shows her back while it comes in or goes out', () => {
+    const tl = GESTURES.spin;
+    for (const share of [0, 0.005, 0.01, 0.02, 0.03, 0.97, 0.98, 0.99, 0.995, 1]) {
+      const s = sampleTimeline(tl, tl.ms * share)!;
+      const y = mix({ hips: [0, 0, 0] }, s.pose, s.weight).hips![1];
+      expect(Math.abs(facing(y))).toBeLessThan(30);
+    }
+  });
+
+  it('still turns all the way round in the middle', () => {
+    const tl = GESTURES.spin;
+    const s = sampleTimeline(tl, tl.ms / 2)!;
+    const y = mix({ hips: [0, 0, 0] }, s.pose, s.weight).hips![1];
+    expect(Math.abs(facing(y))).toBeGreaterThan(150);
+  });
+});
+
+describe('a window on the move', () => {
+  it('leaves her top behind: moving right, she leans to the left of the screen', () => {
+    // A positive turn about Z tips her top to the left of the screen (VRM 1.0, facing the user).
+    expect(windowLean(600)).toBeGreaterThan(0);
+    expect(windowLean(-600)).toBeLessThan(0);
+    expect(windowLean(0)).toBe(0);
+  });
+
+  it('never leans more than 8 degrees', () => {
+    expect(windowLean(1e6)).toBe(8);
+    expect(windowLean(-1e6)).toBe(-8);
   });
 });

@@ -26,7 +26,7 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
 use crate::lead::{wav, with_lead_in, LEAD_IN_MS};
-use crate::lips::{envelope, LipCue, LipSink, FRAME_MS};
+use crate::lips::{envelope, played_ms, LipCue, LipSink, FRAME_MS};
 
 use crate::speech::{
     defuse, prosody_ssml, with_direction, DirectionSource, FirstSound, RemoteSynth, ToneSource,
@@ -35,6 +35,10 @@ use crate::speech::{
 
 /// One sentence never plays longer than this, whatever the player reports.
 const MAX_SENTENCE_PLAY: Duration = Duration::from_secs(90);
+/// How long the lips wait for the player to start before they go anyway.
+const MAX_START_WAIT: Duration = Duration::from_millis(1500);
+/// How often the player is asked whether its sound has started.
+const START_POLL: Duration = Duration::from_millis(5);
 /// The remote synthesizer gets this long for one sentence.
 const REMOTE_WAIT: Duration = Duration::from_secs(45);
 
@@ -369,20 +373,44 @@ impl Engine {
         while self.ended.try_recv().is_ok() {}
         self.player.SetSource(source)?;
         let sink = lips.lock().clone();
-        // Told right before the sound starts, and quiet whatever way it ends.
+        self.player.Play()?;
+        let started = std::time::Instant::now();
+        let mut ended = false;
+        // Told once the sound has started, with how far it got, and quiet
+        // whatever way it ends: the lips never run ahead of the voice.
         let _quiet = match (sink, phrase) {
             (Some(sink), Some((text, levels))) => {
-                sink(LipCue::Phrase {
-                    text: text.to_string(),
-                    frame_ms: FRAME_MS,
-                    levels,
-                });
-                Some(QuietOnDrop(sink))
+                let played = loop {
+                    if self.ended.recv_timeout(START_POLL).is_ok() {
+                        ended = true;
+                        break None;
+                    }
+                    if stopped() {
+                        break None;
+                    }
+                    // A player that cannot tell its place: the lips start now.
+                    let Ok(at) = self.player.PlaybackSession().and_then(|s| s.Position()) else {
+                        break Some(0);
+                    };
+                    if at.Duration > 0 || started.elapsed() > MAX_START_WAIT {
+                        break Some(played_ms(at.Duration));
+                    }
+                };
+                played.map(|played_ms| {
+                    sink(LipCue::Phrase {
+                        text: text.to_string(),
+                        frame_ms: FRAME_MS,
+                        levels,
+                        played_ms,
+                    });
+                    QuietOnDrop(sink)
+                })
             }
             _ => None,
         };
-        self.player.Play()?;
-        let started = std::time::Instant::now();
+        if ended {
+            return Ok(());
+        }
         loop {
             if self.ended.recv_timeout(Duration::from_millis(40)).is_ok() {
                 break;

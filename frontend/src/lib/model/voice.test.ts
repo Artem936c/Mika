@@ -30,4 +30,13 @@ describe('voice of the lips', () => {
     expect(mouthNow(100_000)?.shape).toBe('aa');
     onVoiceEvent({ type: 'voice_quiet' });
   });
+
+  it('starts the track where the sound already is', () => {
+    const levels = [0, 0, 0, 0, 0, 255, 255, 255];
+    onVoiceEvent({ type: 'voice_phrase', text: 'аа', frame_ms: 20, levels, played_ms: 0 }, 1000);
+    expect(mouthNow(1000)!.open).toBe(0);
+    onVoiceEvent({ type: 'voice_phrase', text: 'аа', frame_ms: 20, levels, played_ms: 100 }, 1000);
+    expect(mouthNow(1000)!.open).toBeGreaterThan(0.5);
+    onVoiceEvent({ type: 'voice_quiet' });
+  });
 });

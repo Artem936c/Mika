@@ -13,16 +13,24 @@ pub const FRAME_MS: u32 = 20;
 /// What the voice tells about the sound it plays.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LipCue {
-    /// A phrase starts to sound now. `levels` is its loudness every
-    /// `frame_ms`, 0..=255 of its loudest moment; empty when the sound could
-    /// not be read.
+    /// A phrase sounds now. `levels` is its loudness every `frame_ms`,
+    /// 0..=255 of its loudest moment; empty when the sound could not be read.
+    /// `played_ms` is how far the sound already got when this was told: the
+    /// lips start there and keep up with the sound.
     Phrase {
         text: String,
         frame_ms: u32,
         levels: Vec<u8>,
+        played_ms: u32,
     },
     /// The phrase is over or was cut short.
     Quiet,
+}
+
+/// Milliseconds in a span of the player, given in steps of 100 ns; 0 for a
+/// span below zero.
+pub fn played_ms(ticks: i64) -> u32 {
+    u32::try_from(ticks.max(0) / 10_000).unwrap_or(u32::MAX)
 }
 
 /// Who hears of the phrases the voice plays.
@@ -80,6 +88,15 @@ mod tests {
             pcm.extend_from_slice(&v.to_le_bytes());
         }
         pcm
+    }
+
+    #[test]
+    fn played_ticks_become_milliseconds() {
+        assert_eq!(played_ms(0), 0);
+        assert_eq!(played_ms(1_000_000), 100);
+        assert_eq!(played_ms(9_999), 0);
+        assert_eq!(played_ms(-5), 0);
+        assert_eq!(played_ms(i64::MAX), u32::MAX);
     }
 
     #[test]

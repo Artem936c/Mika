@@ -92,13 +92,22 @@ export function withSign(pose: RigPose, sign: 1 | -1): RigPose {
   return out;
 }
 
-/** `a` moved by `w` (0..1) towards `b`, for the bones `b` has; a bone `a` lacks starts at rest. */
+/** The short way from one angle to another, degrees: -180..180. */
+function shortWay(by: number): number {
+  return by - 360 * Math.round(by / 360);
+}
+
+/**
+ * `a` moved by `w` (0..1) towards `b`, for the bones `b` has; a bone `a`
+ * lacks starts at rest. Each angle goes the short way: a whole turn of 360
+ * degrees is where it began, and she does not turn back through it.
+ */
 export function mix(a: RigPose, b: RigPose, w: number): RigPose {
   const out: RigPose = { ...a };
   if (w <= 0) return out;
   for (const [bone, to] of Object.entries(b) as [RigBone, Euler3][]) {
     const from = a[bone] ?? [0, 0, 0];
-    out[bone] = [0, 1, 2].map((i) => plain(from[i] + (to[i] - from[i]) * Math.min(1, w))) as Euler3;
+    out[bone] = [0, 1, 2].map((i) => plain(from[i] + shortWay(to[i] - from[i]) * Math.min(1, w))) as Euler3;
   }
   return out;
 }
