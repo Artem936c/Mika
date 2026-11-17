@@ -69,20 +69,21 @@ const behind = both({
   ...FINGERS_SOFT,
 });
 
+/** Elbows by her sides, forearms across under the chest, each hand tucked at the other elbow. */
 const crossed = both({
   leftShoulder: [0, 6, -2],
-  leftUpperArm: [-30, -55, -78],
-  leftLowerArm: [0, -95, 0],
-  leftHand: [0, 0, -4],
+  leftUpperArm: [0, -75, -68],
+  leftLowerArm: [0, -90, 0],
+  leftHand: [0, -40, 0],
   ...FINGERS_CURL,
 });
 
-/** Her left hand rests on her hip, the right arm hangs at ease. */
+/** Her left hand rests on the side of her waist, the elbow out and back; the right arm hangs at ease. */
 const hip: RigPose = {
   ...relaxed,
   leftShoulder: [0, 0, 2],
-  leftUpperArm: [40, -30, -40],
-  leftLowerArm: [0, -90, 0],
+  leftUpperArm: [50, -34, -35],
+  leftLowerArm: [0, -80, 0],
   leftHand: [0, 10, 10],
 };
 

@@ -24,6 +24,7 @@ import {
   frameFor,
   gazeWander,
   gestureAt,
+  glide,
   lipGain,
   nextVowel,
   rigSign,
@@ -143,7 +144,17 @@ const rad = (deg: number) => (deg * Math.PI) / 180;
 const FOV = 20;
 /** The emotion reaches 95% of its weight in `EMOTION_BLEND_MS`. */
 const EMOTION_TAU = EMOTION_BLEND_MS / 3;
-const GAZE_TAU = 90;
+/** How the gaze glides (decision 0040): about the time to get there, ms, and the top speed, degrees a second. */
+const HEAD_GLIDE_MS = 170;
+const HEAD_MAX_SPEED = 180;
+const BODY_GLIDE_MS = 320;
+const BODY_MAX_SPEED = 60;
+const EYES_GLIDE_MS = 70;
+const EYES_MAX_SPEED = 400;
+/** A small eye jump takes about this long, ms. */
+const JUMP_TAU = 20;
+/** A cursor that moved this recently is pursued, ms. */
+const PURSUIT_MS = 400;
 
 class LiveScene implements Scene {
   readonly expressions: ReadonlySet<string>;
@@ -213,7 +224,6 @@ class LiveScene implements Scene {
   private opening = 0;
   private blinkAt = 0;
   private readonly pose: Pose = { pitch: 0, yaw: 0, roll: 0, spine: 0 };
-  private readonly gaze: [number, number] = [0, 0];
   private wander: { yaw: number; pitch: number } | null = null;
   private wanderAt = 0;
   /** Animations of the user, loaded once, and the one playing over the layers. */
@@ -236,7 +246,14 @@ class LiveScene implements Scene {
   /** The lean of a moving window, degrees, and the shift that swings her hair. */
   private readonly drift = { lean: 0, shift: 0, vx: 0 };
   /** How far her head and body are turned to what she looks at, degrees. */
-  private readonly turn = { yaw: 0, pitch: 0, body: 0 };
+  /** Head and body turn to what she looks at, gliding: degrees, degrees a millisecond. */
+  private readonly turn = { yaw: { x: 0, v: 0 }, pitch: { x: 0, v: 0 }, body: { x: 0, v: 0 } };
+  /** Her eyes glide too, so a cursor that moves in steps does not shake them. */
+  private readonly eyes = { yaw: { x: 0, v: 0 }, pitch: { x: 0, v: 0 } };
+  /** The small eye jump as shown: it moves fast, but never in one frame. */
+  private readonly jumpNow = { yaw: 0, pitch: 0 };
+  /** She follows a cursor that moves right now: the eyes pursue it without jumps. */
+  private pursuing = false;
   private readonly at = new THREE.Vector3();
   /** A small jump of the eyes on top of where they look. */
   private jump = { yaw: 0, pitch: 0 };
@@ -705,9 +722,9 @@ class LiveScene implements Scene {
     const turned = add(
       this.bodyNow(now, dt),
       {
-        head: [-this.turn.pitch, this.turn.yaw, 0],
-        spine: [0, 0.6 * this.turn.body, this.drift.lean * 0.6],
-        chest: [0, 0.4 * this.turn.body, this.drift.lean * 0.4],
+        head: [-this.turn.pitch.x, this.turn.yaw.x, 0],
+        spine: [0, 0.6 * this.turn.body.x, this.drift.lean * 0.6],
+        chest: [0, 0.4 * this.turn.body.x, this.drift.lean * 0.4],
       },
       1,
     );
@@ -726,15 +743,18 @@ class LiveScene implements Scene {
       }
     }
     const look = eyes ?? slot.gaze ?? (this.wander && !still ? [this.wander.yaw, this.wander.pitch] : [0, 0]);
-    this.gaze[0] = approach(this.gaze[0], look[0], dt, GAZE_TAU);
-    this.gaze[1] = approach(this.gaze[1], look[1], dt, GAZE_TAU);
+    glide(this.eyes.yaw, look[0], dt, EYES_GLIDE_MS, EYES_MAX_SPEED);
+    glide(this.eyes.pitch, look[1], dt, EYES_GLIDE_MS, EYES_MAX_SPEED);
     // Eyes never stand quite still: small quick jumps, which do not glide.
     if (now >= this.jumpAt) {
       const j = saccade(Math.random(), Math.random());
       this.jump = still ? { yaw: 0, pitch: 0 } : j;
       this.jumpAt = now + j.ms;
     }
-    this.applyGaze(this.gaze[0] + this.jump.yaw, this.gaze[1] + this.jump.pitch);
+    const jumpTo = this.pursuing ? { yaw: 0, pitch: 0 } : this.jump;
+    this.jumpNow.yaw = approach(this.jumpNow.yaw, jumpTo.yaw, dt, JUMP_TAU);
+    this.jumpNow.pitch = approach(this.jumpNow.pitch, jumpTo.pitch, dt, JUMP_TAU);
+    this.applyGaze(this.eyes.yaw.x + this.jumpNow.yaw, this.eyes.pitch.x + this.jumpNow.pitch);
 
     this.vrm.update(dt / 1000);
   }
@@ -767,10 +787,11 @@ class LiveScene implements Scene {
       want = aimAt(yaw * 0.5, pitch * 0.5);
       eyes = [yaw * 0.5, pitch * 0.5];
     }
-    // The head follows in about 300 ms.
-    this.turn.yaw = approach(this.turn.yaw, want.headYaw, dt, 100);
-    this.turn.pitch = approach(this.turn.pitch, want.headPitch, dt, 100);
-    this.turn.body = approach(this.turn.body, want.bodyYaw, dt, 200);
+    this.pursuing = source === 'cursor' && now - cursor!.movedAt < PURSUIT_MS;
+    // The head gets there in about 350 ms, the body later; both start and stop softly.
+    glide(this.turn.yaw, want.headYaw, dt, HEAD_GLIDE_MS, HEAD_MAX_SPEED);
+    glide(this.turn.pitch, want.headPitch, dt, HEAD_GLIDE_MS, HEAD_MAX_SPEED);
+    glide(this.turn.body, want.bodyYaw, dt, BODY_GLIDE_MS, BODY_MAX_SPEED);
     return eyes;
   }
 

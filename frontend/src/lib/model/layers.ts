@@ -72,6 +72,37 @@ export function approach(current: number, target: number, dtMs: number, tauMs: n
   return target + (current - target) * Math.exp(-Math.max(0, dtMs) / tauMs);
 }
 
+/** A value that glides: where it is and how fast it moves, units a millisecond. */
+export interface Glide {
+  x: number;
+  v: number;
+}
+
+/**
+ * One step of a critically damped spring towards `target`: it speeds up
+ * from rest, slows down near the target and does not overshoot, so a new
+ * target never makes a jerk. `smoothMs` is about the time to get there,
+ * `maxSpeed` caps the speed in units a second.
+ */
+export function glide(s: Glide, target: number, dtMs: number, smoothMs: number, maxSpeed = Infinity): void {
+  const dt = Math.max(0, dtMs);
+  if (dt === 0) return;
+  const omega = 2 / Math.max(1, smoothMs);
+  const k = omega * dt;
+  const decay = 1 / (1 + k + 0.48 * k * k + 0.235 * k * k * k);
+  const change = s.x - target;
+  const temp = (s.v + omega * change) * dt;
+  let next = target + (change + temp) * decay;
+  let v = (s.v - omega * temp) * decay;
+  const step = (maxSpeed * dt) / 1000;
+  if (Math.abs(next - s.x) > step) {
+    next = s.x + Math.sign(next - s.x) * step;
+    v = Math.sign(v) * Math.min(Math.abs(v), maxSpeed / 1000);
+  }
+  s.x = next;
+  s.v = v;
+}
+
 /** Target weights of a slot, without names the model lacks. */
 export function slotWeights(slot: Slot, available: ReadonlySet<string>): Map<string, number> {
   const out = new Map<string, number>();

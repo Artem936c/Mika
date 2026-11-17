@@ -4,6 +4,7 @@ import {
   FPS,
   VOWELS,
   approach,
+  glide,
   blinkWeight,
   breath,
   canModelBlink,
@@ -329,5 +330,59 @@ describe('drawing', () => {
     expect(frameDue(1034, 1000)).toBe(true);
     // Every second frame of a 60 Hz screen, even when it comes a hair early.
     expect(frameDue(1033.2, 1000)).toBe(true);
+  });
+});
+
+describe('glide', () => {
+  const run = (target: number, ms: number, frame: number, smooth = 250, maxSpeed?: number) => {
+    const s = { x: 0, v: 0 };
+    const path: number[] = [];
+    for (let t = 0; t < ms; t += frame) {
+      glide(s, target, frame, smooth, maxSpeed);
+      path.push(s.x);
+    }
+    return { s, path };
+  };
+
+  it('starts slowly instead of jumping at a new target', () => {
+    const { path } = run(30, 16, 16);
+    expect(path[0]).toBeGreaterThan(0);
+    expect(path[0]).toBeLessThan(1.5);
+  });
+
+  it('speeds up, then slows down, without overshoot', () => {
+    const { path } = run(30, 1200, 16);
+    const steps = path.map((x, i) => x - (path[i - 1] ?? 0));
+    const peak = steps.indexOf(Math.max(...steps));
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThan(steps.length - 1);
+    expect(Math.max(...path)).toBeLessThanOrEqual(30);
+    expect(path[path.length - 1]).toBeCloseTo(30, 0);
+  });
+
+  it('does not depend on the frame rate', () => {
+    const slow = run(30, 320, 32).s.x;
+    const fast = run(30, 320, 4).s.x;
+    expect(Math.abs(slow - fast)).toBeLessThan(1);
+  });
+
+  it('keeps under the speed limit, degrees a second', () => {
+    const { path } = run(90, 1000, 16, 250, 120);
+    for (let i = 1; i < path.length; i++) expect(path[i] - path[i - 1]).toBeLessThanOrEqual((120 * 16) / 1000 + 1e-9);
+  });
+
+  it('does not stop dead when a moving target passes it', () => {
+    const s = { x: 0, v: 0.2 };
+    glide(s, 1, 16, 250);
+    expect(s.v).toBeGreaterThan(0);
+  });
+
+  it('stays put on a zero step and lands after a long pause', () => {
+    const s = { x: 3, v: 0 };
+    glide(s, 10, 0, 250);
+    expect(s.x).toBe(3);
+    glide(s, 10, 60000, 250);
+    expect(s.x).toBeCloseTo(10, 3);
+    expect(Number.isFinite(s.v)).toBe(true);
   });
 });

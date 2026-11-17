@@ -24,7 +24,7 @@
   <div class="lbl">{t('persona.look_pose')}</div>
   <div class="chips" role="radiogroup" aria-label={t('persona.look_pose')}>
     {#each POSES as p (p)}
-      <button role="radio" aria-checked={model.look.pose === p} class:on={model.look.pose === p} onclick={() => save({ pose: p })}>
+      <button class="tg" role="radio" aria-checked={model.look.pose === p} class:on={model.look.pose === p} onclick={() => save({ pose: p })}>
         {t(`persona.pose_${p}`)}
       </button>
     {/each}
@@ -33,7 +33,7 @@
   <div class="lbl">{t('persona.look_frame')}</div>
   <div class="chips" role="radiogroup" aria-label={t('persona.look_frame')}>
     {#each FRAMES as f (f)}
-      <button role="radio" aria-checked={model.look.frame === f} class:on={model.look.frame === f} onclick={() => save({ frame: f })}>
+      <button class="tg" role="radio" aria-checked={model.look.frame === f} class:on={model.look.frame === f} onclick={() => save({ frame: f })}>
         {t(`persona.frame_${f}`)}
       </button>
     {/each}
@@ -55,10 +55,10 @@
   <p class="lead">{t('persona.look_scale_lead')}</p>
 
   <div class="chips">
-    <button aria-pressed={model.look.follow_cursor} class:on={model.look.follow_cursor} onclick={() => save({ follow_cursor: !model.look.follow_cursor })}>
+    <button class="tg" aria-pressed={model.look.follow_cursor} class:on={model.look.follow_cursor} onclick={() => save({ follow_cursor: !model.look.follow_cursor })}>
       {t('persona.look_cursor')}
     </button>
-    <button aria-pressed={model.look.idle_actions} class:on={model.look.idle_actions} onclick={() => save({ idle_actions: !model.look.idle_actions })}>
+    <button class="tg" aria-pressed={model.look.idle_actions} class:on={model.look.idle_actions} onclick={() => save({ idle_actions: !model.look.idle_actions })}>
       {t('persona.look_idle')}
     </button>
   </div>
@@ -66,6 +66,12 @@
 {/if}
 
 <style>
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
   .scale {
     display: flex;
     align-items: center;

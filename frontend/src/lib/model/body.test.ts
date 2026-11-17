@@ -216,3 +216,20 @@ describe('a window on the move', () => {
     expect(windowLean(-1e6)).toBe(-8);
   });
 });
+
+describe('an arm is moved whole', () => {
+  const CHAIN = ['UpperArm', 'LowerArm', 'Hand', 'ThumbProximal', 'IndexProximal', 'MiddleProximal', 'RingProximal', 'LittleProximal'];
+  const bodies = [...EMOTION_ORDER.map((e) => [`emotion ${e}`, EMOTION_BODY[e]] as const), ...BODY_STATES.map((s) => [`state ${s}`, STATE_BODY[s]] as const)];
+
+  it.each(bodies)('%s sets the whole arm or leaves the rest pose alone', (_, body) => {
+    for (const side of ['left', 'right']) {
+      const set = CHAIN.filter((b) => (body as Record<string, unknown>)[side + b] !== undefined);
+      expect([0, CHAIN.length], `${side}: ${set.join(', ')}`).toContain(set.length);
+    }
+  });
+
+  it('joy keeps the arms of the rest pose and only lifts the shoulders', () => {
+    expect(EMOTION_BODY.joy.leftUpperArm).toBeUndefined();
+    expect(EMOTION_BODY.joy.leftShoulder![2]).toBeGreaterThan(0);
+  });
+});

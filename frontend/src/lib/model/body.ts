@@ -195,6 +195,28 @@ export const IDLE_ACTIONS: Record<IdleAction, Timeline> = {
 const armsOf = (pose: RigPose): RigPose =>
   Object.fromEntries(Object.entries(pose).filter(([bone]) => /Shoulder|Arm|Hand|Thumb|Index|Middle|Ring|Little/.test(bone)));
 
+/**
+ * An arm moves as a whole: a body that sets the upper arm, forearm or hand
+ * of a side takes the rest of that arm and the fingers from the relaxed
+ * pose. Otherwise a forearm or a curled hand of the rest pose would hang on
+ * an arm it does not belong to.
+ */
+function whole(pose: RigPose): RigPose {
+  const out: RigPose = { ...pose };
+  for (const side of ['left', 'right'] as const) {
+    if (!['UpperArm', 'LowerArm', 'Hand'].some((b) => (pose as Record<string, unknown>)[side + b] !== undefined)) continue;
+    for (const [bone, angles] of Object.entries(REST_POSES.relaxed)) {
+      if (bone.startsWith(side) && !bone.endsWith('Shoulder') && (out as Record<string, unknown>)[bone] === undefined) {
+        (out as Record<string, unknown>)[bone] = angles;
+      }
+    }
+  }
+  return out;
+}
+
+const wholeAll = <K extends string>(bodies: Record<K, RigPose>): Record<K, RigPose> =>
+  Object.fromEntries(Object.entries<RigPose>(bodies).map(([k, v]) => [k, whole(v)])) as Record<K, RigPose>;
+
 /** Her right hand at her chin. */
 const chinHand: RigPose = mirror({
   leftUpperArm: [-30, -45, -72],
@@ -203,9 +225,10 @@ const chinHand: RigPose = mirror({
 });
 
 /** What her body adds to each emotion, over the rest pose. */
-export const EMOTION_BODY: Record<Emotion, RigPose> = {
+export const EMOTION_BODY: Record<Emotion, RigPose> = wholeAll<Emotion>({
   neutral: {},
-  joy: both({ leftShoulder: [0, 0, 6], leftUpperArm: [-8, 0, -68] }),
+  // Joy lifts the shoulders; the arms stay as the rest pose holds them.
+  joy: both({ leftShoulder: [0, 0, 4] }),
   sad: both({
     leftShoulder: [0, 0, -10],
     leftUpperArm: [-4, 0, -80],
@@ -218,20 +241,20 @@ export const EMOTION_BODY: Record<Emotion, RigPose> = {
     ...both({ leftUpperArm: [-15, 0, -55], leftLowerArm: [0, -40, 0] }),
     spine: [-4, 0, 0],
   },
-  sleepy: both({ leftShoulder: [0, 0, -6], leftUpperArm: [0, 0, -80] }),
+  sleepy: both({ leftShoulder: [0, 0, -6] }),
   worry: both({
     leftUpperArm: [-25, -50, -80],
     leftLowerArm: [0, -120, 0],
     leftHand: [0, 0, -10],
   }),
   wink: armsOf(REST_POSES.hip),
-};
+});
 
 export const BODY_STATES = ['thinking', 'working', 'confirm', 'listening'] as const;
 export type BodyState = (typeof BODY_STATES)[number];
 
 /** Her body while she is busy with something. */
-export const STATE_BODY: Record<BodyState, RigPose> = {
+export const STATE_BODY: Record<BodyState, RigPose> = wholeAll<BodyState>({
   thinking: { ...chinHand, head: [-6, -10, 6] },
   working: {
     ...both({
@@ -251,7 +274,7 @@ export const STATE_BODY: Record<BodyState, RigPose> = {
     spine: [6, 0, 0],
     head: [0, 0, 8],
   },
-};
+});
 
 /** Which state of the body goes with her state and a tool at work; none when she is free. */
 export function bodyState(state: string, working: boolean): BodyState | null {
