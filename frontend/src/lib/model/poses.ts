@@ -7,30 +7,35 @@ import { both, type RigPose } from './rig';
 export const REST_POSE_NAMES = ['relaxed', 'clasped', 'behind', 'hip', 'crossed'] as const;
 export type RestPose = (typeof REST_POSE_NAMES)[number];
 
-/** Fingers at ease: a little bent, the little finger the most. */
+/**
+ * Fingers at ease: a little bent, the little finger the most; the thumb lies
+ * along the index finger. Finger angles keep one meaning on every model
+ * (decision 0041): Z below zero curls to the palm, Y above zero turns towards
+ * the little finger.
+ */
 export const FINGERS_SOFT: RigPose = {
-  leftThumbMetacarpal: [0, -6, 4],
-  leftThumbProximal: [0, -10, -4],
-  leftThumbDistal: [0, -12, -6],
-  leftIndexProximal: [0, 2, -10],
-  leftIndexIntermediate: [0, 0, -14],
-  leftIndexDistal: [0, 0, -10],
-  leftMiddleProximal: [0, 0, -13],
-  leftMiddleIntermediate: [0, 0, -17],
-  leftMiddleDistal: [0, 0, -12],
-  leftRingProximal: [0, -2, -16],
-  leftRingIntermediate: [0, 0, -20],
-  leftRingDistal: [0, 0, -13],
-  leftLittleProximal: [0, -5, -19],
-  leftLittleIntermediate: [0, 0, -23],
-  leftLittleDistal: [0, 0, -15],
+  leftThumbMetacarpal: [0, 25, -10],
+  leftThumbProximal: [0, 10, -15],
+  leftThumbDistal: [0, 0, -15],
+  leftIndexProximal: [0, 2, -12],
+  leftIndexIntermediate: [0, 0, -18],
+  leftIndexDistal: [0, 0, -12],
+  leftMiddleProximal: [0, 0, -16],
+  leftMiddleIntermediate: [0, 0, -22],
+  leftMiddleDistal: [0, 0, -14],
+  leftRingProximal: [0, -2, -20],
+  leftRingIntermediate: [0, 0, -26],
+  leftRingDistal: [0, 0, -16],
+  leftLittleProximal: [0, -4, -24],
+  leftLittleIntermediate: [0, 0, -30],
+  leftLittleDistal: [0, 0, -18],
 };
 
 /** Fingers closed round something: the other hand, an arm. */
 export const FINGERS_CURL: RigPose = {
-  leftThumbMetacarpal: [0, -14, 6],
-  leftThumbProximal: [0, -18, -10],
-  leftThumbDistal: [0, -20, -12],
+  leftThumbMetacarpal: [0, 30, -20],
+  leftThumbProximal: [0, 10, -25],
+  leftThumbDistal: [0, 0, -25],
   leftIndexProximal: [0, 0, -42],
   leftIndexIntermediate: [0, 0, -50],
   leftIndexDistal: [0, 0, -30],

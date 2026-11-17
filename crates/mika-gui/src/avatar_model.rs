@@ -333,11 +333,16 @@ pub fn avatar_motion_rename(
 }
 
 #[tauri::command]
-pub fn avatar_motion_delete(app: AppHandle, id: String) -> Result<(), String> {
+pub fn avatar_motion_delete(app: AppHandle, ctx: CtxState<'_>, id: String) -> Result<(), String> {
     motions()
         .delete(&id)
         .map_err(|e| failed_motion("delete", &e))?;
     log::info!(target: "app", "avatar animation deleted: id={}", safe_id(&id));
+    // A deleted animation is no longer the one she loops at rest.
+    if ctx.config.lock().avatar.forget_motion(&id) {
+        ctx.save_config()?;
+        look_changed(&app);
+    }
     motions_changed(&app);
     Ok(())
 }

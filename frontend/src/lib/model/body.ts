@@ -380,9 +380,9 @@ const peaceHand: RigPose = mirror({
   leftLittleProximal: [0, 0, -70],
   leftLittleIntermediate: [0, 0, -80],
   leftLittleDistal: [0, 0, -40],
-  leftThumbMetacarpal: [0, 30, 10],
-  leftThumbProximal: [0, 30, 20],
-  leftThumbDistal: [0, 20, 20],
+  leftThumbMetacarpal: [0, 40, -35],
+  leftThumbProximal: [0, 10, -30],
+  leftThumbDistal: [0, 0, -30],
 });
 
 /** One beat of her dance: the hips to one side, the arms up on the other. */

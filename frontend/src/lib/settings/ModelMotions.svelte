@@ -71,11 +71,17 @@
     sure = '';
     run('avatar_motion_delete', { id });
   }
+
+  /** The animation she loops at rest; pressed again, the rest pose comes back. */
+  function setIdle(id: string) {
+    const idle_motion = model.look.idle_motion === id ? '' : id;
+    run('avatar_set_look', { look: { ...model.look, idle_motion } });
+  }
 </script>
 
 {#if model.id}
   <div class="lbl">{t('persona.motions')}</div>
-  <p class="lead">{t('persona.motions_lead')}</p>
+  <p class="lead">{t('persona.motions_lead')} {t('persona.motions_idle_lead')}</p>
   <div class="list">
     {#each motions as m (m.id)}
       <div class="row">
@@ -89,6 +95,15 @@
           onkeydown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
         />
         <span class="len">{t('persona.motion_seconds', { n: (m.ms / 1000).toFixed(1) })}</span>
+        <button
+          class="tg"
+          class:on={model.look.idle_motion === m.id}
+          aria-pressed={model.look.idle_motion === m.id}
+          title={t('persona.motion_idle_title')}
+          onclick={() => setIdle(m.id)}
+        >
+          {t('persona.motion_idle')}
+        </button>
         <button class="del" class:sure={sure === m.id} title={t('persona.motion_delete')} aria-label={t('persona.motion_delete')} onclick={() => remove(m.id)}>
           {sure === m.id ? t('persona.model_delete_confirm') : '×'}
         </button>
@@ -108,11 +123,11 @@
   .list {
     display: grid;
     gap: 6px;
-    max-width: 420px;
+    max-width: 520px;
   }
   .row {
     display: grid;
-    grid-template-columns: 30px minmax(0, 1fr) auto auto;
+    grid-template-columns: 30px minmax(0, 1fr) auto auto auto;
     align-items: center;
     gap: 8px;
   }
@@ -132,7 +147,8 @@
     outline: none;
     border-color: rgba(143, 125, 255, 0.6);
   }
-  button {
+  /* The toggle keeps the look of every toggle of the app. */
+  button:not(.tg) {
     all: unset;
     cursor: pointer;
     box-sizing: border-box;
@@ -140,8 +156,13 @@
     font-size: 12.5px;
     color: var(--mute);
   }
-  button:hover {
+  button:not(.tg):hover {
     color: #fff;
+  }
+  .tg {
+    height: 26px;
+    padding: 0 9px;
+    font-size: 11.5px;
   }
   .play {
     width: 30px;

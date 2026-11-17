@@ -150,6 +150,7 @@
       sentAt: live.sentAt,
       pose: model.look.pose,
       idleActions: model.look.idle_actions,
+      idleMotion: model.look.idle_motion || null,
       frame: desktop ? 'full' : model.look.frame,
       follow: model.look.follow_cursor,
       cursor: live.cursor,

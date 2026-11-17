@@ -521,6 +521,9 @@ pub struct AvatarConfig {
     pub follow_cursor: bool,
     /// A model does something now and then when nothing goes on.
     pub idle_actions: bool,
+    /// Id of the user's animation a model loops at rest (decision 0041);
+    /// empty: the rest pose.
+    pub idle_motion: String,
     /// Top-left corner of the desktop avatar window after the user moved it,
     /// physical pixels; none: the corner of the screen.
     pub position: Option<(i32, i32)>,
@@ -537,6 +540,7 @@ impl Default for AvatarConfig {
             frame: "full".into(),
             follow_cursor: true,
             idle_actions: true,
+            idle_motion: String::new(),
             position: None,
         }
     }
@@ -566,6 +570,9 @@ pub struct AvatarLook {
     pub frame: String,
     pub follow_cursor: bool,
     pub idle_actions: bool,
+    /// Empty: no animation at rest.
+    #[serde(default)]
+    pub idle_motion: String,
 }
 
 impl AvatarConfig {
@@ -583,7 +590,21 @@ impl AvatarConfig {
             frame: known(&self.frame, &AVATAR_FRAMES, "full"),
             follow_cursor: self.follow_cursor,
             idle_actions: self.idle_actions,
+            idle_motion: if crate::avatar::is_model_id(&self.idle_motion) {
+                self.idle_motion.clone()
+            } else {
+                String::new()
+            },
         }
+    }
+
+    /// The animation `id` is gone: it is no longer the one at rest. True when it was.
+    pub fn forget_motion(&mut self, id: &str) -> bool {
+        if self.idle_motion != id {
+            return false;
+        }
+        self.idle_motion.clear();
+        true
     }
 
     /// Takes a look from the page; an unknown name or a size out of bounds is put right.
@@ -593,10 +614,12 @@ impl AvatarConfig {
         self.frame = look.frame;
         self.follow_cursor = look.follow_cursor;
         self.idle_actions = look.idle_actions;
+        self.idle_motion = look.idle_motion;
         let fixed = self.look();
         self.pose = fixed.pose;
         self.scale = fixed.scale;
         self.frame = fixed.frame;
+        self.idle_motion = fixed.idle_motion;
     }
 }
 
@@ -1235,6 +1258,7 @@ model = \"\"
         assert_eq!(c.avatar.scale, 1.0);
         assert_eq!(c.avatar.frame, "full");
         assert!(c.avatar.follow_cursor && c.avatar.idle_actions);
+        assert_eq!(c.avatar.idle_motion, "");
         assert_eq!(c.avatar.position, None);
     }
 
@@ -1255,21 +1279,37 @@ model = \"\"
             frame: "feet".into(),
             follow_cursor: false,
             idle_actions: false,
+            idle_motion: "../motions".into(),
         });
         let look = avatar.look();
         assert_eq!(look.pose, "relaxed");
         assert_eq!(look.scale, 1.6);
         assert_eq!(look.frame, "full");
         assert!(!look.follow_cursor && !look.idle_actions);
+        assert_eq!(look.idle_motion, "");
         avatar.set_look(AvatarLook {
             pose: "auto".into(),
             scale: 0.8,
             frame: "close".into(),
             follow_cursor: true,
             idle_actions: true,
+            idle_motion: "0123456789abcdef".into(),
         });
         assert_eq!(avatar.look().pose, "auto");
         assert_eq!(avatar.look().frame, "close");
+        assert_eq!(avatar.look().idle_motion, "0123456789abcdef");
+    }
+
+    #[test]
+    fn a_deleted_animation_stops_being_the_idle_one() {
+        let mut avatar = AvatarConfig {
+            idle_motion: "0123456789abcdef".into(),
+            ..AvatarConfig::default()
+        };
+        assert!(!avatar.forget_motion("fedcba9876543210"));
+        assert_eq!(avatar.idle_motion, "0123456789abcdef");
+        assert!(avatar.forget_motion("0123456789abcdef"));
+        assert_eq!(avatar.idle_motion, "");
     }
 
     #[test]

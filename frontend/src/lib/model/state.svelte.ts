@@ -43,6 +43,8 @@ export interface Look {
   frame: 'full' | 'waist' | 'close';
   follow_cursor: boolean;
   idle_actions: boolean;
+  /** The user's animation she loops at rest; empty: the rest pose. */
+  idle_motion: string;
 }
 
 export const DEFAULT_LOOK: Look = {
@@ -51,6 +53,7 @@ export const DEFAULT_LOOK: Look = {
   frame: 'full',
   follow_cursor: true,
   idle_actions: true,
+  idle_motion: '',
 };
 let look = $state<Look>({ ...DEFAULT_LOOK });
 

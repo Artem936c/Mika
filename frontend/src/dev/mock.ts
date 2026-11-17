@@ -643,7 +643,7 @@ export async function install(scenario: string) {
   const avatarStills = new Map<string, { name: string; png_base64: string }[]>();
   let activeModel = hasModel ? MOCK_MODEL_ID : '';
   const modelChanged = () => emit('mika://ui', { action: 'avatar_model_changed' });
-  let look = { pose: params.get('pose') ?? 'relaxed', scale: 1, frame: params.get('frame') ?? 'full', follow_cursor: true, idle_actions: true };
+  let look = { pose: params.get('pose') ?? 'relaxed', scale: 1, frame: params.get('frame') ?? 'full', follow_cursor: true, idle_actions: true, idle_motion: '' };
   // `&window` starts the preview as an ordinary window.
   let windowed = params.has('window');
   const ffmpeg = {

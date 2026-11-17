@@ -37,6 +37,8 @@ import {
   type Profile,
   type Vowel,
 } from './layers';
+import { fingerAxes, fingerTurn, palmOf, type FingerAxes, type Vec } from './fingers';
+import { motionOf, toRig, type Quat } from './idle';
 import { smoothOpen } from './lips';
 import {
   BODY_TAU_MS,
@@ -97,6 +99,8 @@ export interface SceneInput {
   pose?: string;
   /** Idle actions now and then. */
   idleActions?: boolean;
+  /** The user's animation she loops at rest instead of the rest pose. */
+  idleMotion?: string | null;
   /** What part of her the view shows. */
   frame?: 'full' | 'waist' | 'close';
   /** She looks at the cursor. */
@@ -140,6 +144,10 @@ export interface Scene {
 }
 
 const rad = (deg: number) => (deg * Math.PI) / 180;
+/** The fingers of the relaxed pose: they stay at ease under an idle animation. */
+const FINGERS_AT_EASE: RigPose = Object.fromEntries(
+  Object.entries(REST_POSES.relaxed).filter(([bone]) => /Thumb|Index|Middle|Ring|Little/.test(bone)),
+);
 /** Vertical field of view of the camera, degrees: narrow, so the figure is not distorted. */
 const FOV = 20;
 /** The emotion reaches 95% of its weight in `EMOTION_BLEND_MS`. */
@@ -182,6 +190,8 @@ class LiveScene implements Scene {
   // Bones of the normalized rig: every one of them rests at zero rotation.
   private readonly bones: Partial<Record<RigBone, THREE.Object3D>> = {};
   private readonly euler = new THREE.Euler();
+  /** Axes of every finger joint of this model, in the space of the joint (decision 0041). */
+  private readonly fingers = new Map<RigBone, { axes: FingerAxes; side: 'left' | 'right' }>();
   /** A rest pose set by hand in the preview; null: the one of the settings. */
   private restOverride: RigPose | null = null;
   /** The body as it is now, on its way to the pose it is asked for. */
@@ -236,6 +246,14 @@ class LiveScene implements Scene {
     nodes: THREE.Object3D[];
   } | null = null;
   private readonly held = new THREE.Quaternion();
+  /** The animation she loops at rest (decision 0041): asked for, and loaded. */
+  private idleWant: string | null = null;
+  private idle: {
+    ms: number;
+    tracks: [RigBone, THREE.Interpolant][];
+    /** Its first frame: stands for the rest pose; the rest of it is added as motion. */
+    first: RigPose;
+  } | null = null;
   /** The point to read the opacity of after the next frame, and what was read. */
   private readonly prober = new Probe();
   private readonly pixel = new Uint8Array(4);
@@ -288,6 +306,7 @@ class LiveScene implements Scene {
     this.hipsRest = this.bones.hips?.position.y ?? 0;
     this.hipsRestX = this.bones.hips?.position.x ?? 0;
     this.hipsRestZ = this.bones.hips?.position.z ?? 0;
+    this.measureFingers();
     this.applyRig(this.body);
     this.measure();
     const now = performance.now();
@@ -297,10 +316,69 @@ class LiveScene implements Scene {
     this.autoAt = now + autoPosePause(Math.random());
   }
 
+  /**
+   * The axes of every finger joint, from where the joints stand in the
+   * T-pose (decision 0041). The rig is at rest now, so the world turn of a
+   * joint is the turn of its parent: an axis in the world becomes an axis
+   * of the joint through it.
+   */
+  private measureFingers() {
+    this.vrm.scene.updateMatrixWorld(true);
+    const at = (bone: RigBone): Vec | null => {
+      const node = this.bones[bone];
+      if (!node) return null;
+      node.getWorldPosition(this.at);
+      return [this.at.x, this.at.y, this.at.z];
+    };
+    const q = new THREE.Quaternion();
+    const axis = new THREE.Vector3();
+    const local = (node: THREE.Object3D, v: Vec): Vec => {
+      node.getWorldQuaternion(q).invert();
+      axis.set(v[0], v[1], v[2]).applyQuaternion(q);
+      return [axis.x, axis.y, axis.z];
+    };
+    for (const side of ['left', 'right'] as const) {
+      const hand = at(`${side}Hand`);
+      const index = at(`${side}IndexProximal`);
+      const little = at(`${side}LittleProximal`);
+      if (!hand || !index || !little) continue;
+      const palm = palmOf(hand, index, little, [0, -1, 0]);
+      for (const chain of [
+        ['ThumbMetacarpal', 'ThumbProximal', 'ThumbDistal'],
+        ['IndexProximal', 'IndexIntermediate', 'IndexDistal'],
+        ['MiddleProximal', 'MiddleIntermediate', 'MiddleDistal'],
+        ['RingProximal', 'RingIntermediate', 'RingDistal'],
+        ['LittleProximal', 'LittleIntermediate', 'LittleDistal'],
+      ]) {
+        const bones = chain.map((b) => `${side}${b}` as RigBone);
+        const points = bones.map(at);
+        points.forEach((joint, i) => {
+          const node = this.bones[bones[i]];
+          if (!joint || !node) return;
+          // The last joint goes on the way the one before it went.
+          const prev = points[i - 1];
+          const next = points[i + 1] ?? (prev ? ([2 * joint[0] - prev[0], 2 * joint[1] - prev[1], 2 * joint[2] - prev[2]] as Vec) : null);
+          if (!next) return;
+          const world = fingerAxes(joint, next, palm);
+          this.fingers.set(bones[i], {
+            axes: { flex: local(node, world.flex), spread: local(node, world.spread), twist: local(node, world.twist) },
+            side,
+          });
+        });
+      }
+    }
+  }
+
   /** Turns every bone of the rig to `pose`; a bone it leaves out goes back to rest. */
   private applyRig(pose: RigPose) {
     const signed = withSign(pose, this.sign);
     for (const [bone, node] of Object.entries(this.bones) as [RigBone, THREE.Object3D][]) {
+      const finger = this.fingers.get(bone);
+      if (finger) {
+        const [x, y, z, w] = fingerTurn(finger.axes, pose[bone] ?? [0, 0, 0], finger.side);
+        node.quaternion.set(x, y, z, w);
+        continue;
+      }
       const [x, y, z] = signed[bone] ?? [0, 0, 0];
       this.euler.set(rad(x), rad(y), rad(z), 'XYZ');
       node.quaternion.setFromEuler(this.euler);
@@ -313,9 +391,48 @@ class LiveScene implements Scene {
     if (pose) this.body = { ...ZERO_TRUNK, ...pose };
   }
 
+  /** Loads the animation she loops at rest when another one is asked for; a file that fails leaves the rest pose. */
+  private wantIdle() {
+    const want = this.input.idleMotion || null;
+    if (want === this.idleWant) return;
+    this.idleWant = want;
+    this.idle = null;
+    if (!want) return;
+    this.loadClip(want)
+      .then((clip) => {
+        if (this.idleWant !== want) return;
+        const byName = new Map<string, RigBone>();
+        for (const [bone, node] of Object.entries(this.bones) as [RigBone, THREE.Object3D][]) byName.set(node.name, bone);
+        const tracks: [RigBone, THREE.Interpolant][] = [];
+        for (const track of clip.tracks) {
+          if (!track.name.endsWith('.quaternion')) continue;
+          const bone = byName.get(track.name.slice(0, -'.quaternion'.length));
+          if (bone) tracks.push([bone, new THREE.QuaternionLinearInterpolant(track.times, track.values, 4, new Float32Array(4))]);
+        }
+        const ms = clip.duration * 1000;
+        if (!tracks.length || !(ms > 0)) return;
+        this.idle = { ms, tracks, first: this.idleAt(0, ms, tracks) };
+      })
+      .catch(() => {
+        // An animation that does not load is not looped; the rest pose stays.
+      });
+  }
+
+  /** The idle animation of `length` ms at `ms` from its start, as a pose. */
+  private idleAt(ms: number, length: number, tracks: [RigBone, THREE.Interpolant][]): RigPose {
+    const t = (((ms % length) + length) % length) / 1000;
+    const frame: [RigBone, Quat][] = tracks.map(([bone, interpolant]) => {
+      const v = interpolant.evaluate(t);
+      return [bone, [v[0], v[1], v[2], v[3]]];
+    });
+    return toRig(frame, this.sign);
+  }
+
   /** The rest pose she stands in now. */
   private restNow(now: number): RigPose {
     if (this.restOverride) return this.restOverride;
+    // An idle animation stands for the rest pose; the fingers stay at ease.
+    if (this.idle) return { ...FINGERS_AT_EASE, ...this.idle.first };
     const name = this.input.pose ?? 'relaxed';
     if (name !== 'auto') return restPoseOf(name);
     if (now >= this.autoAt) {
@@ -329,12 +446,14 @@ class LiveScene implements Scene {
   private bodyNow(now: number, dt: number): RigPose {
     const { emotion, still, talking } = this.input;
     const state = bodyState(this.input.state ?? 'idle', this.input.working ?? false);
+    this.wantIdle();
     let target = mix({ ...ZERO_TRUNK, ...this.restNow(now) }, EMOTION_BODY[emotion], 1);
     if (state) target = mix(target, STATE_BODY[state], 1);
     this.body = mix(this.body, target, 1 - Math.exp(-dt / BODY_TAU_MS));
     let pose = this.body;
     if (still) return pose;
-    pose = add(pose, idleOffset(now, this.seed), 1);
+    // The idle animation moves on its own; without it, the slow life of the layers.
+    pose = this.idle && !this.restOverride ? add(pose, motionOf(this.idleAt(now, this.idle.ms, this.idle.tracks), this.idle.first), 1) : add(pose, idleOffset(now, this.seed), 1);
     // Thinking, her finger taps her chin.
     if (state === 'thinking') pose = add(pose, { rightIndexProximal: [0, 0, 16 * Math.max(0, Math.sin(now / 90))] }, 1);
 
