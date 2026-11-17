@@ -143,6 +143,22 @@ npm --prefix frontend run check
 - Модель Live2D: нужны лицензия Cubism SDK и сама модель.
 - Подпись установщика сертификатом.
 
+## Ещё от автора
+
+<table>
+  <tr>
+    <td width="120" align="center">
+      <a href="https://bloodsurf.ru"><img src="docs/images/bloodsurf.png" width="96" alt="Blood Surface"></a>
+    </td>
+    <td>
+      <b>Blood Surface</b> — VPN от автора Мики.<br>
+      Подключить или продлить можно в Telegram-боте или на сайте.<br><br>
+      <a href="https://bloodsurf.ru"><img alt="Сайт bloodsurf.ru" src="https://img.shields.io/badge/%D1%81%D0%B0%D0%B9%D1%82-bloodsurf.ru-8C49F6?style=for-the-badge"></a>
+      <a href="https://t.me/bloodvpn_bot"><img alt="Telegram @bloodvpn_bot" src="https://img.shields.io/badge/Telegram-@bloodvpn__bot-8C49F6?style=for-the-badge&logo=telegram&logoColor=white"></a>
+    </td>
+  </tr>
+</table>
+
 ## Лицензия
 
 [MIT](LICENSE). Персонаж оригинальный. Картинки аватара сгенерированы моделью FLUX.2 klein по текстовому описанию.
