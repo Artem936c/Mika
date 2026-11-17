@@ -1292,7 +1292,10 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
                 streamed = false;
             }
             Event::ConfirmRequested { assessment, .. } => {
-                say(&format!("Нужно подтверждение. {}.", assessment.summary));
+                say(&format!(
+                    "Нужно подтверждение. {}.",
+                    assessment.spoken_name()
+                ));
             }
             Event::ReminderFired {
                 text,
@@ -1461,6 +1464,19 @@ mod tests {
                     allow_always: false,
                     timeout_s: 60,
                 },
+                Event::ConfirmRequested {
+                    id: 2,
+                    tool: "run_command".into(),
+                    assessment: Assessment::new(
+                        RiskLevel::High,
+                        "Выполнить команду PowerShell",
+                        "x",
+                        "y",
+                    )
+                    .with_spoken("Выполнить команду"),
+                    allow_always: false,
+                    timeout_s: 60,
+                },
                 Event::ReminderFired {
                     id: 1,
                     text: "чайник".into(),
@@ -1482,6 +1498,7 @@ mod tests {
             vec![
                 "Сначала ответь на вопрос.",
                 "Нужно подтверждение. Выключить компьютер.",
+                "Нужно подтверждение. Выполнить команду.",
                 "Напоминаю: чайник"
             ]
         );

@@ -85,7 +85,8 @@ impl Tool for RunShellTool {
             command,
             risk.reasons.join("; "),
         )
-        .with_scope(risk.normalized))
+        .with_scope(risk.normalized)
+        .with_spoken("Выполнить команду"))
     }
 
     async fn run(
@@ -150,6 +151,11 @@ mod tests {
             .assess(&json!({"shell": "cmd", "command": "del /s /q C:\\x"}))
             .unwrap();
         assert_eq!(bad.level, RiskLevel::High);
+        // The card names the shell; aloud it is just «a command».
+        assert_eq!(read.summary, "Выполнить команду PowerShell");
+        assert_eq!(bad.summary, "Выполнить команду cmd");
+        assert_eq!(read.spoken_name(), "Выполнить команду");
+        assert_eq!(bad.spoken_name(), "Выполнить команду");
         assert!(t
             .assess(&json!({"shell": "bash", "command": "ls"}))
             .is_err());

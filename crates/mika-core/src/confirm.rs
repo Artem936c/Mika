@@ -700,10 +700,11 @@ pub fn voice_answer(text: &str, assessment: &Assessment) -> VoiceAnswer {
     }
     if assessment.level == crate::tools::RiskLevel::High {
         let question = text.contains(['?', '？']);
-        return if !question && says_name(&t, &assessment.summary) {
+        let name = assessment.spoken_name();
+        return if !question && says_name(&t, name) {
             VoiceAnswer::Answer(Answer::Once)
         } else {
-            VoiceAnswer::NeedName(assessment.summary.clone())
+            VoiceAnswer::NeedName(name.to_string())
         };
     }
     match parse_answer(text) {
@@ -758,6 +759,26 @@ mod tests {
         assert_eq!(
             voice_answer("Да, выключить компьютер.", &a),
             VoiceAnswer::Answer(Answer::Once)
+        );
+    }
+
+    #[test]
+    fn voice_uses_the_spoken_name_when_the_action_has_one() {
+        let a =
+            risk(RiskLevel::High, "Выполнить команду PowerShell").with_spoken("Выполнить команду");
+        assert_eq!(a.spoken_name(), "Выполнить команду");
+        assert_eq!(
+            voice_answer("Да", &a),
+            VoiceAnswer::NeedName("Выполнить команду".into())
+        );
+        assert_eq!(
+            voice_answer("Выполни команду", &a),
+            VoiceAnswer::Answer(Answer::Once)
+        );
+        // Without a spoken name it is the summary.
+        assert_eq!(
+            risk(RiskLevel::High, "Выключить компьютер").spoken_name(),
+            "Выключить компьютер"
         );
     }
 

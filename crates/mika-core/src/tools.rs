@@ -44,6 +44,10 @@ pub struct Assessment {
     pub reason: String,
     /// Key for permanent rules: `*`, a normalized command, an app name, a host.
     pub scope: String,
+    /// The action's name aloud, when it differs from `summary`: the voice
+    /// asks with it, and a high-risk action is approved by saying it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spoken: Option<String>,
 }
 
 impl Assessment {
@@ -59,12 +63,23 @@ impl Assessment {
             target: target.into(),
             reason: reason.into(),
             scope: "*".into(),
+            spoken: None,
         }
     }
 
     pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
         self.scope = scope.into();
         self
+    }
+
+    pub fn with_spoken(mut self, spoken: impl Into<String>) -> Self {
+        self.spoken = Some(spoken.into());
+        self
+    }
+
+    /// The action's name aloud: `spoken` or else `summary`.
+    pub fn spoken_name(&self) -> &str {
+        self.spoken.as_deref().unwrap_or(&self.summary)
     }
 
     /// Raises the level, never lowers it.
