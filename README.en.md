@@ -38,8 +38,18 @@ The interface is in Russian and English: pick the language on the first-run scre
   - Speech with a Windows voice or a provider's voice, input from the microphone.
   - The wake phrase "Mika" is recognized on this computer.
   - Actions can be confirmed by voice.
+  - "Stop" (in Russian: «стоп», «хватит», «остановись») stops everything at any moment: the reply, the task, actions in windows, background jobs. After that Mika starts nothing on her own until you call her.
+- **Settings by conversation.** "Speak quieter", "change the voice", "turn off dictation", "what are your settings?". The microphone, the screen, Telegram and other sensitive features turn on only with a confirmation. The microphone and the screen cannot be turned on from Telegram.
+- **Skills.** After a successful chain of actions Mika offers to save it as a skill, then repeats it by name, with parameters. Every step of a skill goes through the risk policy again.
 - **Extensions**: MCP servers (a program or HTTP), your own commands, control from Telegram.
 - **Avatar.** An original character with ten emotions. She blinks, looks around, talks and reacts to clicks. The core picks her emotion from her state and from tags in the model's reply.
+- **Your own 3D model.** Add a `.vrm` file on the Character page and Mika comes alive in it:
+  - she breathes, blinks, shifts her weight and stands in one of five poses;
+  - her lips move with her voice and her body answers her emotions;
+  - she looks at the cursor and the input field and reacts to clicks on her head, hands and body;
+  - she plays your `.vrma` animations and gestures on request.
+
+  On the desktop you drag the model with the mouse and resize it with the wheel.
 
 <table>
   <tr>
@@ -58,7 +68,7 @@ The interface is in Russian and English: pick the language on the first-run scre
 
 ## Safety
 
-- **Risk policy.** Every tool is registered with a risk level and runs only through the policy. Without a saved rule Mika asks first. High-risk actions can never be allowed forever.
+- **Risk policy.** Every tool is registered with a risk level and runs only through the policy. Without a saved rule Mika asks first. High-risk actions can never be allowed forever. Commands that only look at system information can be allowed with one rule; reading files, the clipboard and anything with passwords or keys still asks.
 - **Blind zone.** Windows and pages with passwords, sign-in, banking and payment are never read or controlled: the tool checks this before any action.
 - **Keys** for providers live in the Windows Credential Manager and never reach the settings file, the log or error texts.
 - **Off by default.** Internet tools, screen viewing and the microphone stay off until you turn them on.
@@ -146,7 +156,8 @@ Release notes (in Russian) are in [docs/releases](docs/releases/).
 
 ## Not there yet
 
-- A Live2D model: it needs a Cubism SDK license and the model itself.
+- A built-in 3D model: without your own `.vrm` file the avatar is drawn with pictures.
+- Live2D models: they need a Cubism SDK license.
 - A signed installer.
 
 ## More from the author
