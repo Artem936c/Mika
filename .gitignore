@@ -10,11 +10,18 @@ frontend/dist/
 
 # Tauri
 crates/mika-gui/gen/
-spikes/*/gen/
 
 # Local tooling
 .superpowers/
-.claude/settings.local.json
+.claude/
+
+# Development notes: kept locally, not published
+CLAUDE.md
+HANDOFF.md
+docs/superpowers/
+docs/decisions/
+docs/design/
+spikes/
 
 # OS and editors
 Thumbs.db
