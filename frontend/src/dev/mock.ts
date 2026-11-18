@@ -1099,6 +1099,7 @@ export async function install(scenario: string) {
         case 'check_update':
           return params.has('update') ? { version: '0.3.0', notes: '' } : null;
         case 'set_wake':
+        case 'set_wake_engine':
           return 'on';
         case 'set_window_mode':
           windowed = a.windowed === true;
@@ -1416,6 +1417,19 @@ export async function install(scenario: string) {
             vosk_installed: params.has('vosk'),
             vosk_downloading: false,
             vosk_bytes: 141_000_000,
+            sherpa_installed: params.has('sherpa'),
+            sherpa_downloading: false,
+            sherpa_bytes: 52_000_000,
+            wake_engine: params.get('wake') ?? 'auto',
+            // As `WakeEngineChoice::resolve`: the choice, or Windows without its files.
+            wake_engine_used: ((choice: string, sherpa: boolean, vosk: boolean) =>
+              choice === 'auto'
+                ? sherpa ? 'sherpa' : vosk ? 'vosk' : 'windows'
+                : (choice === 'sherpa' && sherpa) || (choice === 'vosk' && vosk) ? choice : 'windows')(
+              params.get('wake') ?? 'auto',
+              params.has('sherpa'),
+              params.has('vosk'),
+            ),
             follow_up: true,
             duck_media: true,
             tts_style: '',

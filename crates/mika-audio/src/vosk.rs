@@ -114,7 +114,7 @@ impl VoskLib {
 
 /// Path as the narrow string Kaldi opens files with: the short 8.3 form when
 /// the path has letters outside ASCII, as in a Cyrillic user name.
-fn narrow_path(path: &Path) -> Result<CString, String> {
+pub(crate) fn narrow_path(path: &Path) -> Result<CString, String> {
     let text = path.to_string_lossy().into_owned();
     let text = if text.is_ascii() {
         text

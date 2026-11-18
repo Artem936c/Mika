@@ -54,6 +54,15 @@ pub fn vosk_dir() -> PathBuf {
     }
 }
 
+/// sherpa-onnx for the wake phrase (decision 0048): `lib` with the
+/// libraries, `model` with the model. Machine-local, next to the logs.
+pub fn sherpa_dir() -> PathBuf {
+    match logs_dir().parent() {
+        Some(parent) => parent.join("sherpa"),
+        None => data_dir().join("sherpa"),
+    }
+}
+
 /// FFmpeg that Mika downloaded with the user's consent: `ffmpeg.exe`,
 /// `ffprobe.exe` and `LICENSE.txt`, flat. Machine-local, next to the logs.
 pub fn ffmpeg_dir() -> PathBuf {

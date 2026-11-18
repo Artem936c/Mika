@@ -211,7 +211,7 @@ pub fn is_stop_phrase(text: &str) -> bool {
     let text = text.to_lowercase();
     let word =
         text.trim_matches(|c: char| c.is_whitespace() || matches!(c, '.' | '!' | '?' | '…' | ','));
-    matches!(word, "стоп" | "остановись" | "хватит" | "stop")
+    word == "stop" || mika_core::pause::only_stop_words(&text)
 }
 
 /// Whether a file path Telegram gave is safe to put into the download
@@ -1779,6 +1779,8 @@ mod tests {
             "стоп,",
             "stop",
             "Stop.",
+            "Стой",
+            "Перестань слушать",
         ] {
             assert!(is_stop_phrase(stop), "{stop}");
         }

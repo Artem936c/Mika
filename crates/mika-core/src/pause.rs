@@ -15,6 +15,82 @@ pub const REMARK_STOP: &str = "stop";
 /// `Event::Remark` kind: the line saying what the pause skipped.
 pub const REMARK_PAUSE: &str = "pause";
 
+/// Words that stop her (decisions 0045 and 0048). One list for the wake
+/// phrase listener, the voice dialog and Telegram.
+pub const STOP_WORDS: &[&str] = &[
+    "стоп",
+    "стой",
+    "хватит",
+    "замолчи",
+    "помолчи",
+    "тихо",
+    "достаточно",
+    "остановись",
+    "останови",
+    "перестань",
+    "отмена",
+    "отбой",
+];
+
+/// Words a stop phrase may hold besides the stop words: «перестань
+/// слушать», «стоп, пожалуйста».
+pub const STOP_TAIL: &[&str] = &[
+    "слушать",
+    "слушай",
+    "говорить",
+    "пожалуйста",
+    "уже",
+    "всё",
+    "все",
+    "не",
+];
+
+/// Words of a recognised phrase, lower case, without punctuation and
+/// without the `[unk]` of Vosk.
+pub fn phrase_words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && *w != "unk")
+        .map(str::to_lowercase)
+}
+
+/// True when the phrase is a stop and nothing else: stop words, maybe with
+/// a word of `STOP_TAIL`. «Не слушай» alone is not a stop.
+pub fn only_stop_words(text: &str) -> bool {
+    let mut any = false;
+    for w in phrase_words(text) {
+        if STOP_WORDS.contains(&w.as_str()) {
+            any = true;
+        } else if !STOP_TAIL.contains(&w.as_str()) {
+            return false;
+        }
+    }
+    any
+}
+
+/// The first stop word of the phrase, as a whole word.
+pub fn stop_word(text: &str) -> Option<&'static str> {
+    phrase_words(text).find_map(|w| STOP_WORDS.iter().find(|s| **s == w).copied())
+}
+
+/// While a phrase is still being heard: it may yet turn out to be a stop
+/// and nothing else. Its last word may be cut, «перестань слу».
+pub fn may_be_stop_phrase(text: &str) -> bool {
+    let words: Vec<String> = phrase_words(text).collect();
+    let Some((last, before)) = words.split_last() else {
+        return false;
+    };
+    let whole = |w: &String| STOP_WORDS.contains(&w.as_str()) || STOP_TAIL.contains(&w.as_str());
+    let started = |w: &String| {
+        STOP_WORDS
+            .iter()
+            .chain(STOP_TAIL)
+            .any(|s| s.starts_with(w.as_str()))
+    };
+    before.iter().all(whole)
+        && (whole(last) || started(last))
+        && words.iter().any(|w| STOP_WORDS.contains(&w.as_str()))
+}
+
 /// What she is busy with when a stop word is heard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Busy {
@@ -299,6 +375,47 @@ impl Pause {
 mod tests {
     use super::*;
     use AssistantState::*;
+
+    #[test]
+    fn a_stop_phrase_is_stop_words_and_maybe_a_tail() {
+        for stop in [
+            "стоп",
+            "Стой.",
+            "Хватит, хватит!",
+            "[unk] остановись",
+            "Останови",
+            "Перестань слушать",
+            "Стоп, пожалуйста",
+            "Всё, хватит",
+            "отбой",
+        ] {
+            assert!(only_stop_words(stop), "{stop}");
+        }
+        for other in [
+            "",
+            "[unk]",
+            "стопка книг",
+            "сколько хватит бензина",
+            "останови машину у магазина",
+            "не слушай",
+            "тихий вечер",
+        ] {
+            assert!(!only_stop_words(other), "{other}");
+        }
+        assert_eq!(stop_word("Стоп."), Some("стоп"));
+        assert_eq!(stop_word("а теперь тихо"), Some("тихо"));
+        assert_eq!(stop_word("стопка"), None);
+    }
+
+    #[test]
+    fn a_phrase_being_heard_may_still_become_a_stop() {
+        assert!(may_be_stop_phrase("перестань слу"));
+        assert!(may_be_stop_phrase("стоп"));
+        assert!(may_be_stop_phrase("стоп пожа"));
+        assert!(!may_be_stop_phrase("останови машину"));
+        assert!(!may_be_stop_phrase("слу"));
+        assert!(!may_be_stop_phrase(""));
+    }
 
     fn busy(state: AssistantState) -> Busy {
         Busy {

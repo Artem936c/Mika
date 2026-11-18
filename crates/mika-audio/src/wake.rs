@@ -1,10 +1,11 @@
-//! Wake phrase: a recognizer on this computer listens for a short list of
-//! phrases; no sound leaves it.
+//! Wake phrase: a recognizer on this computer listens for the name and the
+//! stop words; no sound leaves it.
 //!
-//! Vosk with a small Russian model is the main engine: it was trained on
-//! thousands of voices, so it hears anyone without training. It recognizes
-//! all speech with its whole vocabulary, and the name wakes her only as a
-//! whole word: «микрофон» and «Михаил» stay themselves. When its files are not
+//! The user picks the engine (decision 0048). sherpa-onnx with a small
+//! streaming Russian model hears the name and the stop words as hot words.
+//! Vosk with a small Russian model recognizes all speech with its whole
+//! vocabulary. Both hear anyone without training, and the name wakes her only
+//! as a whole word: «микрофон» and «Михаил» stay themselves. When neither is
 //! downloaded, the speech recognizer built into Windows listens for a list of
 //! phrases instead; it needs the Windows speech pack for the language.
 
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::mic::{resample, SystemMicrophone, TARGET_RATE};
+use crate::sherpa::SherpaLib;
 use crate::vosk::{Heard, Model, Recognizer, VoskLib};
 
 /// Called with the phrase that was heard.
@@ -47,6 +49,8 @@ pub fn is_echo(name: &str, speaking: &str) -> bool {
 /// Who listens for the name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WakeEngine {
+    /// sherpa-onnx from the downloaded folders (decision 0048).
+    Sherpa { library: PathBuf, model: PathBuf },
     /// Vosk from the downloaded folders.
     Vosk { library: PathBuf, model: PathBuf },
     /// The speech recognizer of Windows, for this language (`ru-RU`).
@@ -61,16 +65,11 @@ pub fn has_name(heard: &str, name: &str) -> bool {
     !name.is_empty() && heard.windows(name.len()).any(|w| w == name.as_slice())
 }
 
-/// Words that stop her: a full stop while she is busy (decision 0045).
-pub const STOP_WORDS: &[&str] = &[
-    "стоп",
-    "хватит",
-    "замолчи",
-    "помолчи",
-    "тихо",
-    "достаточно",
-    "остановись",
-];
+/// Words that stop her, one list for the whole app (decisions 0045, 0048).
+pub use mika_core::pause::{only_stop_words, stop_word, STOP_WORDS};
+
+/// Stop phrases of more than one word the Windows recognizer listens for.
+const STOP_PHRASES: [&str; 2] = ["перестань слушать", "перестань говорить"];
 
 /// The phrases the Windows recognizer listens for: the ways to say the name
 /// and the stop words (decision 0045). Empty without a name.
@@ -79,7 +78,7 @@ pub fn grammar_phrases(name: &str) -> Vec<String> {
     if phrases.is_empty() {
         return phrases;
     }
-    for word in STOP_WORDS {
+    for word in STOP_WORDS.iter().chain(STOP_PHRASES.iter()) {
         if !phrases.iter().any(|p| p == word) {
             phrases.push(word.to_string());
         }
@@ -87,25 +86,17 @@ pub fn grammar_phrases(name: &str) -> Vec<String> {
     phrases
 }
 
-/// Words of what the recognizer heard, lower case, without punctuation and
-/// without the `[unk]` of Vosk.
-fn heard_words(heard: &str) -> impl Iterator<Item = String> + '_ {
-    heard
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty() && *w != "unk")
-        .map(str::to_lowercase)
-}
-
-/// True when the phrase has stop words and nothing else.
-pub fn only_stop_words(heard: &str) -> bool {
-    let mut any = false;
-    for word in heard_words(heard) {
-        if !STOP_WORDS.contains(&word.as_str()) {
-            return false;
-        }
-        any = true;
+/// The hot words of sherpa-onnx: the name and the stop phrases. The decoder
+/// leans towards them, so they are heard in noise (decision 0048).
+pub fn hotwords(name: &str) -> Vec<String> {
+    let name = name.trim().to_lowercase();
+    if name.is_empty() {
+        return Vec::new();
     }
-    any
+    let mut words = vec![name];
+    words.extend(STOP_WORDS.iter().map(|w| w.to_string()));
+    words.extend(STOP_PHRASES.iter().map(|w| w.to_string()));
+    words
 }
 
 /// What a heard phrase asks for.
@@ -115,11 +106,6 @@ pub enum HeardKind {
     Name,
     /// A stop word without the name: stop everything.
     Stop,
-}
-
-/// The stop word in the phrase, as a whole word.
-pub fn stop_word(heard: &str) -> Option<&'static str> {
-    heard_words(heard).find_map(|w| STOP_WORDS.iter().find(|s| **s == w).copied())
 }
 
 /// The name wins over a stop word: «Мика, стоп» is a call.
@@ -141,6 +127,63 @@ pub fn woke(heard: &Heard, name: &str) -> Option<String> {
         Heard::Partial(t) | Heard::Final { text: t, .. } => t,
     };
     heard_kind(text, name).map(|_| text.clone())
+}
+
+/// Sound blocks a phrase of stop words alone waits before it counts: the
+/// start of «стопка» or «останови машину» is heard as a stop, and sherpa
+/// keeps such a piece for up to 0.6 s (decision 0048).
+pub const STOP_GATE_BLOCKS: u64 = 8;
+
+/// Decides, block by block, when the words heard so far wake or stop her.
+/// The name counts at once. A phrase that may still be a stop and nothing
+/// else waits for its end or for `STOP_GATE_BLOCKS`; a stop word inside a
+/// longer phrase counts at once, and the app decides what it means.
+#[derive(Debug, Default)]
+pub struct Spotter {
+    name: String,
+    /// The block the waiting stop phrase was first heard at, and its words.
+    pending: Option<(u64, String)>,
+}
+
+impl Spotter {
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.trim().to_lowercase(),
+            pending: None,
+        }
+    }
+
+    /// `text`: the words of the phrase so far at sound block `block`;
+    /// `ended`: a pause has just ended the phrase. Returns the phrase that
+    /// counts; the caller then forgets the phrase and waits a cooldown.
+    pub fn hear(&mut self, block: u64, text: &str, ended: bool) -> Option<String> {
+        match heard_kind(text, &self.name) {
+            Some(HeardKind::Name) => {
+                self.pending = None;
+                Some(text.to_string())
+            }
+            Some(HeardKind::Stop) if !ended && mika_core::pause::may_be_stop_phrase(text) => {
+                let since = self.pending.get_or_insert((block, String::new())).0;
+                if block.saturating_sub(since) >= STOP_GATE_BLOCKS {
+                    self.pending = None;
+                    Some(text.to_string())
+                } else {
+                    self.pending = Some((since, text.to_string()));
+                    None
+                }
+            }
+            Some(HeardKind::Stop) => {
+                self.pending = None;
+                Some(text.to_string())
+            }
+            None => match self.pending.take() {
+                // The phrase ended or was dropped: what waited was whole.
+                Some((_, last)) if text.trim().is_empty() || ended => Some(last),
+                // Other words came: «стоп…» was «стопка».
+                _ => None,
+            },
+        }
+    }
 }
 
 /// Stops listening when dropped.
@@ -192,6 +235,7 @@ pub fn start_wake(setup: WakeSetup) -> WakeHandle {
                 &flag,
             ),
             WakeEngine::Vosk { library, model } => vosk_loop(library, model, &setup, &flag),
+            WakeEngine::Sherpa { library, model } => sherpa_loop(library, model, &setup, &flag),
         })
         .expect("spawn wake phrase thread");
     WakeHandle {
@@ -236,17 +280,52 @@ fn vosk_loop(library: &Path, model_dir: &Path, setup: &WakeSetup, stop: &AtomicB
             return;
         }
     };
+    listen_with("vosk", setup, stop, |rate| {
+        Listener::new(&model, &name, rate)
+    });
+}
+
+/// Loads sherpa-onnx once, then listens and reopens the microphone after
+/// any failure (decision 0048).
+fn sherpa_loop(library: &Path, model_dir: &Path, setup: &WakeSetup, stop: &AtomicBool) {
+    let started = Instant::now();
+    let lib = match SherpaLib::load(library) {
+        Ok(lib) => lib,
+        Err(e) => {
+            log::error!("wake phrase does not work: engine=sherpa error={e}");
+            (setup.on_status)(Err(e));
+            return;
+        }
+    };
+    log::info!(
+        "sherpa library loaded: ms={}",
+        started.elapsed().as_millis()
+    );
+    let name = setup.name.trim().to_lowercase();
+    listen_with("sherpa", setup, stop, |rate| {
+        Listener::sherpa(lib.clone(), model_dir, &name, rate)
+    });
+}
+
+/// Opens the microphone, feeds a listener made by `make` for its rate and
+/// starts again every 30 s after a failure, until told to stop.
+fn listen_with(
+    engine: &str,
+    setup: &WakeSetup,
+    stop: &AtomicBool,
+    make: impl Fn(u32) -> Result<Listener, String>,
+) {
     let mut last_error = String::new();
     while !stop.load(Ordering::Relaxed) {
-        match vosk_session(&model, &name, setup, stop) {
+        match session_with(engine, setup, stop, &make) {
             Ok(()) => {
-                log::info!("wake phrase stopped listening: engine=vosk");
+                log::info!("wake phrase stopped listening: engine={engine}");
                 break;
             }
             Err(e) => {
                 if e != last_error {
                     log::warn!(
-                        "wake phrase is unavailable, trying again every 30 s: engine=vosk error={e}"
+                        "wake phrase is unavailable, trying again every 30 s: engine={engine} error={e}"
                     );
                     (setup.on_status)(Err(e.clone()));
                     last_error = e;
@@ -259,16 +338,49 @@ fn vosk_loop(library: &Path, model_dir: &Path, setup: &WakeSetup, stop: &AtomicB
     }
 }
 
-/// Sound given to Vosk at a time.
+/// Sound given to the recognizer at a time.
 const BLOCK_MS: u32 = 100;
 /// After the name, the rest of the word is not heard again.
 const COOLDOWN: Duration = Duration::from_millis(1500);
 
+/// A recognizer of free speech fed 16 kHz blocks.
+enum Hearer {
+    Vosk(Recognizer),
+    Sherpa(crate::sherpa::Recognizer),
+}
+
+impl Hearer {
+    /// The words of the phrase so far and whether a pause has just ended it.
+    fn accept(&mut self, samples: &[f32]) -> (String, bool) {
+        match self {
+            Hearer::Vosk(r) => {
+                let shorts: Vec<i16> = samples
+                    .iter()
+                    .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+                    .collect();
+                match r.accept(&shorts) {
+                    Heard::Partial(t) => (t, false),
+                    Heard::Final { text, .. } => (text, true),
+                }
+            }
+            Hearer::Sherpa(r) => r.accept(samples, TARGET_RATE),
+        }
+    }
+
+    fn reset(&mut self) {
+        match self {
+            Hearer::Vosk(r) => r.reset(),
+            Hearer::Sherpa(r) => r.reset(),
+        }
+    }
+}
+
 /// Feeds sound at `rate` to the recognizer in 100 ms blocks at 16 kHz and
-/// calls `on_wake` when the name is heard. Leftover sound stays in `buffer`.
+/// returns the phrases with the name or a stop. Leftover sound stays in
+/// `buffer`.
 pub struct Listener {
-    recognizer: Recognizer,
-    name: String,
+    hearer: Hearer,
+    spotter: Spotter,
     rate: u32,
     buffer: Vec<f32>,
     /// Sound fed since the start, in blocks; the cooldown is counted in sound
@@ -278,15 +390,32 @@ pub struct Listener {
 }
 
 impl Listener {
+    /// Vosk with its whole vocabulary.
     pub fn new(model: &Arc<Model>, name: &str, rate: u32) -> Result<Self, String> {
-        Ok(Self {
-            recognizer: Recognizer::new(model.clone(), TARGET_RATE as f32)?,
-            name: name.trim().to_lowercase(),
+        let recognizer = Recognizer::new(model.clone(), TARGET_RATE as f32)?;
+        Ok(Self::with(Hearer::Vosk(recognizer), name, rate))
+    }
+
+    /// sherpa-onnx with the name and the stop phrases as hot words.
+    pub fn sherpa(
+        lib: Arc<SherpaLib>,
+        model_dir: &Path,
+        name: &str,
+        rate: u32,
+    ) -> Result<Self, String> {
+        let recognizer = crate::sherpa::Recognizer::new(lib, model_dir, &hotwords(name))?;
+        Ok(Self::with(Hearer::Sherpa(recognizer), name, rate))
+    }
+
+    fn with(hearer: Hearer, name: &str, rate: u32) -> Self {
+        Self {
+            hearer,
+            spotter: Spotter::new(name),
             rate,
             buffer: Vec::new(),
             blocks: 0,
             quiet_until: 0,
-        })
+        }
     }
 
     /// Mono samples at the rate given to `new`. Returns the phrases heard.
@@ -296,35 +425,35 @@ impl Listener {
         let cooldown = COOLDOWN.as_millis() as u64 / BLOCK_MS as u64;
         let mut heard = Vec::new();
         while self.buffer.len() >= block {
-            let samples: Vec<i16> = resample(&self.buffer[..block], self.rate, TARGET_RATE)
-                .iter()
-                .map(|s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
-                .collect();
+            let samples = resample(&self.buffer[..block], self.rate, TARGET_RATE);
             self.buffer.drain(..block);
             self.blocks += 1;
             if self.blocks < self.quiet_until {
                 continue;
             }
-            if let Some(phrase) = woke(&self.recognizer.accept(&samples), &self.name) {
-                self.recognizer.reset();
+            let (text, ended) = self.hearer.accept(&samples);
+            if let Some(phrase) = self.spotter.hear(self.blocks, &text, ended) {
+                self.hearer.reset();
                 self.quiet_until = self.blocks + cooldown;
                 heard.push(phrase);
+            } else if ended {
+                self.hearer.reset();
             }
         }
         heard
     }
 }
 
-fn vosk_session(
-    model: &Arc<Model>,
-    name: &str,
+fn session_with(
+    engine: &str,
     setup: &WakeSetup,
     stop: &AtomicBool,
+    make: &impl Fn(u32) -> Result<Listener, String>,
 ) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let (stream, rate) = setup.mic.open(tx).map_err(|e| e.to_string())?;
-    let mut listener = Listener::new(model, name, rate)?;
-    log::info!("wake phrase is listening: engine=vosk rate={rate}");
+    let mut listener = make(rate)?;
+    log::info!("wake phrase is listening: engine={engine} rate={rate}");
     (setup.on_status)(Ok(()));
     let result = loop {
         if stop.load(Ordering::Relaxed) {
@@ -597,5 +726,69 @@ mod tests {
         assert_eq!(heard_kind("стопка книг", "мика"), None);
         assert_eq!(heard_kind("включи музыку", "мика"), None);
         assert_eq!(stop_word("а теперь тихо"), Some("тихо"));
+    }
+
+    /// Feeds the spotter one text per block and returns what counted, with
+    /// the block it counted at.
+    fn spot(steps: &[(&str, bool)]) -> Vec<(u64, String)> {
+        let mut s = Spotter::new("Мика");
+        steps
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (text, ended))| s.hear(i as u64, text, *ended).map(|p| (i as u64, p)))
+            .collect()
+    }
+
+    #[test]
+    fn the_name_counts_at_once() {
+        assert_eq!(
+            spot(&[("", false), ("мика", false)]),
+            vec![(1, "мика".into())]
+        );
+    }
+
+    #[test]
+    fn a_lone_stop_waits_for_the_end_of_the_phrase_or_the_gate() {
+        // The phrase ends: the stop counts then.
+        assert_eq!(
+            spot(&[("стоп", false), ("стоп", false), ("стоп", true)]),
+            vec![(2, "стоп".into())]
+        );
+        // The recognizer keeps the word: it counts after the gate.
+        let held: Vec<(&str, bool)> = vec![("стой", false); 10];
+        assert_eq!(spot(&held), vec![(STOP_GATE_BLOCKS, "стой".into())]);
+        // A cut last word that may still finish the stop phrase waits too.
+        assert_eq!(
+            spot(&[("перестань слу", false), ("перестань слушать", true)]),
+            vec![(1, "перестань слушать".into())]
+        );
+        // The phrase is dropped while it waits: what waited was whole.
+        assert_eq!(
+            spot(&[("хватит", false), ("", false)]),
+            vec![(1, "хватит".into())]
+        );
+    }
+
+    #[test]
+    fn the_start_of_a_longer_word_is_not_a_stop() {
+        assert!(spot(&[("стоп", false), ("стопка", false), ("стопка книг", true)]).is_empty());
+    }
+
+    #[test]
+    fn a_stop_word_inside_a_phrase_counts_and_the_app_decides() {
+        assert_eq!(
+            spot(&[("останови", false), ("останови машину", false)]),
+            vec![(1, "останови машину".into())]
+        );
+    }
+
+    #[test]
+    fn hot_words_are_the_name_and_the_stop_phrases() {
+        let h = hotwords(" Мика ");
+        assert_eq!(h[0], "мика");
+        assert!(h.contains(&"стой".to_string()));
+        assert!(h.contains(&"перестань слушать".to_string()));
+        assert!(hotwords("").is_empty());
+        assert!(grammar_phrases("Мика").contains(&"перестань слушать".to_string()));
     }
 }

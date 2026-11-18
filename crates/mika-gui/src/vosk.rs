@@ -9,13 +9,13 @@ use mika_audio::wake::WakeEngine;
 use sha2::{Digest, Sha256};
 
 /// One archive to download: where from, its sum, and what to take from it.
-struct Part {
-    url: &'static str,
-    sha256: &'static str,
+pub(crate) struct Part {
+    pub(crate) url: &'static str,
+    pub(crate) sha256: &'static str,
     /// Folder inside the archive.
-    inner: &'static str,
+    pub(crate) inner: &'static str,
     /// Folder under `vosk_dir` it becomes.
-    target: &'static str,
+    pub(crate) target: &'static str,
 }
 
 /// libvosk for Windows from vosk-api 0.3.45 (Apache 2.0), about 15 MB.
@@ -149,7 +149,7 @@ async fn install_parts(progress: &impl Fn(u8)) -> Result<(), String> {
 }
 
 /// Streams one archive to `path`, hashing as it goes.
-async fn download(
+pub(crate) async fn download(
     client: &reqwest::Client,
     part: &Part,
     path: &Path,

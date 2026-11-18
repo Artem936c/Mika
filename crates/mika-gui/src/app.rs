@@ -326,6 +326,8 @@ pub struct Ctx {
     wake: Mutex<Option<mika_audio::wake::WakeHandle>>,
     /// `off`, `on`, or why the wake phrase cannot listen.
     pub wake_status: Mutex<String>,
+    /// The engine that listens now, after the fallback (decision 0048).
+    pub wake_engine_used: Mutex<mika_core::config::WakeEngineChoice>,
     /// Set while the user talks to her by voice: she listens again after answering.
     follow_up: AtomicBool,
     /// What she has said in the current reply, to tell her own voice from the user.
@@ -632,6 +634,7 @@ impl Ctx {
             app: std::sync::OnceLock::new(),
             wake: Mutex::new(None),
             wake_status: Mutex::new("off".into()),
+            wake_engine_used: Mutex::new(mika_core::config::WakeEngineChoice::Windows),
             follow_up: AtomicBool::new(false),
             speaking: Mutex::new(String::new()),
             update: Mutex::new(None),
@@ -1083,12 +1086,13 @@ impl Ctx {
     pub fn restart_wake(self: &Arc<Self>) {
         // Dropping the old handle stops its listener.
         self.wake.lock().take();
-        let (on, name, language) = {
+        let (on, name, language, choice) = {
             let c = self.config.lock();
             (
                 c.privacy.microphone_enabled && c.voice.wake_enabled,
                 c.assistant.wake_phrase.clone(),
                 c.voice.stt_language.clone(),
+                c.voice.wake_engine,
             )
         };
         // The name and the stop words (decision 0045); empty without a name.
@@ -1100,10 +1104,27 @@ impl Ctx {
         *self.wake_status.lock() = "starting".into();
         let me = Arc::downgrade(self);
         let status = Arc::downgrade(self);
-        let engine = crate::vosk::engine().unwrap_or(mika_audio::wake::WakeEngine::Windows {
+        // The chosen engine, or Windows when its files are not downloaded
+        // (decision 0048).
+        use mika_core::config::WakeEngineChoice;
+        let windows = mika_audio::wake::WakeEngine::Windows {
             language: speech_locale(&language),
-        });
-        let local = matches!(engine, mika_audio::wake::WakeEngine::Vosk { .. });
+        };
+        let used = choice.resolve(crate::sherpa::installed(), crate::vosk::installed());
+        let engine = match used {
+            WakeEngineChoice::Sherpa => crate::sherpa::engine(),
+            WakeEngineChoice::Vosk => crate::vosk::engine(),
+            _ => None,
+        }
+        .unwrap_or(windows);
+        log::info!(
+            target: "voice",
+            "wake engine chosen: choice={} used={}",
+            choice.as_str(),
+            used.as_str()
+        );
+        *self.wake_engine_used.lock() = used;
+        let local = !matches!(engine, mika_audio::wake::WakeEngine::Windows { .. });
         let handle = mika_audio::wake::start_wake(mika_audio::wake::WakeSetup {
             engine,
             name,
@@ -1334,6 +1355,15 @@ impl Ctx {
     /// again once her answer is said; silence then ends the conversation quietly.
     async fn listen_once(&self, follow_up: bool) {
         match self.hear().await {
+            // «Стой», «перестань слушать»: a stop, not a question for the
+            // model, which would only say it stopped (decision 0048).
+            Ok(Heard::Text(text)) if mika_core::pause::only_stop_words(&text) => {
+                log::info!(
+                    target: "voice",
+                    "spoken phrase is a stop, she stops everything: follow_up={follow_up}"
+                );
+                self.full_stop(true);
+            }
             Ok(Heard::Text(text)) => {
                 self.follow_up.store(true, Ordering::Relaxed);
                 self.session.submit_from(&text, Origin::Voice);

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 publish = false
 
@@ -28,6 +28,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time", "process", "io-util", "net"] }
 tokio-util = "0.7"
 toml = "0.9"
+tar = "0.4"
+bzip2 = "0.6"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-build = { version = "2", features = [] }
@@ -87,3 +89,11 @@ flate2 = "1"
 ring = "0.17"
 arboard = { version = "3", default-features = false }
 sysinfo = { version = "0.33", default-features = false, features = ["system", "disk"] }
+
+# Debug builds keep line numbers for our crates and no debug info for
+# dependencies: target/ stays several times smaller and builds link faster.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

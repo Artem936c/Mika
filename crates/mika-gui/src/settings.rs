@@ -1134,6 +1134,14 @@ pub struct VoiceSettings {
     vosk_installed: bool,
     vosk_downloading: bool,
     vosk_bytes: u64,
+    /// sherpa-onnx is downloaded (decision 0048).
+    sherpa_installed: bool,
+    sherpa_downloading: bool,
+    sherpa_bytes: u64,
+    /// Who should hear the name: `auto`, `sherpa`, `vosk`, `windows`.
+    wake_engine: mika_core::config::WakeEngineChoice,
+    /// Who hears it now, after the fallback to what is downloaded.
+    wake_engine_used: mika_core::config::WakeEngineChoice,
     follow_up: bool,
     duck_media: bool,
     tts_style: String,
@@ -1198,10 +1206,12 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
     .await
     .unwrap_or_default();
     let cache = ctx.speech_cache.clone();
-    let (tts_cache_bytes, vosk_bytes) =
-        tauri::async_runtime::spawn_blocking(move || (cache.size(), crate::vosk::size()))
-            .await
-            .unwrap_or_default();
+    let (tts_cache_bytes, vosk_bytes, sherpa_bytes) =
+        tauri::async_runtime::spawn_blocking(move || {
+            (cache.size(), crate::vosk::size(), crate::sherpa::size())
+        })
+        .await
+        .unwrap_or_default();
     let (c, microphone_enabled, llm_base_url) = {
         let cfg = ctx.config.lock();
         (
@@ -1238,6 +1248,11 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
         vosk_installed: crate::vosk::installed(),
         vosk_downloading: crate::vosk::downloading(),
         vosk_bytes,
+        sherpa_installed: crate::sherpa::installed(),
+        sherpa_downloading: crate::sherpa::downloading(),
+        sherpa_bytes,
+        wake_engine: c.wake_engine,
+        wake_engine_used: *ctx.wake_engine_used.lock(),
         follow_up: c.follow_up,
         duck_media: c.duck_media,
         tts_style: c.tts_style,
@@ -1304,6 +1319,66 @@ pub async fn remove_vosk(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<String, Stri
     .map_err(|e| e.to_string())?;
     ctx.restart_wake();
     removed?;
+    let status = ctx.wake_status.lock().clone();
+    Ok(status)
+}
+
+/// Downloads sherpa-onnx on the user's press (decision 0048). Progress goes
+/// to the window as `sherpa-progress` with the share done.
+#[tauri::command]
+pub async fn install_sherpa(
+    app: AppHandle,
+    ctx: tauri::State<'_, Arc<Ctx>>,
+) -> Result<String, String> {
+    use tauri::Emitter;
+    let last = std::sync::atomic::AtomicU8::new(u8::MAX);
+    crate::sherpa::install(move |share| {
+        if last.swap(share, std::sync::atomic::Ordering::Relaxed) != share {
+            let _ = app.emit("sherpa-progress", share);
+        }
+    })
+    .await?;
+    let ctx: &Arc<Ctx> = &ctx;
+    ctx.restart_wake();
+    let status = ctx.wake_status.lock().clone();
+    Ok(status)
+}
+
+/// Deletes sherpa-onnx; the next engine that is downloaded hears the name.
+#[tauri::command]
+pub async fn remove_sherpa(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<String, String> {
+    let ctx: Arc<Ctx> = ctx.inner().clone();
+    let stopping = ctx.clone();
+    // The listener holds the library open: stop it before deleting.
+    let removed = tauri::async_runtime::spawn_blocking(move || {
+        stopping.stop_wake();
+        crate::sherpa::remove()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    ctx.restart_wake();
+    removed?;
+    let status = ctx.wake_status.lock().clone();
+    Ok(status)
+}
+
+/// Who hears the name and the stop words (decision 0048).
+#[tauri::command]
+pub async fn set_wake_engine(
+    ctx: tauri::State<'_, Arc<Ctx>>,
+    engine: mika_core::config::WakeEngineChoice,
+) -> Result<String, String> {
+    ctx.config.lock().voice.wake_engine = engine;
+    ctx.save_config()?;
+    let ctx: Arc<Ctx> = ctx.inner().clone();
+    // The old listener lets go of its files before the new one opens them.
+    let restarting = ctx.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        restarting.stop_wake();
+        restarting.restart_wake();
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     let status = ctx.wake_status.lock().clone();
     Ok(status)
 }

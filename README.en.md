@@ -36,9 +36,9 @@ The interface is in Russian and English: pick the language on the first-run scre
 - **Information and system**: weather, exchange rates, news, the media player, volume, Wi-Fi, Bluetooth, brightness.
 - **Voice.**
   - Speech with a Windows voice or a provider's voice, input from the microphone.
-  - The wake phrase "Mika" is recognized on this computer.
+  - The wake phrase "Mika" is recognized on this computer, by sherpa-onnx, Vosk or the Windows recognizer: you pick which in the settings.
   - Actions can be confirmed by voice.
-  - "Stop" (in Russian: «стоп», «хватит», «остановись») stops everything at any moment: the reply, the task, actions in windows, background jobs. After that Mika starts nothing on her own until you call her.
+  - "Stop" (in Russian: «стоп», «стой», «хватит», «перестань слушать») stops everything at any moment: the reply, the task, actions in windows, background jobs. After that Mika starts nothing on her own until you call her.
 - **Settings by conversation.** "Speak quieter", "change the voice", "turn off dictation", "what are your settings?". The microphone, the screen, Telegram and other sensitive features turn on only with a confirmation. The microphone and the screen cannot be turned on from Telegram.
 - **Skills.** After a successful chain of actions Mika offers to save it as a skill, then repeats it by name, with parameters. Every step of a skill goes through the risk policy again.
 - **Extensions**: MCP servers (a program or HTTP), your own commands, control from Telegram.

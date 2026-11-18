@@ -58,6 +58,7 @@ const BY_MODULE: &[(&str, &str)] = &[
     ("mika_gui::events_page", "events"),
     ("mika_gui::research", "web"),
     ("mika_gui::vosk", "voice"),
+    ("mika_gui::sherpa", "voice"),
 ];
 
 /// The category of a record by its target: a category name as it is, a module

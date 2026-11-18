@@ -21,6 +21,7 @@ mod research;
 mod rhythm;
 mod selection;
 mod settings;
+mod sherpa;
 mod strings;
 mod talk_settings;
 mod tray;
@@ -292,6 +293,8 @@ fn main() {
             settings::set_mood_directions,
             settings::clear_speech_cache,
             settings::install_vosk,
+            settings::install_sherpa,
+            settings::set_wake_engine,
             settings::set_follow_up,
             settings::set_duck_media,
             settings::set_notifications,
@@ -310,6 +313,7 @@ fn main() {
             settings::set_brief_speech,
             settings::set_expressive_speech,
             settings::remove_vosk,
+            settings::remove_sherpa,
             settings::save_speech_settings,
             settings::set_microphone_enabled,
             settings::voice_listen,

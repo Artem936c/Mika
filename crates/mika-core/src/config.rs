@@ -682,6 +682,8 @@ pub struct VoiceConfig {
     pub input_device: String,
     /// Listen for the wake phrase while the microphone is allowed.
     pub wake_enabled: bool,
+    /// Who hears the name and the stop words (decision 0048).
+    pub wake_engine: WakeEngineChoice,
     /// After an answer to a spoken question, listen again for a few seconds.
     pub follow_up: bool,
     /// Other programs get quieter while she listens and speaks.
@@ -715,6 +717,7 @@ impl Default for VoiceConfig {
             speech_base_url: String::new(),
             input_device: String::new(),
             wake_enabled: false,
+            wake_engine: WakeEngineChoice::Auto,
             follow_up: true,
             duck_media: true,
             tts_style: String::new(),
@@ -769,6 +772,44 @@ pub enum TtsEngine {
     Windows,
     /// The provider's `/audio/speech`.
     Provider,
+}
+
+/// Who hears the name and the stop words (decision 0048). A choice whose
+/// files are not downloaded falls back to the recognizer of Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WakeEngineChoice {
+    /// sherpa-onnx if downloaded, else Vosk if downloaded, else Windows.
+    #[default]
+    Auto,
+    /// sherpa-onnx with the Russian streaming model and hot words.
+    Sherpa,
+    /// The small Russian model of Vosk.
+    Vosk,
+    /// The speech recognizer of Windows, with a list of phrases.
+    Windows,
+}
+
+impl WakeEngineChoice {
+    /// The engine to use, given which downloads are in place.
+    pub fn resolve(self, sherpa: bool, vosk: bool) -> WakeEngineChoice {
+        match self {
+            WakeEngineChoice::Auto if sherpa => WakeEngineChoice::Sherpa,
+            WakeEngineChoice::Auto if vosk => WakeEngineChoice::Vosk,
+            WakeEngineChoice::Sherpa if sherpa => WakeEngineChoice::Sherpa,
+            WakeEngineChoice::Vosk if vosk => WakeEngineChoice::Vosk,
+            _ => WakeEngineChoice::Windows,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WakeEngineChoice::Auto => "auto",
+            WakeEngineChoice::Sherpa => "sherpa",
+            WakeEngineChoice::Vosk => "vosk",
+            WakeEngineChoice::Windows => "windows",
+        }
+    }
 }
 
 /// Key for speech requests; without one the LLM key is used.
@@ -1096,6 +1137,22 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_wake_engine_falls_back_to_what_is_downloaded() {
+        use WakeEngineChoice::*;
+        assert_eq!(Auto.resolve(true, true), Sherpa);
+        assert_eq!(Auto.resolve(false, true), Vosk);
+        assert_eq!(Auto.resolve(false, false), Windows);
+        assert_eq!(Vosk.resolve(true, true), Vosk);
+        assert_eq!(Sherpa.resolve(false, true), Windows);
+        assert_eq!(Windows.resolve(true, true), Windows);
+        // Old settings files have no field: auto.
+        let c: VoiceConfig = toml::from_str("wake_enabled = true").unwrap();
+        assert_eq!(c.wake_engine, Auto);
+        let c: VoiceConfig = toml::from_str("wake_engine = \"sherpa\"").unwrap();
+        assert_eq!(c.wake_engine, Sherpa);
+    }
 
     fn tmp() -> (tempfile::TempDir, PathBuf) {
         let d = tempfile::tempdir().unwrap();

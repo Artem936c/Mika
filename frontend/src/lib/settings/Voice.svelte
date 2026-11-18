@@ -7,6 +7,15 @@
   import { t } from '../i18n';
 
   type Engine = 'windows' | 'provider';
+  /** Who hears the name and the stop words (decision 0048). */
+  type WakeEngine = 'auto' | 'sherpa' | 'vosk' | 'windows';
+  const WAKE_ENGINES: WakeEngine[] = ['auto', 'sherpa', 'vosk', 'windows'];
+  /** The line under the switch: which engine listens now. */
+  function wakeOnKey(used: WakeEngine): 'voice.wake_on_sherpa' | 'voice.wake_on_vosk' | 'voice.wake_on' {
+    if (used === 'sherpa') return 'voice.wake_on_sherpa';
+    if (used === 'vosk') return 'voice.wake_on_vosk';
+    return 'voice.wake_on';
+  }
   interface VoiceSettings {
     speak_replies: boolean;
     voice: string;
@@ -34,6 +43,11 @@
     vosk_installed: boolean;
     vosk_downloading: boolean;
     vosk_bytes: number;
+    sherpa_installed: boolean;
+    sherpa_downloading: boolean;
+    sherpa_bytes: number;
+    wake_engine: WakeEngine;
+    wake_engine_used: WakeEngine;
     follow_up: boolean;
     duck_media: boolean;
     tts_style: string;
@@ -54,12 +68,15 @@
   let listening = $state(false);
 
   let voskShare = $state(0);
+  let sherpaShare = $state(0);
 
   onMount(() => {
     invoke<VoiceSettings>('get_voice_settings').then((v) => (s = v), fail);
     const off = onEvent<number>('vosk-progress', (e) => (voskShare = e.payload));
+    const offSherpa = onEvent<number>('sherpa-progress', (e) => (sherpaShare = e.payload));
     return () => {
       off.then((f) => f());
+      offSherpa.then((f) => f());
     };
   });
 
@@ -149,6 +166,41 @@
 
   const voskSize = $derived(s ? Math.round(s.vosk_bytes / (1024 * 1024)) : 0);
 
+  async function installSherpa() {
+    if (!s) return;
+    s.sherpa_downloading = true;
+    sherpaShare = 0;
+    try {
+      s.wake_status = await invoke<string>('install_sherpa');
+      s = await invoke<VoiceSettings>('get_voice_settings');
+    } catch (e) {
+      fail(e);
+      if (s) s.sherpa_downloading = false;
+    }
+  }
+
+  async function removeSherpa() {
+    if (!s) return;
+    try {
+      s.wake_status = await invoke<string>('remove_sherpa');
+      s = await invoke<VoiceSettings>('get_voice_settings');
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  async function setWakeEngine(engine: WakeEngine) {
+    if (!s) return;
+    try {
+      s.wake_status = await invoke<string>('set_wake_engine', { engine });
+      s = await invoke<VoiceSettings>('get_voice_settings');
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  const sherpaSize = $derived(s ? Math.round(s.sherpa_bytes / (1024 * 1024)) : 0);
+
   function fail(e: unknown) {
     note = String(e);
     noteKind = 'bad';
@@ -188,7 +240,7 @@
     if (!s || !s.wake_enabled) return '';
     if (!s.microphone_enabled) return t('voice.wake_needs_mic');
     if (s.wake_status === 'on' || s.wake_status === 'starting') {
-      return t(s.vosk_installed ? 'voice.wake_on_vosk' : 'voice.wake_on', { name: s.wake_phrase });
+      return t(wakeOnKey(s.wake_engine_used), { name: s.wake_phrase });
     }
     return s.wake_status;
   });
@@ -406,9 +458,34 @@
     <span class="lbl">{t('voice.wake_phrase')}</span>
     <input class="fld short2" bind:value={s.wake_phrase} maxlength="40" onchange={() => s && setWake(s.wake_enabled)} />
   </label>
+  <label>
+    <span class="lbl">{t('voice.wake_engine')}</span>
+    <select class="fld" value={s.wake_engine} onchange={(e) => setWakeEngine(e.currentTarget.value as WakeEngine)}>
+      {#each WAKE_ENGINES as engine (engine)}
+        <option value={engine}>{t(`voice.wake_engine_${engine}`)}</option>
+      {/each}
+    </select>
+  </label>
+  {#if s.wake_engine !== 'auto' && s.wake_engine !== s.wake_engine_used}
+    <p class="warn">{t('voice.wake_engine_missing')}</p>
+  {/if}
   {#if wakeNote}<p class="hint">{wakeNote}</p>{/if}
   <Switch checked={s.follow_up} title={t('voice.follow_up')} sub={t('voice.follow_up_sub')} onchange={setFollowUp} />
   <Switch checked={s.duck_media} title={t('voice.duck')} sub={t('voice.duck_sub')} onchange={setDuck} />
+  <div class="lbl top">{t('voice.sherpa')}</div>
+  {#if s.sherpa_downloading}
+    <p class="hint">{t('voice.vosk_loading', { share: sherpaShare })}</p>
+  {:else if s.sherpa_installed}
+    <p class="hint">{t('voice.sherpa_on', { size: sherpaSize })}</p>
+    <div class="acts">
+      <button class="bt" onclick={removeSherpa}>{t('voice.vosk_remove')}</button>
+    </div>
+  {:else}
+    <p class="hint">{t('voice.sherpa_off')}</p>
+    <div class="acts">
+      <button class="bt" onclick={installSherpa}>{t('voice.vosk_get')}</button>
+    </div>
+  {/if}
   <div class="lbl top">{t('voice.vosk')}</div>
   {#if s.vosk_downloading}
     <p class="hint">{t('voice.vosk_loading', { share: voskShare })}</p>
