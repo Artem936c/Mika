@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use mika_core::config::{Persona, TtsEngine};
+use mika_core::config::{ThemeChoice, TtsEngine};
 use mika_core::session::Origin;
 use mika_core::settings::{self, SettingsPort, Value};
 use parking_lot::Mutex;
@@ -69,11 +69,6 @@ fn own_level(apps: &[mika_tools::sys::AppVolume], pid: u32) -> Option<u8> {
     apps.iter().find(|a| a.pid == pid).map(|a| a.level)
 }
 
-/// A persona by its id in the settings list.
-fn persona(id: &str) -> Option<Persona> {
-    serde_json::from_value(serde_json::json!(id)).ok()
-}
-
 #[async_trait]
 impl SettingsPort for TalkSettings {
     fn read(&self, key: &str) -> Result<Value, String> {
@@ -87,7 +82,8 @@ impl SettingsPort for TalkSettings {
 
     fn options(&self, key: &str) -> Vec<String> {
         if key != "voice.voice" {
-            return Vec::new();
+            // The user's own characters by name, and nothing for the rest.
+            return settings::options(&self.ctx().config.lock(), key);
         }
         let voice = self.ctx().config.lock().voice.clone();
         if voice.tts == TtsEngine::Provider {
@@ -196,15 +192,13 @@ impl SettingsPort for TalkSettings {
             ("voice.tone_by_mood", Value::Bool(on)) => {
                 page::set_voice_style(state(), config.voice.tts_style.clone(), *on)
             }
-            ("assistant.persona", Value::Text(id)) => match persona(id) {
-                Some(p) => bridge::set_persona(
-                    app.clone(),
-                    state(),
-                    p,
-                    config.assistant.custom_prompt.clone(),
-                ),
-                None => unknown(),
-            },
+            // A ready character by its id or an own one by its name.
+            ("assistant.persona", Value::Text(choice)) => {
+                crate::persona::set_persona(app.clone(), state(), choice.clone()).map(|_| ())
+            }
+            ("assistant.adult", Value::Bool(on)) => {
+                crate::persona::set_adult(app.clone(), state(), *on).map(|_| ())
+            }
             ("rhythm.lively", Value::Bool(on)) => {
                 let r = &config.rhythm;
                 page::set_rhythm(state(), r.breaks, r.break_every_min, *on)
@@ -217,7 +211,14 @@ impl SettingsPort for TalkSettings {
                 let r = &config.rhythm;
                 page::set_rhythm(state(), r.breaks, minutes.round() as u32, r.lively)
             }
+            ("companion.enabled", Value::Bool(on)) => {
+                page::set_companion(state(), *on, config.companion.every_s)
+            }
+            ("companion.every_s", Value::Number(seconds)) => {
+                page::set_companion(state(), config.companion.enabled, seconds.round() as u32)
+            }
             ("skills.suggest", Value::Bool(on)) => page::set_skill_offers(state(), *on),
+            ("quick.enabled", Value::Bool(on)) => page::set_quick_commands(state(), *on),
             ("island.hide_in_games", Value::Bool(on)) => {
                 page::set_island_settings(state(), config.island.city.clone(), *on)
             }
@@ -229,6 +230,12 @@ impl SettingsPort for TalkSettings {
                 bridge::set_avatar_placement(app.clone(), state(), config.avatar.in_island, *on)
                     .await
             }
+            // A ready theme by its own colour: the own accent is dropped, as
+            // a tile of the page does.
+            ("ui.theme", Value::Text(id)) => match ThemeChoice::from_id(id) {
+                Some(t) => crate::theme::set_theme(app.clone(), state(), t, String::new()),
+                None => unknown(),
+            },
             ("i18n.language", Value::Text(code)) => {
                 lang::set_language(app.clone(), state(), code.clone()).await
             }
@@ -267,15 +274,6 @@ mod tests {
         let apps = [app(10, 30), app(42, 75)];
         assert_eq!(own_level(&apps, 42), Some(75));
         assert_eq!(own_level(&apps, 7), None);
-    }
-
-    #[test]
-    fn every_persona_of_the_list_is_known() {
-        for id in ["caring", "cheerful", "calm", "bold"] {
-            assert!(persona(id).is_some(), "{id}");
-        }
-        assert_eq!(persona("bold"), Some(Persona::Bold));
-        assert_eq!(persona("grumpy"), None);
     }
 
     #[test]

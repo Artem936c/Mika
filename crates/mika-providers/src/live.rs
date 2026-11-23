@@ -209,6 +209,10 @@ impl Vision for Live {
         let frames: Vec<&[u8]> = pngs.iter().map(Vec::as_slice).collect();
         self.look(VIDEO_FRAMES_PROMPT, &frames, question).await
     }
+
+    async fn ask_as(&self, system: &str, png: &[u8], question: &str) -> Result<String, String> {
+        self.look(system, &[png], question).await
+    }
 }
 
 impl Live {

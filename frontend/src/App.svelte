@@ -39,6 +39,7 @@
     opensChat,
     rectForShape,
     reducePaused,
+    reduceSleeping,
     reduceState,
     unionRect,
     viewShape,
@@ -77,6 +78,8 @@
   let current = $state<AssistantState>('idle');
   /** The pause after a full stop: she starts nothing until called (decision 0045). */
   let paused = $state(false);
+  /** She sleeps: the pause she was asked for (decision 0050). */
+  let sleeping = $state(false);
   let view = $state<View>('island');
   let settingsStart = $state<'persona' | 'providers' | 'journal'>('persona');
   let items = $state<ChatItem[]>([]);
@@ -203,6 +206,20 @@
   }
 
   /** Cards for the background jobs that still run: the chat is drawn anew at start and after «new chat». */
+  /** Another conversation is open (decision 0052): the chat draws its history and the cards of running jobs. */
+  async function showConversation() {
+    reply = '';
+    task = null;
+    screenAsk = null;
+    invoke('screen_ask_cancel');
+    try {
+      items = fromHistory(await invoke<unknown>('get_history'));
+    } catch (e) {
+      items = reduceChat([], { type: 'error', message: String(e) });
+    }
+    await loadJobs();
+  }
+
   async function loadJobs() {
     try {
       const list = listJobs(await invoke<unknown>('bg_jobs_list'), jobsSeen);
@@ -230,6 +247,7 @@
   function onEvent(payload: unknown) {
     current = reduceState(current, payload);
     paused = reducePaused(paused, payload);
+    sleeping = reduceSleeping(sleeping, payload);
     emotion = reduceEmotion(emotion, payload);
     items = reduceChat(items, payload);
     pending = reducePending(pending, payload, Date.now());
@@ -330,6 +348,9 @@
     invoke<AssistantState>('get_state').then((s) => (current = s));
     invoke<boolean>('get_paused')
       .then((p) => (paused = p === true))
+      .catch(() => {});
+    invoke<boolean>('get_sleeping')
+      .then((p) => (sleeping = p === true))
       .catch(() => {});
     invoke<unknown>('get_emotion').then((e) => {
       if (isEmotion(e)) emotion = e;
@@ -461,16 +482,17 @@
       view = 'settings';
     }}
     onnew={async () => {
-      // A new chat is not a «stop»: no pause after it.
-      await invoke('stop', { pause: false });
-      await invoke('clear_history');
-      items = [];
-      loadJobs();
-      reply = '';
-      task = null;
-      screenAsk = null;
-      invoke('screen_ask_cancel');
+      // A new chat stops the reply and the task, without the pause; the old
+      // conversation stays in the list (decision 0052).
+      try {
+        await invoke('new_conversation');
+      } catch (e) {
+        items = reduceChat(items, { type: 'error', message: String(e) });
+        return;
+      }
+      await showConversation();
     }}
+    onswitched={showConversation}
     ontaskhide={() => (task = null)}
     onpoke={(part) => invoke('poke_avatar', { part })}
     onspeak={setSpeak}
@@ -542,6 +564,7 @@
           track={idle.track}
           dictation={dictation?.phase ?? null}
           {paused}
+          {sleeping}
           onspeak={setSpeak}
         />
       </div>

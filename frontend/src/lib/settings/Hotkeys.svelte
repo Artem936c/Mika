@@ -212,7 +212,7 @@
     background: rgba(255, 255, 255, 0.04);
   }
   .row.edit {
-    outline: 1px solid rgba(143, 125, 255, 0.5);
+    outline: 1px solid rgba(var(--v-rgb), 0.5);
   }
   .what {
     flex: 1 1 120px;

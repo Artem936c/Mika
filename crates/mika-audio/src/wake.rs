@@ -1,5 +1,5 @@
-//! Wake phrase: a recognizer on this computer listens for the name and the
-//! stop words; no sound leaves it.
+//! Wake phrase: a recognizer on this computer listens for the name, the
+//! stop words and the sleep words; no sound leaves it.
 //!
 //! The user picks the engine (decision 0048). sherpa-onnx with a small
 //! streaming Russian model hears the name and the stop words as hot words.
@@ -65,20 +65,35 @@ pub fn has_name(heard: &str, name: &str) -> bool {
     !name.is_empty() && heard.windows(name.len()).any(|w| w == name.as_slice())
 }
 
-/// Words that stop her, one list for the whole app (decisions 0045, 0048).
-pub use mika_core::pause::{only_stop_words, stop_word, STOP_WORDS};
+/// Words that stop her and words that put her to sleep, one list for the
+/// whole app (decisions 0045, 0048, 0050).
+pub use mika_core::pause::{only_sleep_words, only_stop_words, stop_word, SLEEP_WORDS, STOP_WORDS};
 
 /// Stop phrases of more than one word the Windows recognizer listens for.
 const STOP_PHRASES: [&str; 2] = ["перестань слушать", "перестань говорить"];
 
-/// The phrases the Windows recognizer listens for: the ways to say the name
-/// and the stop words (decision 0045). Empty without a name.
+/// Sleep phrases of more than one word the Windows recognizer listens for.
+const SLEEP_PHRASES: [&str; 1] = ["иди спать"];
+
+/// Every stop and sleep phrase, without repeats.
+fn command_phrases() -> impl Iterator<Item = &'static str> {
+    STOP_WORDS
+        .iter()
+        .chain(STOP_PHRASES.iter())
+        .chain(SLEEP_WORDS.iter())
+        .chain(SLEEP_PHRASES.iter())
+        .copied()
+}
+
+/// The phrases the Windows recognizer listens for: the ways to say the name,
+/// the stop words (decision 0045) and the sleep words (decision 0050).
+/// Empty without a name.
 pub fn grammar_phrases(name: &str) -> Vec<String> {
     let mut phrases = wake_phrases(name);
     if phrases.is_empty() {
         return phrases;
     }
-    for word in STOP_WORDS.iter().chain(STOP_PHRASES.iter()) {
+    for word in command_phrases() {
         if !phrases.iter().any(|p| p == word) {
             phrases.push(word.to_string());
         }
@@ -86,16 +101,20 @@ pub fn grammar_phrases(name: &str) -> Vec<String> {
     phrases
 }
 
-/// The hot words of sherpa-onnx: the name and the stop phrases. The decoder
-/// leans towards them, so they are heard in noise (decision 0048).
+/// The hot words of sherpa-onnx: the name, the stop phrases and the sleep
+/// phrases. The decoder leans towards them, so they are heard in noise
+/// (decisions 0048, 0050).
 pub fn hotwords(name: &str) -> Vec<String> {
     let name = name.trim().to_lowercase();
     if name.is_empty() {
         return Vec::new();
     }
     let mut words = vec![name];
-    words.extend(STOP_WORDS.iter().map(|w| w.to_string()));
-    words.extend(STOP_PHRASES.iter().map(|w| w.to_string()));
+    for word in command_phrases() {
+        if !words.iter().any(|w| w == word) {
+            words.push(word.to_string());
+        }
+    }
     words
 }
 
@@ -106,14 +125,20 @@ pub enum HeardKind {
     Name,
     /// A stop word without the name: stop everything.
     Stop,
+    /// A phrase of sleep words and nothing else: go to sleep (decision 0050).
+    Sleep,
 }
 
-/// The name wins over a stop word: «Мика, стоп» is a call.
+/// The name wins over a stop word: «Мика, стоп» is a call. A sleep word
+/// counts only as the whole phrase: «спи» inside «списка» or «спи
+/// спокойно» is nothing.
 pub fn heard_kind(heard: &str, name: &str) -> Option<HeardKind> {
     if has_name(heard, name) {
         Some(HeardKind::Name)
     } else if stop_word(heard).is_some() {
         Some(HeardKind::Stop)
+    } else if only_sleep_words(heard) {
+        Some(HeardKind::Sleep)
     } else {
         None
     }
@@ -134,10 +159,12 @@ pub fn woke(heard: &Heard, name: &str) -> Option<String> {
 /// keeps such a piece for up to 0.6 s (decision 0048).
 pub const STOP_GATE_BLOCKS: u64 = 8;
 
-/// Decides, block by block, when the words heard so far wake or stop her.
-/// The name counts at once. A phrase that may still be a stop and nothing
-/// else waits for its end or for `STOP_GATE_BLOCKS`; a stop word inside a
-/// longer phrase counts at once, and the app decides what it means.
+/// Decides, block by block, when the words heard so far wake, stop her or
+/// put her to sleep. The name counts at once. A phrase that may still be a
+/// stop and nothing else waits for its end or for `STOP_GATE_BLOCKS`; a
+/// stop word inside a longer phrase counts at once, and the app decides what
+/// it means. A sleep phrase always waits the same way: more words after it
+/// make it something else.
 #[derive(Debug, Default)]
 pub struct Spotter {
     name: String,
@@ -163,25 +190,34 @@ impl Spotter {
                 Some(text.to_string())
             }
             Some(HeardKind::Stop) if !ended && mika_core::pause::may_be_stop_phrase(text) => {
-                let since = self.pending.get_or_insert((block, String::new())).0;
-                if block.saturating_sub(since) >= STOP_GATE_BLOCKS {
-                    self.pending = None;
-                    Some(text.to_string())
-                } else {
-                    self.pending = Some((since, text.to_string()));
-                    None
-                }
+                self.wait(block, text)
             }
-            Some(HeardKind::Stop) => {
+            Some(HeardKind::Sleep) if !ended => self.wait(block, text),
+            Some(HeardKind::Stop | HeardKind::Sleep) => {
                 self.pending = None;
                 Some(text.to_string())
             }
             None => match self.pending.take() {
-                // The phrase ended or was dropped: what waited was whole.
-                Some((_, last)) if text.trim().is_empty() || ended => Some(last),
+                // The phrase was dropped, or ended without more words:
+                // what waited was whole.
+                Some((_, last)) if mika_core::pause::phrase_words(text).next().is_none() => {
+                    Some(last)
+                }
                 // Other words came: «стоп…» was «стопка».
                 _ => None,
             },
+        }
+    }
+
+    /// A phrase that counts only whole waits for its end or for the gate.
+    fn wait(&mut self, block: u64, text: &str) -> Option<String> {
+        let since = self.pending.get_or_insert((block, String::new())).0;
+        if block.saturating_sub(since) >= STOP_GATE_BLOCKS {
+            self.pending = None;
+            Some(text.to_string())
+        } else {
+            self.pending = Some((since, text.to_string()));
+            None
         }
     }
 }
@@ -780,6 +816,42 @@ mod tests {
             spot(&[("останови", false), ("останови машину", false)]),
             vec![(1, "останови машину".into())]
         );
+    }
+
+    #[test]
+    fn a_sleep_phrase_counts_whole_and_never_inside_a_word_or_a_phrase() {
+        assert_eq!(heard_kind("усни", "мика"), Some(HeardKind::Sleep));
+        assert_eq!(heard_kind("иди спать", "мика"), Some(HeardKind::Sleep));
+        assert_eq!(heard_kind("списка", "мика"), None);
+        assert_eq!(heard_kind("спи спокойно", "мика"), None);
+        // The name wins: «Мика, усни» is a call.
+        assert_eq!(heard_kind("мика усни", "мика"), Some(HeardKind::Name));
+        // «усни» heard on its own: it counts when the phrase ends.
+        assert_eq!(
+            spot(&[("усни", false), ("усни", false), ("усни", true)]),
+            vec![(2, "усни".into())]
+        );
+        // The recognizer keeps the word: it counts after the gate.
+        let held: Vec<(&str, bool)> = vec![("засыпай", false); 10];
+        assert_eq!(spot(&held), vec![(STOP_GATE_BLOCKS, "засыпай".into())]);
+        // «спи» was the start of «списка»: nothing counts.
+        assert!(spot(&[("спи", false), ("списка", false), ("списка дел", true)]).is_empty());
+        // «спи» and then more words: nothing counts.
+        assert!(spot(&[("спи", false), ("спи спокойно", true)]).is_empty());
+    }
+
+    #[test]
+    fn the_sleep_words_are_hot_words_and_in_the_windows_grammar() {
+        let g = grammar_phrases("Мика");
+        let h = hotwords("Мика");
+        for w in SLEEP_WORDS.iter().chain(SLEEP_PHRASES.iter()) {
+            assert!(g.contains(&w.to_string()), "{w}");
+            assert!(h.contains(&w.to_string()), "{w}");
+        }
+        let mut unique = h.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), h.len());
     }
 
     #[test]

@@ -94,6 +94,13 @@ pub fn database_path() -> PathBuf {
     data_dir().join("mika.db")
 }
 
+/// Files attached to chat messages, a folder per conversation:
+/// `%APPDATA%\Mika\attachments` (decision 0053). Next to `mika.db`, so the
+/// database finds it from its own path.
+pub fn attachments_dir() -> PathBuf {
+    data_dir().join(crate::attach::FOLDER)
+}
+
 /// Copies of the data made before a restore: `%APPDATA%\Mika\backups`.
 pub fn backups_dir() -> PathBuf {
     data_dir().join("backups")

@@ -6,6 +6,7 @@ import './app.css';
 import './avatar.css';
 import { isLang, setLang } from './lib/locale.svelte';
 import { allowsContextMenu } from './lib/menu';
+import { apply as applyTheme, themeChange, type ThemeView } from './lib/theme';
 
 const params = new URLSearchParams(location.search);
 const scenario = params.get('mock');
@@ -14,15 +15,18 @@ if (import.meta.env.DEV && scenario !== null) {
   await install(scenario);
 }
 
-// The language is known before the first paint; a change comes on the UI channel.
+// The language and the theme are known before the first paint; a change comes on the UI channel.
 try {
   const saved = await invoke<unknown>('get_language');
   if (isLang(saved)) setLang(saved);
+  applyTheme(await invoke<ThemeView>('get_theme').catch(() => null));
   await listen<{ action?: string; lang?: unknown }>('mika://ui', (e) => {
     if (e.payload?.action === 'language_changed' && isLang(e.payload.lang)) setLang(e.payload.lang);
+    const theme = themeChange(e.payload);
+    if (theme) applyTheme(theme);
   });
 } catch {
-  // Outside Tauri and without a mock the page stays Russian.
+  // Outside Tauri and without a mock the page stays Russian and violet.
 }
 
 // The desktop avatar window loads the same bundle with `?view=avatar`.

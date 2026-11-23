@@ -223,7 +223,7 @@
     flex: none;
     border-radius: 50%;
     overflow: hidden;
-    background: radial-gradient(circle at 50% 30%, #4a4090, #1b1736);
+    background: radial-gradient(circle at 50% 30%, var(--halo-a), var(--halo-b));
     box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.14);
   }
 </style>

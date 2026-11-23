@@ -138,14 +138,14 @@
     padding: 0 8px;
     border-radius: 9px;
     border: 1px solid var(--line2);
-    background: #14131f;
+    background: var(--raised-v);
     color: #fff;
     font: inherit;
     font-size: 12.5px;
   }
   input:focus {
     outline: none;
-    border-color: rgba(143, 125, 255, 0.6);
+    border-color: rgba(var(--v-rgb), 0.6);
   }
   /* The toggle keeps the look of every toggle of the app. */
   button:not(.tg) {

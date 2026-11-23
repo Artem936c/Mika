@@ -66,13 +66,16 @@ pub fn set_island_rect(rect: tauri::State<'_, Arc<Mutex<IslandRect>>>, value: Is
 type CtxState<'a> = tauri::State<'a, Arc<crate::app::Ctx>>;
 
 /// Answers an open question or starts a reply in the background.
+/// The files attached in the chat go with it (decision 0053).
 #[tauri::command]
-pub fn send_message(ctx: CtxState<'_>, text: String) {
+pub fn send_message(app: AppHandle, ctx: CtxState<'_>, text: String) {
     ctx.end_voice_dialog();
-    let session = ctx.session.clone();
+    let ctx = ctx.inner().clone();
     // Session::submit spawns on tokio; run it inside the Tauri runtime.
     tauri::async_runtime::spawn(async move {
-        session.submit(&text);
+        if let Some(view) = crate::attachments::send_with_files(&ctx, &text) {
+            crate::attachments::changed(&app, &view);
+        }
     });
 }
 
@@ -101,10 +104,19 @@ pub fn get_paused(ctx: CtxState<'_>) -> bool {
     ctx.session.pause().is_on()
 }
 
+/// Whether she sleeps (decision 0050): the island says so.
+#[tauri::command]
+pub fn get_sleeping(ctx: CtxState<'_>) -> bool {
+    ctx.session.pause().is_sleeping()
+}
+
 #[derive(serde::Serialize)]
 pub struct HistoryItem {
     role: &'static str,
     text: String,
+    /// Files attached to a user message (decision 0053).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<mika_core::attach::AttachmentCard>,
 }
 
 #[tauri::command]
@@ -114,30 +126,28 @@ pub fn get_history(ctx: CtxState<'_>) -> Vec<HistoryItem> {
         .agent
         .history()
         .into_iter()
-        .filter(|m| !m.content.trim().is_empty())
+        .filter(|m| !m.content.trim().is_empty() || !m.attachments.is_empty())
         .filter_map(|m| match m.role {
             Role::User => Some(HistoryItem {
                 role: "user",
+                attachments: mika_core::attach::cards(&m.attachments),
                 text: m.content,
             }),
             Role::Assistant => Some(HistoryItem {
                 role: "assistant",
                 text: m.content,
+                attachments: Vec::new(),
             }),
             _ => None,
         })
         .collect()
 }
 
-/// Starts a new conversation. The old one goes to the archive, where
-/// `history_search` still finds it; the "Memory" page clears the archive.
+/// Starts a new conversation; kept for older callers, the chat calls
+/// `new_conversation` (decision 0052). The old one stays in the list.
 #[tauri::command]
-pub fn clear_history(ctx: CtxState<'_>) -> Result<(), String> {
-    ctx.session.agent.clear_history();
-    ctx.db
-        .archive_messages(crate::app::CONVERSATION)
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+pub async fn clear_history(ctx: tauri::State<'_, Arc<crate::app::Ctx>>) -> Result<(), String> {
+    ctx.new_conversation(true).await
 }
 
 // ---- confirmations and permissions ----
@@ -245,8 +255,6 @@ pub struct UiSettings {
     speak_replies: bool,
     microphone_enabled: bool,
     screen_enabled: bool,
-    persona: mika_core::config::Persona,
-    custom_prompt: String,
     avatar_in_island: bool,
     avatar_on_desktop: bool,
     /// True when the main window is an ordinary window instead of the island.
@@ -264,8 +272,6 @@ pub fn get_ui_settings(ctx: CtxState<'_>) -> UiSettings {
         speak_replies: c.voice.speak_replies,
         microphone_enabled: c.privacy.microphone_enabled,
         screen_enabled: c.privacy.screen_enabled,
-        persona: c.assistant.persona,
-        custom_prompt: c.assistant.custom_prompt.clone(),
         avatar_in_island: c.avatar.in_island,
         avatar_on_desktop: c.avatar.on_desktop,
         windowed: c.window.mode == mika_core::config::WindowMode::Window,
@@ -392,28 +398,6 @@ pub fn settings_changed_by_talk(app: &AppHandle, key: &str) {
 pub fn set_assistant_name(app: AppHandle, ctx: CtxState<'_>, value: String) -> Result<(), String> {
     let name = clean_name(&value)?;
     ctx.config.lock().assistant.name = name;
-    ctx.save_config()?;
-    ctx.refresh_prompt();
-    settings_changed(&app);
-    Ok(())
-}
-
-#[tauri::command]
-pub fn set_persona(
-    app: AppHandle,
-    ctx: CtxState<'_>,
-    persona: mika_core::config::Persona,
-    custom_prompt: String,
-) -> Result<(), String> {
-    {
-        let mut cfg = ctx.config.lock();
-        cfg.assistant.persona = persona;
-        cfg.assistant.custom_prompt = custom_prompt
-            .trim()
-            .chars()
-            .take(mika_core::config::MAX_CUSTOM_PROMPT)
-            .collect();
-    }
     ctx.save_config()?;
     ctx.refresh_prompt();
     settings_changed(&app);

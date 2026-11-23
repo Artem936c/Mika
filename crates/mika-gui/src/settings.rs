@@ -149,6 +149,9 @@ pub fn set_briefing(ctx: CtxState<'_>, enabled: bool, time: String) -> Result<()
 #[derive(serde::Serialize)]
 pub struct RhythmSettings {
     rhythm: mika_core::config::RhythmConfig,
+    /// The companion in games (decision 0054) and the «Экран» switch it needs.
+    companion: mika_core::config::CompanionConfig,
+    screen_enabled: bool,
     tracking: mika_core::config::TrackingConfig,
     clip_count: usize,
     /// Seconds of focus left, when it runs.
@@ -180,6 +183,11 @@ fn rhythm_settings(ctx: &Ctx) -> RhythmSettings {
     let (calendar_events, read, calendar_error) = shared.calendar.status();
     RhythmSettings {
         rhythm: c.rhythm,
+        companion: mika_core::config::CompanionConfig {
+            every_s: c.companion.every(),
+            ..c.companion
+        },
+        screen_enabled: c.privacy.screen_enabled,
         tracking: c.tracking,
         clip_count: shared.clips.len(),
         focus_left_s: shared.focus.left(chrono::Local::now().timestamp()),
@@ -211,6 +219,35 @@ pub fn set_rhythm(
         c.rhythm.break_every_min = break_every_min.clamp(15, 240);
         c.rhythm.lively = lively;
     }
+    ctx.save_config()
+}
+
+/// Why the companion may not be turned on now: `None` when it may. Turning
+/// on needs «Экран»; nothing turns «Экран» on along the way. A companion
+/// that is on already may change its interval with «Экран» off: it just
+/// does not look until «Экран» is back.
+pub fn companion_refusal(enabled: bool, was: bool, screen: bool) -> Option<&'static str> {
+    (enabled && !was && !screen).then_some("tools.companion_needs_screen")
+}
+
+/// The companion in games (decision 0054). The page asks before it turns it
+/// on; the settings by conversation ask through the policy and never from
+/// Telegram.
+#[tauri::command]
+pub fn set_companion(ctx: CtxState<'_>, enabled: bool, every_s: u32) -> Result<(), String> {
+    use mika_core::config::CompanionConfig;
+    let every_s = every_s.clamp(CompanionConfig::EVERY_MIN, CompanionConfig::EVERY_MAX);
+    {
+        let mut c = ctx.config.lock();
+        if let Some(key) = companion_refusal(enabled, c.companion.enabled, c.privacy.screen_enabled)
+        {
+            log::info!(target: "app", "companion in games not turned on: reason=screen_off");
+            return Err(crate::strings::tr(key));
+        }
+        c.companion.enabled = enabled;
+        c.companion.every_s = every_s;
+    }
+    log::info!(target: "app", "companion in games: enabled={enabled} every_s={every_s}");
     ctx.save_config()
 }
 
@@ -608,7 +645,10 @@ pub async fn idle_info(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<IdleInfo, Stri
 #[derive(serde::Serialize)]
 pub struct MemoryView {
     facts: Vec<Fact>,
-    archived_messages: usize,
+    /// Conversations that are neither pinned nor open (decision 0052).
+    other_conversations: usize,
+    /// «Удалять диалоги старше N дней»; 0 is «никогда».
+    keep_days: u32,
     embedding_base_url: String,
     embedding_model: String,
     has_embedding_key: bool,
@@ -617,10 +657,19 @@ pub struct MemoryView {
 
 #[tauri::command]
 pub fn get_memory(ctx: CtxState<'_>) -> Result<MemoryView, String> {
+    let open = ctx.session.agent.conversation().unwrap_or_default();
+    let other_conversations = ctx
+        .db
+        .list_conversations()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .filter(|c| !c.pinned && c.id != open)
+        .count();
     let c = ctx.config.lock();
     Ok(MemoryView {
         facts: ctx.memory.facts.list().map_err(|e| e.to_string())?,
-        archived_messages: ctx.db.archive_size().map_err(|e| e.to_string())?,
+        other_conversations,
+        keep_days: c.history.keep_days,
         embedding_base_url: c.embedding.base_url.clone(),
         embedding_model: c.embedding.model.clone(),
         has_embedding_key: has_secret(&ctx, EMBEDDING_SECRET_KEY),
@@ -644,11 +693,6 @@ pub fn remove_fact(ctx: CtxState<'_>, id: i64) -> Result<bool, String> {
 #[tauri::command]
 pub fn clear_facts(ctx: CtxState<'_>) -> Result<usize, String> {
     ctx.memory.facts.clear().map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn clear_archive(ctx: CtxState<'_>) -> Result<usize, String> {
-    ctx.db.clear_archive().map_err(|e| e.to_string())
 }
 
 /// A new model makes the stored vectors useless: they are dropped and made again on demand.
@@ -1143,6 +1187,8 @@ pub struct VoiceSettings {
     /// Who hears it now, after the fallback to what is downloaded.
     wake_engine_used: mika_core::config::WakeEngineChoice,
     follow_up: bool,
+    /// The switch of quick commands (decision 0050).
+    quick: bool,
     duck_media: bool,
     tts_style: String,
     tone_by_mood: bool,
@@ -1254,6 +1300,7 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
         wake_engine: c.wake_engine,
         wake_engine_used: *ctx.wake_engine_used.lock(),
         follow_up: c.follow_up,
+        quick: ctx.config.lock().quick.enabled,
         duck_media: c.duck_media,
         tts_style: c.tts_style,
         tone_by_mood: c.tone_by_mood,
@@ -1281,6 +1328,14 @@ pub fn set_follow_up(ctx: CtxState<'_>, value: bool) -> Result<(), String> {
     if !value {
         ctx.end_voice_dialog();
     }
+    ctx.save_config()
+}
+
+/// Quick commands on or off (decision 0050). The session reads the switch
+/// at each message, so nothing else is told.
+#[tauri::command]
+pub fn set_quick_commands(ctx: CtxState<'_>, value: bool) -> Result<(), String> {
+    ctx.config.lock().quick.enabled = value;
     ctx.save_config()
 }
 
@@ -1644,6 +1699,19 @@ pub async fn problem_report(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<String, S
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn the_companion_turns_on_only_with_the_screen() {
+        assert_eq!(
+            companion_refusal(true, false, false),
+            Some("tools.companion_needs_screen")
+        );
+        assert_eq!(companion_refusal(true, false, true), None);
+        // Already on: the interval changes; off is always allowed.
+        assert_eq!(companion_refusal(true, true, false), None);
+        assert_eq!(companion_refusal(false, true, false), None);
+        assert_eq!(companion_refusal(false, false, false), None);
+    }
 
     #[test]
     fn args_split_on_spaces_outside_quotes() {

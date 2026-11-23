@@ -29,9 +29,39 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
-    /// PNG pictures in base64, for models that can see.
+    /// PNG pictures in base64, for models that can see. Filled only in the
+    /// copy that goes to the provider: a stored message keeps its pictures
+    /// as files in `attachments` (decision 0053).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    /// Files the user attached to the message (decision 0053). Messages
+    /// stored before had none: the field may be missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<Attachment>,
+}
+
+/// What an attached file became (decision 0053).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    /// A picture, kept as PNG.
+    Image,
+    /// Text read from the file, kept as UTF-8 text.
+    Text,
+}
+
+/// A file attached to a user message (decision 0053).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub kind: AttachmentKind,
+    /// The name of the file the user chose, as the chip shows it.
+    pub name: String,
+    /// The kept copy, relative to the attachments folder: `<folder>/<file>`.
+    pub path: String,
+    /// What the vision model said the picture shows, when the main model
+    /// does not get pictures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 impl ChatMessage {
@@ -42,6 +72,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             images: Vec::new(),
+            attachments: Vec::new(),
         }
     }
 
@@ -57,6 +88,14 @@ impl ChatMessage {
     pub fn user_with_image(content: impl Into<String>, png_base64: impl Into<String>) -> Self {
         Self {
             images: vec![png_base64.into()],
+            ..Self::plain(Role::User, content)
+        }
+    }
+
+    /// A user message with attached files (decision 0053).
+    pub fn user_with_attachments(content: impl Into<String>, attachments: Vec<Attachment>) -> Self {
+        Self {
+            attachments,
             ..Self::plain(Role::User, content)
         }
     }
@@ -174,6 +213,13 @@ pub trait Vision: Send + Sync {
             Some(png) => self.ask(png, question).await,
             None => Err("нет кадров".into()),
         }
+    }
+
+    /// One picture with system words of the caller's own in place of the
+    /// usual ones: her character and a task (decision 0054). By default the
+    /// usual question is asked with `system` in front of it.
+    async fn ask_as(&self, system: &str, png: &[u8], question: &str) -> Result<String, String> {
+        self.ask(png, &format!("{system}\n\n{question}")).await
     }
 }
 

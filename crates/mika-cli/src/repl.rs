@@ -41,6 +41,10 @@ impl Renderer {
                 format!("[state] {} -> {}", from.as_str(), to.as_str())
             }
             Event::UserText { text } => format!("[user] {text}"),
+            Event::UserAttachments { items } => {
+                let names: Vec<&str> = items.iter().map(|a| a.name.as_str()).collect();
+                format!("[files] {}", names.join(", "))
+            }
             Event::Error { message } => format!("[error] {message}"),
             Event::ToolStarted { name, summary, .. } => format!("[tool] {name}: {summary}"),
             Event::ToolFinished {
@@ -85,7 +89,9 @@ impl Renderer {
             Event::Timing { stage, ms } => format!("[time] {stage} {ms} ms"),
             Event::VoicePhrase { levels, .. } => format!("[voice] phrase, {} steps", levels.len()),
             Event::VoiceQuiet => "[voice] quiet".to_string(),
-            Event::PauseChanged { paused } => format!("[pause] {paused}"),
+            Event::PauseChanged { paused, sleeping } => {
+                format!("[pause] {paused} sleeping={sleeping}")
+            }
             Event::SkillOffer { actions, .. } => format!(
                 "[skill] {actions} действия подряд: скажи «сохрани это как навык», чтобы повторять их по имени"
             ),

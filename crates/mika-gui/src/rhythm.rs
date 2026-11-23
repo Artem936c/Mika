@@ -163,6 +163,8 @@ struct Watch {
     last_tick: Option<i64>,
     sample_left: u64,
     pruned_on: Option<NaiveDate>,
+    /// The day old conversations were last deleted (decision 0052).
+    purged_on: Option<NaiveDate>,
 }
 
 impl Watch {
@@ -370,6 +372,14 @@ impl Ctx {
                 emotion: Emotion::Sleepy,
             });
             self.remark(&pick(&tr("life.late"), seed()), "life", false);
+        }
+
+        // Old conversations: at the first tick after start and once a day.
+        if w.purged_on != Some(now.date_naive()) {
+            w.purged_on = Some(now.date_naive());
+            // SQLite and the disk: off the async threads.
+            let ctx = self.clone();
+            tauri::async_runtime::spawn_blocking(move || ctx.purge_conversations());
         }
 
         // Time in programs: the window in front, while someone is there.

@@ -2,9 +2,12 @@ import { describe, expect, it } from 'vitest';
 import type { JobView } from './bgjobs';
 import {
   addJobs,
+  attachView,
   baseName,
   cardData,
   clock,
+  conversationRows,
+  conversationWhen,
   countdown,
   formatSeconds,
   fromHistory,
@@ -93,6 +96,13 @@ describe('new events and cards', () => {
       { kind: 'reminder', text: 'Через 10 мин: Созвон' },
     ]);
     expect(reduceChat([], { type: 'remark', text: ' ', kind: 'life' })).toEqual([]);
+  });
+
+  it('a line of the companion in games is marked as one', () => {
+    expect(reduceChat([], { type: 'remark', text: 'Красиво ушёл от удара!', kind: 'companion' })).toEqual([
+      { kind: 'reminder', text: 'Красиво ушёл от удара!', companion: true },
+    ]);
+    expect(reduceChat([], { type: 'remark', text: '  ', kind: 'companion' })).toEqual([]);
   });
 
   it('image card needs a path', () => {
@@ -663,5 +673,104 @@ describe('research report card', () => {
   it('labels the tool as a search', () => {
     expect(toolLabel('deep_search')).toBe('tool.search');
     expect(isMessageKey(toolLabel('deep_search'))).toBe(true);
+  });
+});
+
+describe('conversation list', () => {
+  const now = new Date(2026, 10, 22, 15, 30);
+  const view = {
+    current: 'c-2',
+    items: [
+      { id: 'c-1', title: 'Кот', created_at: '2026-11-01T10:00:00+03:00', updated_at: new Date(2026, 10, 22, 9, 5).toISOString(), pinned: true, messages: 4 },
+      { id: 'c-2', title: '', created_at: 'x', updated_at: new Date(2026, 10, 20, 9, 5).toISOString(), pinned: false, messages: 0 },
+      { id: 'main', title: 'Старое', updated_at: new Date(2025, 2, 3, 9, 5).toISOString(), messages: 12 },
+      { id: '', title: 'без id' },
+      null,
+      'строка',
+    ],
+  };
+
+  it('keeps the order of the list, marks the open one and drops broken entries', () => {
+    const rows = conversationRows(view, now);
+    expect(rows.map((r) => r.id)).toEqual(['c-1', 'c-2', 'main']);
+    expect(rows.map((r) => r.current)).toEqual([false, true, false]);
+    expect(rows.map((r) => r.pinned)).toEqual([true, false, false]);
+    expect(rows.map((r) => r.title)).toEqual(['Кот', '', 'Старое']);
+    expect(rows.map((r) => r.messages)).toEqual([4, 0, 12]);
+  });
+
+  it('says a time for today and a date otherwise', () => {
+    const [today, thisYear, before] = conversationRows(view, now).map((r) => r.when);
+    expect(today).toMatch(/09:05/);
+    expect(thisYear).not.toMatch(/:/);
+    expect(thisYear).toMatch(/20/);
+    expect(before).toMatch(/2025/);
+    expect(conversationWhen('не дата', now)).toBe('');
+  });
+
+  it('draws nothing from something that is not a list', () => {
+    expect(conversationRows(null, now)).toEqual([]);
+    expect(conversationRows({ current: 'a' }, now)).toEqual([]);
+    expect(conversationRows({ items: [{ id: 'a' }] }, now)).toEqual([{ id: 'a', title: '', when: '', pinned: false, current: false, messages: 0 }]);
+  });
+});
+
+describe('attachments (decision 0053)', () => {
+  it('the files of a message go under the user line that came last', () => {
+    const items = run([
+      { type: 'user_text', text: 'что тут?' },
+      { type: 'user_attachments', items: [{ kind: 'image', name: 'кот.png' }, { kind: 'text', name: 'заметки.txt' }, { kind: 'pdf', name: 'x' }, { name: 'y' }] },
+      { type: 'assistant_text', text: 'Кот.' },
+    ]);
+    expect(items[0]).toEqual({
+      kind: 'user',
+      text: 'что тут?',
+      attachments: [
+        { kind: 'image', name: 'кот.png' },
+        { kind: 'text', name: 'заметки.txt' },
+      ],
+    });
+    // Nothing to draw, or no user line: nothing changes.
+    expect(run([{ type: 'user_attachments', items: [{ kind: 'image', name: 'a.png' }] }])).toEqual([]);
+    const plain = run([{ type: 'user_text', text: 'a' }]);
+    expect(reduceChat(plain, { type: 'user_attachments', items: [] })).toBe(plain);
+  });
+
+  it('history shows the chips of a message, an old one has none', () => {
+    expect(
+      fromHistory([
+        { role: 'user', text: '', attachments: [{ kind: 'image', name: 'кот.png' }] },
+        { role: 'user', text: 'старое' },
+        { role: 'assistant', text: 'ответ', attachments: [{ kind: 'image', name: 'x.png' }] },
+      ]),
+    ).toEqual([
+      { kind: 'user', text: '', attachments: [{ kind: 'image', name: 'кот.png' }] },
+      { kind: 'user', text: 'старое' },
+      { kind: 'assistant', text: 'ответ' },
+    ]);
+  });
+
+  it('the waiting files are read from the answer of the commands', () => {
+    expect(
+      attachView({
+        items: [
+          { id: 1, kind: 'image', name: 'a.png', cut: false },
+          { id: 2, kind: 'text', name: 'b.log', cut: true },
+          { id: 'x', kind: 'text', name: 'bad' },
+        ],
+        refused: ['«c.exe» не прикреплён', 7, ''],
+        hint: true,
+      }),
+    ).toEqual({
+      items: [
+        { id: 1, kind: 'image', name: 'a.png', cut: false },
+        { id: 2, kind: 'text', name: 'b.log', cut: true },
+      ],
+      refused: ['«c.exe» не прикреплён'],
+      hint: true,
+    });
+    // The hint is about pictures only.
+    expect(attachView({ items: [{ id: 1, kind: 'text', name: 'a.txt' }], hint: true }).hint).toBe(false);
+    expect(attachView(null)).toEqual({ items: [], refused: [], hint: false });
   });
 });

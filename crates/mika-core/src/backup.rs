@@ -986,6 +986,12 @@ mod tests {
         fn old() -> Pc {
             let mut config = Config::default();
             config.assistant.name = "Айри".into();
+            // Own characters travel with the settings (decision 0051).
+            config
+                .assistant
+                .save_custom_persona(None, "Котёнок", "Мурлычешь и ласкаешься.")
+                .unwrap();
+            config.assistant.choose_persona("Котёнок").unwrap();
             config.llm.base_url = "https://routerai.ru/api/v1".into();
             config.voice.speech_base_url = "https://speech.example/v1/".into();
             config.privacy.microphone_enabled = true;
@@ -1247,6 +1253,8 @@ mod tests {
         assert!(done.restart_needed);
         let landed = done.config.unwrap();
         assert_eq!(landed.assistant.name, "Айри");
+        assert_eq!(landed.assistant.persona_choice(), "Котёнок");
+        assert_eq!(landed.assistant.persona_prompt(), "Мурлычешь и ласкаешься.");
         assert_eq!(landed.llm.base_url, "https://routerai.ru/api/v1");
         // The path to a program is the one of this PC, which has none.
         assert_eq!(landed.tools.ffmpeg_path, "");

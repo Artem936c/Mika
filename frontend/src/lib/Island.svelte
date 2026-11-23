@@ -84,7 +84,7 @@
   .tone-glow {
     box-shadow:
       0 14px 44px rgba(0, 0, 0, 0.55),
-      0 0 46px rgba(143, 125, 255, 0.42);
+      0 0 46px rgba(var(--v-rgb), 0.42);
   }
   .tone-glow .ring {
     opacity: 1;
@@ -102,7 +102,7 @@
   }
   .tone-danger .ring {
     opacity: 1;
-    background: conic-gradient(from var(--a), var(--bad), #ffb36b, var(--bad));
+    background: conic-gradient(from var(--a), var(--bad), var(--hot), var(--bad));
   }
   .island {
     position: absolute;

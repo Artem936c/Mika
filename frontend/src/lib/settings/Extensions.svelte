@@ -355,7 +355,7 @@
     padding: 2px 8px;
     border-radius: 999px;
     color: var(--c);
-    background: rgba(111, 227, 255, 0.1);
+    background: rgba(var(--c-rgb), 0.1);
   }
   .tag.dim {
     color: var(--mute);

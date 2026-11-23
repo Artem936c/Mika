@@ -10,9 +10,9 @@ use std::path::PathBuf;
 
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::Controls::Dialogs::{
-    CommDlgExtendedError, GetOpenFileNameW, GetSaveFileNameW, OFN_DONTADDTORECENT, OFN_EXPLORER,
-    OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
-    OPENFILENAMEW,
+    CommDlgExtendedError, GetOpenFileNameW, GetSaveFileNameW, OFN_ALLOWMULTISELECT,
+    OFN_DONTADDTORECENT, OFN_EXPLORER, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR,
+    OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 
 use crate::strings::tr;
@@ -36,10 +36,37 @@ fn filter_wide(label: &str, pattern: &str) -> Vec<u16> {
     out
 }
 
+/// Several entries of the file type list, closed by one more zero.
+fn filters_wide(filters: &[(&str, &str)]) -> Vec<u16> {
+    let mut out = Vec::new();
+    for (label, pattern) in filters {
+        out.extend(wide(&format!("{label} ({pattern})")));
+        out.extend(wide(pattern));
+    }
+    out.push(0);
+    out
+}
+
+/// The files chosen in a dialog that allows several: one full path, or the
+/// folder followed by the names, each closed by a zero, the list by two.
+fn chosen_files(buffer: &[u16]) -> Vec<PathBuf> {
+    let parts: Vec<PathBuf> = buffer
+        .split(|unit| *unit == 0)
+        .take_while(|part| !part.is_empty())
+        .map(|part| PathBuf::from(OsString::from_wide(part)))
+        .collect();
+    match parts.split_first() {
+        None => Vec::new(),
+        Some((one, [])) => vec![one.clone()],
+        Some((folder, names)) => names.iter().map(|n| folder.join(n)).collect(),
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Save,
     Open,
+    OpenMany,
 }
 
 /// What a dialog is opened with, ready to cross to its thread.
@@ -53,7 +80,7 @@ struct Request {
 }
 
 /// Shows the dialog and waits for it. Runs on a thread of its own.
-fn show(request: Request) -> Result<Option<PathBuf>, String> {
+fn show(request: Request) -> Result<Vec<PathBuf>, String> {
     let mut file = vec![0u16; FILE_BUFFER];
     // The name offered in "Save as"; the zero at its end is already there.
     let name = &request.default_name[..request.default_name.len().saturating_sub(1)];
@@ -79,6 +106,7 @@ fn show(request: Request) -> Result<Option<PathBuf>, String> {
     ofn.Flags = match request.kind {
         Kind::Save => common | OFN_OVERWRITEPROMPT,
         Kind::Open => common | OFN_FILEMUSTEXIST,
+        Kind::OpenMany => common | OFN_FILEMUSTEXIST | OFN_ALLOWMULTISELECT,
     };
     // SAFETY: every pointer in `ofn` points into a buffer that lives until
     // the call returns, and `nMaxFile` is the real length of the file buffer.
@@ -86,30 +114,33 @@ fn show(request: Request) -> Result<Option<PathBuf>, String> {
     let chosen = unsafe {
         match request.kind {
             Kind::Save => GetSaveFileNameW(&mut ofn),
-            Kind::Open => GetOpenFileNameW(&mut ofn),
+            Kind::Open | Kind::OpenMany => GetOpenFileNameW(&mut ofn),
         }
     };
     if chosen == 0 {
         // SAFETY: plain query of the last dialog error of this thread.
         return match unsafe { CommDlgExtendedError() } {
             // The user closed the dialog.
-            0 => Ok(None),
+            0 => Ok(Vec::new()),
             code => {
                 log::warn!("file dialog failed: {code:#x}");
                 Err(tr("error.backup_dialog"))
             }
         };
     }
+    if request.kind == Kind::OpenMany {
+        return Ok(chosen_files(&file));
+    }
     let len = file.iter().position(|unit| *unit == 0).unwrap_or(0);
     if len == 0 {
-        return Ok(None);
+        return Ok(Vec::new());
     }
-    Ok(Some(PathBuf::from(OsString::from_wide(&file[..len]))))
+    Ok(vec![PathBuf::from(OsString::from_wide(&file[..len]))])
 }
 
 /// A fresh thread has no COM state of ours, and the dialog pumps its own
 /// messages there.
-fn run(request: Request) -> Result<Option<PathBuf>, String> {
+fn run(request: Request) -> Result<Vec<PathBuf>, String> {
     std::thread::spawn(move || show(request))
         .join()
         .unwrap_or_else(|_| Err(tr("error.backup_dialog")))
@@ -134,6 +165,7 @@ pub fn pick_save(
         default_name: wide(default_name),
         default_ext: wide(default_ext),
     })
+    .map(|paths| paths.into_iter().next())
 }
 
 /// Blocking, like `pick_save`. The file must exist.
@@ -147,6 +179,25 @@ pub fn pick_open(
         owner,
         title: wide(title),
         filter: filter_wide(filter.0, filter.1),
+        default_name: wide(""),
+        default_ext: wide(""),
+    })
+    .map(|paths| paths.into_iter().next())
+}
+
+/// Blocking, like `pick_open`, and several files may be chosen. `filters`
+/// are the entries of the type list, the first one shown. Empty when the
+/// user cancelled.
+pub fn pick_open_many(
+    owner: isize,
+    title: &str,
+    filters: &[(&str, &str)],
+) -> Result<Vec<PathBuf>, String> {
+    run(Request {
+        kind: Kind::OpenMany,
+        owner,
+        title: wide(title),
+        filter: filters_wide(filters),
         default_name: wide(""),
         default_ext: wide(""),
     })
@@ -168,6 +219,30 @@ mod tests {
         );
         // A zero inside a text would cut the list short.
         assert_eq!(filter_wide("a\0b", "*.x"), units("ab (*.x)\0*.x\0\0"));
+    }
+
+    #[test]
+    fn several_filters_are_closed_by_one_more_zero() {
+        assert_eq!(
+            filters_wide(&[("A", "*.a"), ("B", "*.*")]),
+            units("A (*.a)\0*.a\0B (*.*)\0*.*\0\0")
+        );
+    }
+
+    #[test]
+    fn one_or_several_chosen_files() {
+        assert_eq!(
+            chosen_files(&units("C:\\d\\a.png\0\0garbage")),
+            vec![PathBuf::from("C:\\d\\a.png")]
+        );
+        assert_eq!(
+            chosen_files(&units("C:\\d\0a.png\0b c.txt\0\0")),
+            vec![
+                PathBuf::from("C:\\d").join("a.png"),
+                PathBuf::from("C:\\d").join("b c.txt")
+            ]
+        );
+        assert!(chosen_files(&units("\0\0")).is_empty());
     }
 
     #[test]

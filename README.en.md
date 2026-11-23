@@ -31,7 +31,9 @@ The interface is in Russian and English: pick the language on the first-run scre
 - **Windows of any program.** She reads a window, clicks buttons by their label or by a path, types text and presses keys. After every action she sees what changed.
 - **Her own browser** in a separate Edge profile: open, read, click, fill in. She leaves sign-in, banking and payment pages alone.
 - **Files**: search, read, write, archives, the Recycle Bin. Tidying a folder takes up to 200 actions under one confirmation.
-- **Memory** with search by meaning, an archive of past conversations, reminders, timers, scheduled tasks, a to-do list.
+- **Conversations.** A list of past conversations: open and continue, rename, pin, delete. Old unpinned ones are deleted by themselves, after 30 days by default.
+- **Attachments.** A paperclip, drag and drop or Ctrl+V: pictures, text, PDF, DOCX and XLSX right in a message.
+- **Memory** with search by meaning, reminders, timers, scheduled tasks, a to-do list.
 - **Screen**: a question about a screenshot, text from a picture, a screenshot.
 - **Information and system**: weather, exchange rates, news, the media player, volume, Wi-Fi, Bluetooth, brightness.
 - **Voice.**
@@ -39,9 +41,13 @@ The interface is in Russian and English: pick the language on the first-run scre
   - The wake phrase "Mika" is recognized on this computer, by sherpa-onnx, Vosk or the Windows recognizer: you pick which in the settings.
   - Actions can be confirmed by voice.
   - "Stop" (in Russian: «стоп», «стой», «хватит», «перестань слушать») stops everything at any moment: the reply, the task, actions in windows, background jobs. After that Mika starts nothing on her own until you call her.
+- **Quick commands without the model.** "Quieter", "volume 30", "next track", "what time is it", "timer for 5 minutes", "open the browser" run at once, free and offline, through the same risk policy. Say "sleep" and Mika stays quiet until you call her, while work already started finishes.
 - **Settings by conversation.** "Speak quieter", "change the voice", "turn off dictation", "what are your settings?". The microphone, the screen, Telegram and other sensitive features turn on only with a confirmation. The microphone and the screen cannot be turned on from Telegram.
 - **Skills.** After a successful chain of actions Mika offers to save it as a skill, then repeats it by name, with parameters. Every step of a skill goes through the risk policy again.
 - **Extensions**: MCP servers (a program or HTTP), your own commands, control from Telegram.
+- **Character.** Ready characters and up to ten of your own, switched on the fly by voice or from the chat menu. An 18+ mode is off by default and turns on only with a confirmation.
+- **Game companion.** When turned on, Mika now and then looks at a full-screen game and makes a short spoken remark. It needs Screen on and skips blind-zone windows, browsers, calls and remote desktops.
+- **Themes.** Six ready themes and your own accent colour.
 - **Avatar.** An original character with ten emotions. She blinks, looks around, talks and reacts to clicks. The core picks her emotion from her state and from tags in the model's reply.
 - **Your own 3D model.** Add a `.vrm` file on the Character page and Mika comes alive in it:
   - she breathes, blinks, shifts her weight and stands in one of five poses;

@@ -41,10 +41,24 @@
 // the save dialog without a file. `?mock=settings&page=journal` is the same page without the unclean run.
 // Full stop (decision 0045): scenario `paused` speaks, hears «стоп», says what stopped and shows the calm paused island;
 // `&inchat` shows it in the chat, `&addressed` sends a message after four seconds: the pause ends with the line of what it skipped.
+// Quick commands and sleep (decision 0050): scenario `quick` runs «тише» without the model (the tool row and a short
+// reply), then «усни»: her line and the island «Сплю — позови по имени»; `&inchat` shows it in the chat, `&addressed`
+// wakes her after four seconds with the line of what the sleep skipped. The voice page has the switch «Быстрые команды»
+// (`&noquick` has it off).
 // Skills (decision 0047): scenario `skills` does three actions in a row and shows the chip «Сохранить как навык» under the
 // reply; a click saves the skill (`&stale` makes the recording old, so the click is refused). The extensions page lists
 // the skills with their steps; `&noskills` shows none, `&nosuggest` has the offers switched off.
 // `&lang=en` starts the preview in English; the language picker on `&page=general` and on `&welcome` switches it in place.
+// Themes (decision 0049): `&theme=sakura` (violet, night, sakura, mint, amber, graphite) starts any scenario in that theme,
+// `&accent=40c0a0` with an own accent; the tiles and the colour on `?mock=settings&page=island` switch it in place.
+// Attachments (decision 0053): scenario `attach` opens the chat with a message that has a picture and a log, two
+// files waiting under the field (a picture, so the hint shows, and a text that was cut), then drags a file over
+// the window and drops it (`&drop` keeps the drag going). The paperclip adds two files from a pretend dialog and
+// refuses a third; a pasted picture comes as `image.png`, any other paste as `вставка.txt`. Sending shows the chips
+// under the message and empties the list.
+// Companion in games (decision 0054): scenario `companion` opens the chat with two lines of the companion and the faces
+// that go with them. On the tools page (`?mock=settings&page=tools`) the switch «Напарник в играх» asks before it turns
+// on; `&companion` has it on already, `&noscreen` has «Экран» off (turning on only explains, an enabled one says it waits).
 
 import { mockIPC } from '@tauri-apps/api/mocks';
 import { emit } from '@tauri-apps/api/event';
@@ -682,9 +696,149 @@ export async function install(scenario: string) {
     'radial-gradient(760px 520px at 16% 108%,#51308f 0,transparent 62%),radial-gradient(700px 520px at 88% 104%,#b0437f 0,transparent 60%),radial-gradient(900px 500px at 60% -10%,#16436e 0,transparent 62%),linear-gradient(#0c0f1c,#131022)';
   let state = 'idle';
   let lang = params.get('lang') === 'en' ? 'en' : 'ru';
+  let theme = params.get('theme') ?? 'violet';
+  let accent = params.get('accent') ? `#${params.get('accent')!.replace('#', '').toLowerCase()}` : '';
   // Before the first-run screen is passed the name follows the language.
   let name = lang === 'en' && params.has('welcome') ? 'Mika' : 'Мика';
+  // Her character (decision 0051): `&noown` starts with no own characters, `&adult` with the adult mode on.
+  const READY_PERSONAS = ['caring', 'cheerful', 'calm', 'bold', 'business', 'sarcastic', 'sleepy'];
+  const READY_PERSONA_NAMES = ['заботливая', 'весёлая', 'спокойная', 'дерзкая', 'деловая', 'ехидная', 'сонная'];
   let persona = 'caring';
+  let ownPersonas = params.has('noown')
+    ? []
+    : [
+        { name: 'Котёнок', prompt: 'Мурлычешь, ласкаешься и называешь пользователя хозяином. Иногда отвлекаешься на солнечный зайчик.' },
+        { name: 'Капитан', prompt: 'Говоришь как старый морской волк: «полный вперёд», «свистать всех наверх». Задачи называешь курсом.' },
+      ];
+  let adultMode = params.has('adult');
+  const personaView = () => ({
+    choice: persona,
+    ready: READY_PERSONAS,
+    custom: ownPersonas.map((p) => ({ ...p })),
+    adult: adultMode,
+    max_custom: 10,
+    max_name: 32,
+    max_prompt: 1000,
+  });
+  // The list of conversations (decision 0052): the open one is empty, one is pinned, one is old.
+  // `&noconv` starts with only the open one.
+  type MockAttachment = { kind: 'image' | 'text'; name: string };
+  type MockConversation = {
+    id: string;
+    title: string;
+    updated: number;
+    pinned: boolean;
+    history: { role: string; text: string; attachments?: MockAttachment[] }[];
+  };
+  const ago = (days: number, hours = 0) => Date.now() - days * 86_400_000 - hours * 3_600_000;
+  let conversations: MockConversation[] = [
+    scenario === 'attach'
+      ? {
+          id: 'c-now',
+          title: 'Что не так на скриншоте?',
+          updated: ago(0),
+          pinned: false,
+          history: [
+            {
+              role: 'user',
+              text: 'Что не так на скриншоте? Лог сборки тоже приложила',
+              attachments: [
+                { kind: 'image', name: 'ошибка сборки.png' },
+                { kind: 'text', name: 'build.log' },
+              ],
+            },
+            { role: 'assistant', text: 'В логе ошибка в `main.rs`, строка 42: функция ждёт `&str`, а получает `String`. На скриншоте та же строка подчёркнута красным.' },
+            { role: 'user', text: '', attachments: [{ kind: 'image', name: 'после правки.jpg' }] },
+            { role: 'assistant', text: 'Теперь сборка зелёная.' },
+          ],
+        }
+      : { id: 'c-now', title: '', updated: ago(0), pinned: false, history: [] },
+    ...(params.has('noconv')
+      ? []
+      : [
+          {
+            id: 'c-cat',
+            title: 'Как зовут моего кота?',
+            updated: ago(0, 3),
+            pinned: false,
+            history: [
+              { role: 'user', text: 'Как зовут моего кота?' },
+              { role: 'assistant', text: 'Барсик. Ты говорил, что он любит спать на клавиатуре.' },
+            ],
+          },
+          {
+            id: 'c-trip',
+            title: 'Поездка в Казань',
+            updated: ago(6),
+            pinned: true,
+            history: [
+              { role: 'user', text: 'Составь план поездки в Казань на выходные' },
+              { role: 'assistant', text: 'Суббота: Кремль и улица Баумана. Воскресенье: Старо-Татарская слобода и чак-чак.' },
+            ],
+          },
+          {
+            id: 'main',
+            title: 'Почему небо голубое и что такое рэлеевс…',
+            updated: ago(45),
+            pinned: false,
+            history: [{ role: 'user', text: 'Почему небо голубое и что такое рэлеевское рассеяние?' }],
+          },
+        ]),
+  ];
+  let openConversation = 'c-now';
+  // Files waiting under the field (decision 0053).
+  type MockFile = MockAttachment & { id: number; cut: boolean };
+  let mockFiles: MockFile[] =
+    scenario === 'attach'
+      ? [
+          { id: 1, kind: 'image', name: 'скриншот ошибки.png', cut: false },
+          { id: 2, kind: 'text', name: 'журнал сборки за неделю.log', cut: true },
+        ]
+      : [];
+  let mockFileId = 10;
+  let mockPictureSent = false;
+  const attachViewOf = (refused: string[] = []) => ({
+    items: mockFiles.map((f) => ({ ...f })),
+    refused,
+    hint: !mockPictureSent && mockFiles.some((f) => f.kind === 'image'),
+  });
+  const mockAttach = (adds: (MockAttachment & { cut?: boolean })[]) => {
+    const refused: string[] = [];
+    for (const a of adds) {
+      if (mockFiles.length >= 5) {
+        refused.push(`В сообщении не больше 5 вложений: «${a.name}» не прикреплён.`);
+      } else if (a.name.endsWith('.exe')) {
+        refused.push(`«${a.name}» не прикреплён: такие файлы не читаю. Подходят картинки, текст, код, PDF, DOCX и XLSX.`);
+      } else {
+        mockFiles.push({ id: ++mockFileId, kind: a.kind, name: a.name, cut: a.cut === true });
+      }
+    }
+    return attachViewOf(refused);
+  };
+  let keepDays = 30;
+  const conversationsView = () => ({
+    current: openConversation,
+    items: [...conversations]
+      .sort((a, b) => Number(b.pinned) - Number(a.pinned) || b.updated - a.updated)
+      .map((c) => ({
+        id: c.id,
+        title: c.title,
+        created_at: new Date(c.updated).toISOString(),
+        updated_at: new Date(c.updated).toISOString(),
+        pinned: c.pinned,
+        messages: c.history.length,
+      })),
+  });
+  const findConversation = (id: unknown) => conversations.find((c) => c.id === id);
+  const newMockConversation = () => {
+    const id = `c-${Date.now()}`;
+    // As in Rust: the new one takes the place of the empty ones left behind.
+    conversations = conversations.filter((c) => c.pinned || c.title !== '' || c.history.length > 0);
+    conversations.push({ id, title: '', updated: Date.now(), pinned: false, history: [] });
+    openConversation = id;
+  };
+  const foldName = (s: string) => s.trim().toLowerCase().replace(/ё/g, 'е');
+  const findOwn = (n: string) => ownPersonas.find((p) => foldName(p.name) === foldName(n));
   let inIsland = !params.has('narrow');
   let onDesktop = false;
   const hasModel = params.has('model') || params.has('vrm');
@@ -704,6 +858,8 @@ export async function install(scenario: string) {
     setting: params.has('ffmpeg_bad') ? String.raw`D:\Tools\ffmpeg` : '',
     downloading: false,
   };
+  // The companion in games (decision 0054): `&companion` has it on.
+  const companion = { enabled: params.has('companion'), every_s: 60, max_per_hour: 40 };
   const research = { folder: '', model: '', searches: 5, pages: 8, minutes: 5, tokens: params.has('research_high') ? 150_000 : 50_000 };
   const researchView = () => ({
     folder: research.folder,
@@ -1069,12 +1225,91 @@ export async function install(scenario: string) {
       switch (cmd) {
         case 'get_paused':
           return false;
+        case 'get_sleeping':
+          return false;
+        case 'set_quick_commands':
+          return null;
         case 'get_state':
           return state;
         case 'get_emotion':
           return 'neutral';
         case 'get_history':
-          return [];
+          return structuredClone(findConversation(openConversation)?.history ?? []);
+        case 'send_message': {
+          // No reply comes; the message goes into the open conversation of the list.
+          const c = findConversation(openConversation);
+          const files = mockFiles.map(({ kind, name }) => ({ kind, name }));
+          if (c) {
+            c.history.push(files.length > 0 ? { role: 'user', text: String(a.text ?? ''), attachments: files } : { role: 'user', text: String(a.text ?? '') });
+            c.updated = Date.now();
+            if (!c.title) c.title = String(a.text ?? '').slice(0, 40);
+          }
+          if (files.length > 0) {
+            // The files go with the message: the chat shows them under it and the list empties.
+            mockPictureSent ||= files.some((f) => f.kind === 'image');
+            mockFiles = [];
+            send({ type: 'user_text', text: String(a.text ?? '') });
+            send({ type: 'user_attachments', items: files });
+            void emit('attachments-changed', attachViewOf());
+          }
+          return null;
+        }
+        case 'list_attachments':
+          return attachViewOf();
+        case 'pick_attachments':
+          return mockAttach([
+            { kind: 'text', name: 'Договор поставки.pdf' },
+            { kind: 'image', name: 'фото витрины.jpg' },
+            { kind: 'text', name: 'setup.exe' },
+          ]);
+        case 'attach_bytes': {
+          const bytes = args instanceof Uint8Array ? args : new Uint8Array();
+          const png = bytes[0] === 0x89 && bytes[1] === 0x50;
+          return mockAttach([png ? { kind: 'image', name: 'image.png' } : { kind: 'text', name: 'вставка.txt' }]);
+        }
+        case 'remove_attachment':
+          mockFiles = mockFiles.filter((f) => f.id !== a.id);
+          return attachViewOf();
+        case 'list_conversations':
+          return conversationsView();
+        case 'open_conversation':
+          if (!findConversation(a.id)) throw 'Этого диалога уже нет';
+          openConversation = String(a.id);
+          return conversationsView();
+        case 'new_conversation':
+        case 'clear_history':
+          if ((findConversation(openConversation)?.history.length ?? 0) > 0) newMockConversation();
+          return cmd === 'clear_history' ? null : conversationsView();
+        case 'rename_conversation': {
+          const c = findConversation(a.id);
+          if (!c) throw 'Этого диалога уже нет';
+          const title = String(a.title ?? '').replace(/\s+/g, ' ').trim();
+          const first = c.history.find((m) => m.role === 'user')?.text ?? '';
+          const pick = title || first.replace(/\s+/g, ' ').trim();
+          c.title = pick.length > 40 ? `${pick.slice(0, 39).trimEnd()}…` : pick;
+          return conversationsView();
+        }
+        case 'pin_conversation': {
+          const c = findConversation(a.id);
+          if (!c) throw 'Этого диалога уже нет';
+          c.pinned = a.pinned === true;
+          return conversationsView();
+        }
+        case 'delete_conversation': {
+          const gone = String(a.id);
+          if (gone === openConversation) newMockConversation();
+          conversations = conversations.filter((c) => c.id !== gone);
+          return conversationsView();
+        }
+        case 'delete_unpinned_conversations': {
+          const before = conversations.length;
+          conversations = conversations.filter((c) => c.pinned || c.id === openConversation);
+          return before - conversations.length;
+        }
+        case 'set_history_keep':
+          if (![7, 30, 90, 365, 0].includes(Number(a.days))) throw `unknown choice: ${a.days}`;
+          keepDays = Number(a.days);
+          return null;
         case 'get_ui_settings':
           return {
             name,
@@ -1082,8 +1317,6 @@ export async function install(scenario: string) {
             microphone_enabled: params.has('mic'),
             screen_enabled: false,
             web_enabled: true,
-            persona,
-            custom_prompt: '',
             avatar_in_island: inIsland,
             avatar_on_desktop: onDesktop,
             windowed,
@@ -1108,9 +1341,46 @@ export async function install(scenario: string) {
           name = String(a.value).trim();
           emit('mika://ui', { action: 'settings_changed' });
           return null;
-        case 'set_persona':
-          persona = String(a.persona);
-          return null;
+        case 'get_personas':
+          return personaView();
+        case 'set_persona': {
+          const choice = String(a.choice);
+          if (READY_PERSONAS.includes(choice)) persona = choice;
+          else if (findOwn(choice)) persona = findOwn(choice)!.name;
+          else throw 'Такого характера нет';
+          emit('mika://ui', { action: 'settings_changed' });
+          return personaView();
+        }
+        case 'save_custom_persona': {
+          const old = a.old == null ? null : String(a.old);
+          const ownName = String(a.name).trim();
+          const prompt = String(a.prompt).trim();
+          if (!ownName) throw 'У характера нет имени';
+          if (!prompt) throw 'Опиши характер хотя бы парой слов';
+          const clash = [...READY_PERSONAS, ...READY_PERSONA_NAMES, 'custom'].some((r) => foldName(r) === foldName(ownName));
+          const twin = ownPersonas.find((p) => foldName(p.name) === foldName(ownName) && (old === null || foldName(p.name) !== foldName(old)));
+          if (clash || twin) throw 'Это имя уже занято другим характером';
+          if (old === null) {
+            if (ownPersonas.length >= 10) throw 'Своих характеров уже 10: удали один, чтобы добавить новый';
+            ownPersonas = [...ownPersonas, { name: ownName, prompt }];
+          } else {
+            const was = findOwn(old);
+            if (!was) throw 'Такого характера нет';
+            if (persona === was.name) persona = ownName;
+            ownPersonas = ownPersonas.map((p) => (p === was ? { name: ownName, prompt } : p));
+          }
+          return personaView();
+        }
+        case 'delete_custom_persona': {
+          const was = findOwn(String(a.name));
+          if (!was) throw 'Такого характера нет';
+          ownPersonas = ownPersonas.filter((p) => p !== was);
+          if (persona === was.name) persona = 'caring';
+          return personaView();
+        }
+        case 'set_adult':
+          adultMode = a.on === true;
+          return personaView();
         case 'set_avatar_placement':
           inIsland = a.inIsland === true;
           onDesktop = a.onDesktop === true;
@@ -1155,6 +1425,16 @@ export async function install(scenario: string) {
           };
         case 'get_language':
           return lang;
+        case 'get_theme':
+          return { theme, accent };
+        case 'set_theme': {
+          const own = String(a.accent ?? '').trim();
+          if (own && !/^#?[0-9a-f]{6}$/i.test(own)) throw 'A colour is #rrggbb';
+          theme = String(a.theme);
+          accent = own ? `#${own.replace('#', '').toLowerCase()}` : '';
+          emit('mika://ui', { action: 'theme_changed', theme, accent });
+          return null;
+        }
         case 'set_language':
           if (a.value !== 'ru' && a.value !== 'en') throw 'No such interface language: ru or en';
           lang = a.value;
@@ -1284,6 +1564,8 @@ export async function install(scenario: string) {
         case 'get_rhythm_settings':
           return {
             rhythm: { breaks: true, break_every_min: 50, lively: true },
+            companion: { ...companion },
+            screen_enabled: !params.has('noscreen'),
             tracking: { app_time: true, clipboard: true },
             clip_count: 7,
             focus_left_s: params.has('focus') ? 1260 : null,
@@ -1296,6 +1578,14 @@ export async function install(scenario: string) {
             docs_folders: [String.raw`~\Documents\Работа`, String.raw`D:\Договоры`],
             docs: { files: 128, chunks: 2310, embedded: 2310, running: false, last_run: 0, error: null, progress: null },
           };
+        case 'set_companion': {
+          if (a.enabled && !companion.enabled && params.has('noscreen')) {
+            throw 'Напарнику нужен «Экран»: включи его в шапке чата или в разделе «Инструменты».';
+          }
+          companion.enabled = Boolean(a.enabled);
+          companion.every_s = Math.min(300, Math.max(20, Number(a.everyS)));
+          return null;
+        }
         case 'get_island_settings':
           return { city: 'Пермь', hide_in_games: true, monitor: '', monitors: [String.raw`\\.\DISPLAY1`, String.raw`\\.\DISPLAY2`] };
         case 'idle_info':
@@ -1310,7 +1600,8 @@ export async function install(scenario: string) {
               { id: 1, created_at: '2026-11-10T22:00:00+03:00', text: 'Кота зовут Барсик' },
               { id: 2, created_at: '2026-11-11T09:00:00+03:00', text: 'Любит чай без сахара' },
             ],
-            archived_messages: 42,
+            other_conversations: conversations.filter((c) => !c.pinned && c.id !== openConversation).length,
+            keep_days: keepDays,
             embedding_base_url: '',
             embedding_model: params.has('embed') ? 'openai/text-embedding-3-small' : '',
             has_embedding_key: false,
@@ -1431,6 +1722,7 @@ export async function install(scenario: string) {
               params.has('vosk'),
             ),
             follow_up: true,
+            quick: !params.has('noquick'),
             duck_media: true,
             tts_style: '',
             tone_by_mood: true,
@@ -1790,13 +2082,70 @@ export async function install(scenario: string) {
         // «Стоп»: the reply and her voice end, the pause begins.
         setState('idle');
         send({ type: 'voice_quiet' });
-        send({ type: 'pause_changed', paused: true });
+        send({ type: 'pause_changed', paused: true, sleeping: false });
         send({ type: 'remark', kind: 'stop', text: 'Остановилась: ответ, речь. Сама ничего не начну, пока не позовёшь.' });
         if (params.has('addressed')) {
           await wait(4000);
-          send({ type: 'pause_changed', paused: false });
+          send({ type: 'pause_changed', paused: false, sleeping: false });
           send({ type: 'remark', kind: 'pause', text: 'Пока была пауза, я пропустила: сценарий «Наушники», напоминание о перерыве.' });
           send({ type: 'user_text', text: 'Мика, продолжим' });
+        }
+        break;
+      }
+      case 'attach': {
+        click('.iw');
+        await wait(1500);
+        // A file dragged over the window lights the chat up; the drop goes to Rust, which sends the new list.
+        const paths = ['C:\\Users\\me\\Documents\\Таблица продаж.xlsx'];
+        void emit('tauri://drag-enter', { paths, position: { x: 400, y: 300 } });
+        if (params.has('drop')) break;
+        await wait(1500);
+        void emit('tauri://drag-drop', { paths, position: { x: 400, y: 300 } });
+        await wait(600);
+        void emit('attachments-changed', mockAttach([{ kind: 'text', name: 'Таблица продаж.xlsx' }]));
+        break;
+      }
+      case 'companion': {
+        // A game fills the screen; now and then she says a short line with a face.
+        click('.iw');
+        await wait(700);
+        send({ type: 'user_text', text: 'Посмотри, как я играю' });
+        send({ type: 'tool_started', id: 'comp-1', name: 'settings_set', summary: 'Включить напарника в играх' });
+        await wait(300);
+        send({ type: 'tool_finished', id: 'comp-1', name: 'settings_set', ok: true, output: 'Готово.', elapsed_ms: 20 });
+        await say('Смотрю. Играй, я рядом.');
+        setState('idle');
+        await wait(1500);
+        feel('joy');
+        send({ type: 'remark', kind: 'companion', text: 'Красиво ушёл от удара! Ещё чуть-чуть — и босс твой.' });
+        await wait(2500);
+        feel('worry');
+        send({ type: 'remark', kind: 'companion', text: 'Осторожно, здоровья совсем мало — отступи за колонну.' });
+        break;
+      }
+      case 'quick': {
+        if (params.has('inchat')) {
+          click('.iw');
+          await wait(700);
+        }
+        // «Мика, тише»: one tool call, no model, a short reply.
+        send({ type: 'user_text', text: 'Мика, тише' });
+        setState('thinking');
+        send({ type: 'tool_started', id: 'quick-1', name: 'volume', summary: 'Сделать тише' });
+        await wait(300);
+        send({ type: 'tool_finished', id: 'quick-1', name: 'volume', ok: true, output: 'Громкость 40% (была 50%).', elapsed_ms: 30, data: { kind: 'volume', level: 40, was: 50 } });
+        await say('Громкость 40 %.');
+        setState('idle');
+        await wait(1500);
+        // «Усни»: she falls asleep, the island says so.
+        send({ type: 'pause_changed', paused: true, sleeping: true });
+        send({ type: 'user_text', text: 'Усни' });
+        send({ type: 'remark', kind: 'sleep', text: 'Сплю. Позови по имени.' });
+        if (params.has('addressed')) {
+          await wait(4000);
+          send({ type: 'pause_changed', paused: false, sleeping: false });
+          send({ type: 'remark', kind: 'pause', text: 'Пока я спала, я пропустила: реплику «Живости», напоминание о перерыве.' });
+          send({ type: 'user_text', text: 'Мика, проснись' });
         }
         break;
       }
@@ -2223,7 +2572,8 @@ export async function install(scenario: string) {
         // `&notice`: the chat stays, with the notice of a run that was cut short.
         if (scenario === 'journal' && params.has('notice')) break;
         // The settings button: the last one of an ordinary window, the one before «close» in the island.
-        click(windowed ? '.cbar .ib:last-child' : '.cbar .ib:nth-last-child(2)');
+        // Children of the header only: the character menu holds a button of its own.
+        click(windowed ? '.cbar > .ib:last-child' : '.cbar > .ib:nth-last-child(2)');
         await wait(500);
         const page =scenario === 'journal' ? 'journal' : params.get('page');
         if (page) {

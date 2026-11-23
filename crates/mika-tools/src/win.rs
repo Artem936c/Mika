@@ -10,6 +10,7 @@ mod launcher;
 pub mod locale;
 mod media;
 pub mod pdf;
+pub mod picture;
 mod power;
 mod probe;
 mod radio;

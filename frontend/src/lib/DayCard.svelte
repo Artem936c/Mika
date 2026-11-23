@@ -49,8 +49,8 @@
     box-sizing: border-box;
     padding: 12px 16px;
     border-radius: 18px;
-    border: 1px solid rgba(143, 125, 255, 0.24);
-    background: linear-gradient(135deg, rgba(143, 125, 255, 0.16), rgba(255, 126, 182, 0.08));
+    border: 1px solid rgba(var(--v-rgb), 0.24);
+    background: linear-gradient(135deg, rgba(var(--v-rgb), 0.16), rgba(var(--p-rgb), 0.08));
     user-select: text;
   }
   .ttl {
@@ -63,7 +63,7 @@
   }
   .total {
     font-size: 12.5px;
-    color: #c9cbe6;
+    color: var(--ink2);
   }
   .apps {
     display: grid;
@@ -108,7 +108,7 @@
     border-radius: 999px;
     background: rgba(0, 0, 0, 0.25);
     font-size: 11.5px;
-    color: #b9c3e6;
+    color: var(--ink3);
     white-space: nowrap;
   }
   .chip b {

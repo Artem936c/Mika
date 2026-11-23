@@ -11,6 +11,7 @@ export const CATEGORIES = [
   'app',
   'turn',
   'llm',
+  'vision',
   'tool',
   'policy',
   'voice',

@@ -1,11 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod attachments;
 mod avatar_model;
 mod backup;
 mod bgjobs;
 mod bridge;
 mod catalog;
+mod companion;
+mod conversations;
 mod costs;
 mod dayend;
 mod events_page;
@@ -16,6 +19,7 @@ mod hotkey_actions;
 mod hotkeys;
 mod journal;
 mod lang;
+mod persona;
 mod platform;
 mod research;
 mod rhythm;
@@ -24,6 +28,7 @@ mod settings;
 mod sherpa;
 mod strings;
 mod talk_settings;
+mod theme;
 mod tray;
 mod update;
 mod vosk;
@@ -111,6 +116,18 @@ fn track_window(app: tauri::AppHandle, window: &tauri::WebviewWindow, ctx: Arc<a
     });
 }
 
+/// Files dropped onto the island or the window are attached to the message
+/// being typed (decision 0053). Windows gives the paths to this side; the
+/// webview only learns what became of them.
+fn take_dropped_files(app: tauri::AppHandle, window: &tauri::WebviewWindow, ctx: Arc<app::Ctx>) {
+    use tauri::{DragDropEvent, WindowEvent};
+    window.on_window_event(move |event| {
+        if let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
+            attachments::on_drop(&app, ctx.clone(), paths.clone());
+        }
+    });
+}
+
 fn main() {
     // Before the journal: the copy that is already running owns its files.
     let Some(_instance) = platform::single_instance() else {
@@ -184,13 +201,26 @@ fn main() {
             bridge::debug_set_state,
             bridge::set_island_rect,
             bridge::send_message,
+            attachments::pick_attachments,
+            attachments::attach_bytes,
+            attachments::remove_attachment,
+            attachments::list_attachments,
             bridge::stop,
             bridge::get_paused,
+            bridge::get_sleeping,
             bridge::poke_avatar,
             catalog::list_models,
             catalog::list_voices,
             bridge::get_history,
             bridge::clear_history,
+            conversations::list_conversations,
+            conversations::open_conversation,
+            conversations::new_conversation,
+            conversations::rename_conversation,
+            conversations::pin_conversation,
+            conversations::delete_conversation,
+            conversations::delete_unpinned_conversations,
+            conversations::set_history_keep,
             bridge::get_llm_settings,
             bridge::save_llm_settings,
             bridge::test_provider,
@@ -206,11 +236,17 @@ fn main() {
             bridge::get_general_settings,
             lang::get_language,
             lang::set_language,
+            theme::get_theme,
+            theme::set_theme,
             bridge::set_autostart,
             bridge::open_folder,
             bridge::wipe_all_data,
             bridge::set_assistant_name,
-            bridge::set_persona,
+            persona::get_personas,
+            persona::set_persona,
+            persona::save_custom_persona,
+            persona::delete_custom_persona,
+            persona::set_adult,
             bridge::set_avatar_placement,
             avatar_model::avatar_motions,
             avatar_model::avatar_motion_add,
@@ -255,7 +291,6 @@ fn main() {
             settings::add_fact,
             settings::remove_fact,
             settings::clear_facts,
-            settings::clear_archive,
             settings::save_embedding_settings,
             settings::test_embedding,
             settings::list_reminders,
@@ -296,11 +331,13 @@ fn main() {
             settings::install_sherpa,
             settings::set_wake_engine,
             settings::set_follow_up,
+            settings::set_quick_commands,
             settings::set_duck_media,
             settings::set_notifications,
             settings::set_briefing,
             settings::get_rhythm_settings,
             settings::set_rhythm,
+            settings::set_companion,
             settings::set_tracking,
             settings::clear_app_time,
             settings::clear_clipboard_history,
@@ -387,6 +424,7 @@ fn main() {
                 window::show_without_activation(&island)?;
             }
             track_window(app.handle().clone(), &island, background.clone());
+            take_dropped_files(app.handle().clone(), &island, background.clone());
             if avatar_on_desktop {
                 window::set_desktop_avatar(app.handle(), true)?;
             }
@@ -405,11 +443,13 @@ fn main() {
             background.start_background();
             spawn_notifier(app.handle().clone(), bus.clone(), background.clone());
             let watched = background.clone();
+            let companion = background.clone();
             let busy_state = watch_state.clone();
             let asking_state = watch_state.clone();
             window::spawn_game_watch(
                 app.handle().clone(),
                 move || watched.config.lock().island.hide_in_games,
+                move || companion.config.lock().companion.enabled,
                 move || busy_state.get() != mika_core::AssistantState::Idle,
                 move || asking_state.get() == mika_core::AssistantState::AwaitingConfirm,
             );

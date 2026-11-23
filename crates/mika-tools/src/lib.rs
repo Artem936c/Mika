@@ -2,6 +2,7 @@
 
 pub mod apps;
 pub mod archive;
+pub mod attach;
 pub mod avatar;
 pub mod batch;
 pub mod browser;

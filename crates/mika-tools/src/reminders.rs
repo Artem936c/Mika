@@ -56,8 +56,25 @@ fn plan(args: &Value) -> Result<Plan, ToolError> {
     let at = arg_str_opt(args, "at")
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let due_at = match (arg_u64(args, "in_minutes"), at) {
-        (Some(m), None) if (1..=MAX_MINUTES).contains(&m) => now.timestamp() + m as i64 * 60,
+    // A timer in seconds (decision 0050): «засеки 30 секунд».
+    let seconds = arg_u64(args, "in_seconds");
+    let in_minutes = arg_u64(args, "in_minutes");
+    if seconds.is_some() && (in_minutes.is_some() || at.is_some()) {
+        return Err(ToolError::BadArguments(
+            "укажи что-то одно: in_seconds, in_minutes или at".into(),
+        ));
+    }
+    let in_seconds = match seconds {
+        Some(s) if (1..=MAX_MINUTES * 60).contains(&s) => Some(s),
+        Some(_) => {
+            return Err(ToolError::BadArguments(
+                "in_seconds должно быть от 1 до 31622400".into(),
+            ))
+        }
+        None => in_minutes.map(|m| m.saturating_mul(60)),
+    };
+    let due_at = match (in_seconds, at) {
+        (Some(s), None) if (1..=MAX_MINUTES * 60).contains(&s) => now.timestamp() + s as i64,
         (Some(_), None) => {
             return Err(ToolError::BadArguments(
                 "in_minutes должно быть от 1 до 527040".into(),
@@ -109,12 +126,13 @@ impl Tool for ReminderSetTool {
     fn spec(&self) -> ToolSpec {
         spec(
             "reminder_set",
-            "Поставить напоминание, таймер или будильник. Время: in_minutes (через сколько минут) или at (ЧЧ:ММ либо ГГГГ-ММ-ДД ЧЧ:ММ). kind=task — задача по расписанию: в это время text будет выполнен как поручение помощнице.",
+            "Поставить напоминание, таймер или будильник. Время: in_minutes (через сколько минут), in_seconds (через сколько секунд, для короткого таймера) или at (ЧЧ:ММ либо ГГГГ-ММ-ДД ЧЧ:ММ). kind=task — задача по расписанию: в это время text будет выполнен как поручение помощнице.",
             json!({
                 "type": "object",
                 "properties": {
                     "text": { "type": "string", "description": "О чём напомнить или что сделать" },
                     "in_minutes": { "type": "integer", "description": "Через сколько минут" },
+                    "in_seconds": { "type": "integer", "description": "Через сколько секунд, для короткого таймера" },
                     "at": { "type": "string", "description": "Когда: ЧЧ:ММ или ГГГГ-ММ-ДД ЧЧ:ММ" },
                     "repeat": { "type": "string", "enum": ["none", "daily", "weekly", "every"] },
                     "every_minutes": { "type": "integer", "description": "Шаг повтора для repeat=every" },
@@ -350,6 +368,9 @@ mod tests {
             json!({"text": " ", "in_minutes": 5}),
             json!({"text": "x", "in_minutes": 5, "repeat": "every"}),
             json!({"text": "x", "in_minutes": 5, "kind": "boom"}),
+            json!({"text": "x", "in_seconds": 0}),
+            json!({"text": "x", "in_seconds": 30, "in_minutes": 5}),
+            json!({"text": "x", "in_seconds": 30, "at": "10:00"}),
         ] {
             assert!(
                 matches!(tool.assess(&args), Err(ToolError::BadArguments(_))),
@@ -359,6 +380,24 @@ mod tests {
         assert!(tool
             .assess(&json!({"text": "x", "in_minutes": 5, "repeat": "every", "every_minutes": 30}))
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_timer_in_seconds() {
+        let s = store();
+        let out = run(
+            &ReminderSetTool(s.clone()),
+            json!({"text": "Таймер", "in_seconds": 30}),
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.text.contains("через 30 с") || out.text.contains("через 29 с"),
+            "{}",
+            out.text
+        );
+        let due = s.list().unwrap()[0].due_at - Local::now().timestamp();
+        assert!((29..=30).contains(&due), "{due}");
     }
 
     #[test]

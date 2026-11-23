@@ -135,6 +135,7 @@ export type OffItem =
         | 'clipboard'
         | 'dictation'
         | 'screen_ask'
+        | 'companion'
         | 'telegram'
         | 'telegram_voice'
         | 'web'
@@ -142,7 +143,8 @@ export type OffItem =
         | 'briefing'
         | 'evening'
         | 'events'
-        | 'journal_content';
+        | 'journal_content'
+        | 'adult';
     }
   | { id: 'mcp' | 'docs' | 'scenarios'; count: number };
 

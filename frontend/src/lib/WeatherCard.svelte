@@ -38,8 +38,8 @@
     border-radius: 18px;
     max-width: 96%;
     box-sizing: border-box;
-    border: 1px solid rgba(111, 227, 255, 0.2);
-    background: linear-gradient(135deg, rgba(60, 120, 200, 0.28), rgba(143, 125, 255, 0.16));
+    border: 1px solid rgba(var(--c-rgb), 0.2);
+    background: linear-gradient(135deg, rgba(60, 120, 200, 0.28), rgba(var(--v-rgb), 0.16));
   }
   .t {
     font-size: 38px;
@@ -50,7 +50,7 @@
   small {
     display: block;
     font-size: 11.5px;
-    color: #b9c3e6;
+    color: var(--ink3);
     margin-top: 4px;
     white-space: nowrap;
   }
@@ -65,7 +65,7 @@
     background: rgba(0, 0, 0, 0.25);
     font-size: 11px;
     text-align: center;
-    color: #b9c3e6;
+    color: var(--ink3);
     max-width: 78px;
     overflow: hidden;
     text-overflow: ellipsis;

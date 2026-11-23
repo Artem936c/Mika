@@ -122,6 +122,17 @@ impl SettingsSetTool {
                 setting.name
             )));
         }
+        // What needs another switch on says so; the other one is not turned
+        // on along the way, it asks for itself (decision 0054).
+        if let Some(other) = settings::needs(setting.key) {
+            let off = port.read(other.key).map_err(ToolError::Failed)? != Value::Bool(true);
+            if setting.turns_on(&old, &new) && off {
+                return Err(ToolError::Failed(format!(
+                    "сначала нужно включить {} ({}): без него {} не работает. Спроси пользователя, включить ли его; это отдельная просьба со своим подтверждением",
+                    other.name, other.key, setting.name
+                )));
+            }
+        }
         Ok(Change { setting, old, new })
     }
 }
@@ -132,7 +143,7 @@ impl Tool for SettingsSetTool {
         let keys = format!("one of: {}", settings::keys());
         spec(
             "settings_set",
-            "Поменять одну свою настройку по просьбе пользователя, сразу и так же, как в окне настроек. «Говори тише» или «громче» — voice.volume со сдвигом «-15» или «+15» (это её голос; громкость всего компьютера меняет volume). «Говори быстрее» или «медленнее» — voice.rate, «+0.2» или «-0.2». «Смени голос на …» — voice.voice. «Не читай ответы вслух» — voice.speak_replies. «Длинное пересказывай вслух короче» — voice.brief_long. «Включи» или «выключи» активационную фразу — voice.wake, диктовку — dictation, микрофон — privacy.microphone, просмотр экрана — privacy.screen. Характер — assistant.persona, язык интерфейса — i18n.language, перерывы — rhythm.breaks и rhythm.break_every_min, лимиты расходов — costs.day_limit и costs.month_limit. Варианты и текущие значения даёт settings_get. Ключи провайдеров, адреса, модели, папки и сочетания клавиш так не меняются.",
+            "Поменять одну свою настройку по просьбе пользователя, сразу и так же, как в окне настроек. «Говори тише» или «громче» — voice.volume со сдвигом «-15» или «+15» (это её голос; громкость всего компьютера меняет volume). «Говори быстрее» или «медленнее» — voice.rate, «+0.2» или «-0.2». «Смени голос на …» — voice.voice. «Не читай ответы вслух» — voice.speak_replies. «Длинное пересказывай вслух короче» — voice.brief_long. «Включи» или «выключи» активационную фразу — voice.wake, диктовку — dictation, микрофон — privacy.microphone, просмотр экрана — privacy.screen. Характер — assistant.persona, язык интерфейса — i18n.language, перерывы — rhythm.breaks и rhythm.break_every_min, лимиты расходов — costs.day_limit и costs.month_limit. «Посмотри, как я играю» — companion.enabled вкл, «хватит комментировать» — выкл; как часто она смотрит — companion.every_s. Варианты и текущие значения даёт settings_get. Ключи провайдеров, адреса, модели, папки и сочетания клавиш так не меняются.",
             schema(
                 &[
                     ("key", "string", &keys),
@@ -213,7 +224,7 @@ mod tests {
         fn options(&self, key: &str) -> Vec<String> {
             match key {
                 "voice.voice" => vec!["Microsoft Irina".into(), "Microsoft Pavel".into()],
-                _ => Vec::new(),
+                key => settings::options(&self.config.lock(), key),
             }
         }
 
@@ -231,6 +242,13 @@ mod tests {
                 ("voice.volume", Value::Number(n)) => *self.volume.lock() = *n,
                 ("voice.wake", Value::Bool(b)) => c.voice.wake_enabled = *b,
                 ("privacy.microphone", Value::Bool(b)) => c.privacy.microphone_enabled = *b,
+                ("assistant.adult", Value::Bool(b)) => c.assistant.adult = *b,
+                ("companion.enabled", Value::Bool(b)) => c.companion.enabled = *b,
+                ("privacy.screen", Value::Bool(b)) => c.privacy.screen_enabled = *b,
+                ("assistant.persona", Value::Text(choice)) => c
+                    .assistant
+                    .choose_persona(choice)
+                    .map_err(|e| e.to_string())?,
                 _ => {}
             }
             Ok(())
@@ -275,7 +293,10 @@ mod tests {
         let mut config = Config::default();
         config.llm.base_url = "https://secret-host.example/v1".into();
         config.llm.model = "secret-model".into();
-        config.assistant.custom_prompt = "секретный характер".into();
+        config
+            .assistant
+            .save_custom_persona(None, "Котёнок", "секретный характер")
+            .unwrap();
         config.telegram.user_id = 987654321;
         config.updates.manifest_url = "https://updates.example/m.json".into();
         config.research.folder = r"C:\Тайная папка".into();
@@ -403,6 +424,7 @@ mod tests {
             "privacy.screen",
             "screen_ask",
             "log.content",
+            "assistant.adult",
         ] {
             let err = tool
                 .assess(&json!({"key": key, "value": "вкл"}))
@@ -450,6 +472,129 @@ mod tests {
             Err(ToolError::Failed(why)) if why.contains("менять нечего")
         ));
         assert!(port.applied.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_own_character_is_seen_and_put_on_by_name() {
+        let mut config = Config::default();
+        config
+            .assistant
+            .save_custom_persona(None, "Котёнок", "Мурлычешь.")
+            .unwrap();
+        let (slot, port) = slot(FakePort {
+            config: Mutex::new(config),
+            ..Default::default()
+        });
+        // settings_get names it, so the model knows it can be asked for.
+        let out = run(&SettingsGetTool(slot.clone()), json!({}))
+            .await
+            .unwrap();
+        assert!(out.text.contains("свои по имени: Котёнок"), "{}", out.text);
+        assert!(!out.text.contains("Мурлычешь"), "the text stays out");
+        let tool = SettingsSetTool(slot);
+        let args = json!({"key": "assistant.persona", "value": "котёнок"});
+        let a = tool.assess(&args).unwrap();
+        assert_eq!(a.level, RiskLevel::Low);
+        assert_eq!(a.target, "было: заботливая → станет: Котёнок");
+        run(&tool, args).await.unwrap();
+        assert_eq!(port.config.lock().assistant.persona_choice(), "Котёнок");
+        // A ready one by its Russian name, from Telegram too.
+        run(
+            &tool,
+            json!({"key": "assistant.persona", "value": "деловая"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(port.config.lock().assistant.persona_choice(), "business");
+        assert!(matches!(
+            tool.assess(&json!({"key": "assistant.persona", "value": "Пират"})),
+            Err(ToolError::BadArguments(why)) if why.contains("Котёнок")
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_adult_mode_asks_every_time_and_turns_off_freely() {
+        let (here, port) = slot(FakePort::default());
+        let tool = SettingsSetTool(here);
+        let on = tool
+            .assess(&json!({"key": "assistant.adult", "value": "вкл"}))
+            .unwrap();
+        assert_eq!(on.level, RiskLevel::High);
+        assert_eq!(on.summary, "Включить взрослый режим");
+        assert!(mika_core::policy::forever_block_for(&on).is_some());
+        run(&tool, json!({"key": "assistant.adult", "value": "вкл"}))
+            .await
+            .unwrap();
+        assert!(port.config.lock().assistant.adult);
+
+        // From Telegram it does not turn on, but it turns off.
+        let (remote, port) = slot(FakePort {
+            telegram: true,
+            ..Default::default()
+        });
+        port.config.lock().assistant.adult = true;
+        let tool = SettingsSetTool(remote);
+        let off = tool
+            .assess(&json!({"key": "assistant.adult", "value": "выкл"}))
+            .unwrap();
+        assert_eq!(off.level, RiskLevel::Low);
+        run(&tool, json!({"key": "assistant.adult", "value": "выкл"}))
+            .await
+            .unwrap();
+        assert!(!port.config.lock().assistant.adult);
+    }
+
+    #[tokio::test]
+    async fn the_companion_asks_every_time_needs_the_screen_and_not_from_telegram() {
+        let (here, port) = slot(FakePort::default());
+        let tool = SettingsSetTool(here);
+        let on = json!({"key": "companion.enabled", "value": "вкл"});
+        // «Экран» is off: she says what is missing and turns nothing on.
+        let err = tool.assess(&on).unwrap_err();
+        assert!(
+            matches!(&err, ToolError::Failed(why) if why.contains("privacy.screen")),
+            "{err:?}"
+        );
+        assert!(port.applied.lock().is_empty());
+        assert!(!port.config.lock().privacy.screen_enabled);
+
+        port.config.lock().privacy.screen_enabled = true;
+        let a = tool.assess(&on).unwrap();
+        assert_eq!(a.level, RiskLevel::High);
+        assert_eq!(a.summary, "Включить напарника в играх");
+        assert!(mika_core::policy::forever_block_for(&a).is_some());
+        run(&tool, on).await.unwrap();
+        assert!(port.config.lock().companion.enabled);
+        // The interval asks nothing.
+        let every = tool
+            .assess(&json!({"key": "companion.every_s", "value": 30}))
+            .unwrap();
+        assert_eq!(every.level, RiskLevel::Low);
+
+        // From Telegram it does not turn on, but it turns off; off needs no screen.
+        let (remote, port) = slot(FakePort {
+            telegram: true,
+            ..Default::default()
+        });
+        port.config.lock().privacy.screen_enabled = true;
+        let tool = SettingsSetTool(remote);
+        let err = tool
+            .assess(&json!({"key": "companion.enabled", "value": "вкл"}))
+            .unwrap_err();
+        assert!(
+            matches!(&err, ToolError::Failed(why) if why.contains("только за компьютером")),
+            "{err:?}"
+        );
+        port.config.lock().companion.enabled = true;
+        port.config.lock().privacy.screen_enabled = false;
+        let off = tool
+            .assess(&json!({"key": "companion.enabled", "value": "выкл"}))
+            .unwrap();
+        assert_eq!(off.level, RiskLevel::Low);
+        run(&tool, json!({"key": "companion.enabled", "value": "выкл"}))
+            .await
+            .unwrap();
+        assert!(!port.config.lock().companion.enabled);
     }
 
     #[tokio::test]

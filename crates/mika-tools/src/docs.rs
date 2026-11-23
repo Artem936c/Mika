@@ -141,6 +141,180 @@ pub fn docx_xml_text(xml: &str) -> String {
     out
 }
 
+/// Value of the attribute `name` in the text of a tag, such as `c r="A1" t="s"`.
+fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let mut from = 0;
+    while let Some(i) = tag[from..].find(name).map(|i| i + from) {
+        let starts = i == 0 || tag.as_bytes()[i - 1].is_ascii_whitespace();
+        if starts {
+            if let Some(value) = tag[i + name.len()..].strip_prefix("=\"") {
+                return value.find('"').map(|end| &value[..end]);
+            }
+        }
+        from = i + name.len();
+    }
+    None
+}
+
+/// The parts of `xml` between `<name …>` and `</name>`, with the text of the
+/// opening tag. A self-closing `<name …/>` gives an empty part.
+fn elements<'a>(xml: &'a str, name: &str) -> Vec<(&'a str, &'a str)> {
+    let open = format!("<{name}");
+    let close = format!("</{name}>");
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find(&open) {
+        let after = &rest[i + open.len()..];
+        // `<c` must not match `<col` or `<cols`.
+        if !after.starts_with([' ', '>', '/', '\t', '\r', '\n']) {
+            rest = after;
+            continue;
+        }
+        let Some(end) = after.find('>') else { break };
+        let tag = &after[..end];
+        rest = &after[end + 1..];
+        if tag.ends_with('/') {
+            out.push((tag.trim_end_matches('/'), ""));
+            continue;
+        }
+        match rest.find(&close) {
+            Some(stop) => {
+                out.push((tag, &rest[..stop]));
+                rest = &rest[stop + close.len()..];
+            }
+            None => break,
+        }
+    }
+    out
+}
+
+/// Text of the `<t>` parts of a cell or a shared string; phonetic hints dropped.
+fn run_text(xml: &str) -> String {
+    let mut clean = String::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find("<rPh") {
+        clean.push_str(&rest[..i]);
+        rest = match rest[i..].find("</rPh>") {
+            Some(e) => &rest[i + e + "</rPh>".len()..],
+            None => "",
+        };
+    }
+    clean.push_str(rest);
+    elements(&clean, "t")
+        .into_iter()
+        .map(|(_, t)| unescape_xml(t))
+        .collect()
+}
+
+/// Number of the column of a cell reference: `A1` is 0, `AB7` is 27.
+fn column_of(reference: &str) -> Option<usize> {
+    let letters: Vec<u8> = reference
+        .bytes()
+        .take_while(u8::is_ascii_alphabetic)
+        .collect();
+    if letters.is_empty() || letters.len() > 3 {
+        return None;
+    }
+    let n = letters.iter().fold(0usize, |n, l| {
+        n * 26 + (l.to_ascii_uppercase() - b'A') as usize + 1
+    });
+    Some(n - 1)
+}
+
+/// Sheets of an Excel workbook read at most.
+const MAX_SHEETS: usize = 50;
+/// Empty cells put before a far column at most: a cell in column ZZ does not
+/// make a line of seven hundred tabs.
+const MAX_GAP: usize = 50;
+
+/// The text of a cell of a sheet.
+fn cell_value(tag: &str, body: &str, shared: &[String]) -> String {
+    let kind = attr(tag, "t");
+    if kind == Some("inlineStr") {
+        return run_text(body);
+    }
+    let v = elements(body, "v")
+        .first()
+        .map(|(_, v)| unescape_xml(v))
+        .unwrap_or_default();
+    match kind {
+        Some("s") => v
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| shared.get(n).cloned())
+            .unwrap_or_default(),
+        Some("b") if v.trim() == "1" => "TRUE".into(),
+        Some("b") => "FALSE".into(),
+        _ => v,
+    }
+}
+
+/// Text of an Excel workbook: a heading per sheet, a line per row, cells by
+/// tabs. Numbers come as stored, dates as their day numbers.
+pub fn xlsx_text(zip: &[u8]) -> Result<String, String> {
+    let read = |name: &str| zip_entry(zip, name).map(|b| String::from_utf8_lossy(&b).into_owned());
+    let shared: Vec<String> = read("xl/sharedStrings.xml")
+        .map(|xml| {
+            elements(&xml, "si")
+                .into_iter()
+                .map(|(_, si)| run_text(si))
+                .collect()
+        })
+        .unwrap_or_default();
+    let workbook = read("xl/workbook.xml")?;
+    let rels = read("xl/_rels/workbook.xml.rels").unwrap_or_default();
+    let targets: Vec<(&str, &str)> = elements(&rels, "Relationship")
+        .into_iter()
+        .filter_map(|(tag, _)| Some((attr(tag, "Id")?, attr(tag, "Target")?)))
+        .collect();
+    let mut out = String::new();
+    for (i, (tag, _)) in elements(&workbook, "sheet")
+        .into_iter()
+        .take(MAX_SHEETS)
+        .enumerate()
+    {
+        let name = unescape_xml(attr(tag, "name").unwrap_or_default());
+        let target = attr(tag, "r:id")
+            .and_then(|id| targets.iter().find(|(rid, _)| *rid == id))
+            .map(|(_, t)| *t);
+        let path = match target {
+            Some(t) if t.starts_with('/') => t.trim_start_matches('/').to_string(),
+            Some(t) => format!("xl/{t}"),
+            None => format!("xl/worksheets/sheet{}.xml", i + 1),
+        };
+        let Ok(sheet) = read(&path) else { continue };
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("## {name}\n"));
+        for (_, row) in elements(&sheet, "row") {
+            let mut cells: Vec<String> = Vec::new();
+            for (tag, body) in elements(row, "c") {
+                let value = cell_value(tag, body, &shared).replace(['\t', '\n', '\r'], " ");
+                let at = attr(tag, "r")
+                    .and_then(column_of)
+                    .unwrap_or(cells.len())
+                    .min(cells.len() + MAX_GAP);
+                if at < cells.len() {
+                    cells[at] = value;
+                } else {
+                    cells.resize(at, String::new());
+                    cells.push(value);
+                }
+            }
+            while cells.last().is_some_and(|c| c.trim().is_empty()) {
+                cells.pop();
+            }
+            if !cells.is_empty() {
+                out.push_str(&cells.join("\t"));
+                out.push('\n');
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn u16_at(b: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?))
 }
@@ -292,6 +466,10 @@ pub fn extract(path: &Path) -> Result<Vec<(u32, String)>, String> {
             let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
             let xml = zip_entry(&bytes, "word/document.xml")?;
             Ok(vec![(0, docx_xml_text(&String::from_utf8_lossy(&xml)))])
+        }
+        "xlsx" => {
+            let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+            Ok(vec![(0, xlsx_text(&bytes)?)])
         }
         _ => {
             let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
@@ -1088,7 +1266,7 @@ impl Tool for DocsSearchTool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::testing::run;
     use serde_json::json;
@@ -1131,6 +1309,81 @@ mod tests {
     }
 
     const BODY: &str = r#"<?xml version="1.0"?><w:document><w:body><w:p><w:r><w:t>Договор №5</w:t></w:r></w:p><w:p><w:r><w:t xml:space="preserve">Штраф за просрочку &lt;1%&gt;</w:t><w:tab/><w:t>в день</w:t></w:r></w:p></w:body></w:document>"#;
+
+    /// A ZIP of several stored files.
+    pub(crate) fn zip_of(files: &[(&str, &str)]) -> Vec<u8> {
+        let mut z = Vec::new();
+        let mut central = Vec::new();
+        for (name, body) in files {
+            let local = z.len() as u32;
+            z.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            z.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            z.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            z.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            z.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            z.extend_from_slice(&0u16.to_le_bytes());
+            z.extend_from_slice(name.as_bytes());
+            z.extend_from_slice(body.as_bytes());
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&[0; 12]);
+            central.extend_from_slice(&local.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let at = z.len() as u32;
+        let size = central.len() as u32;
+        z.extend_from_slice(&central);
+        z.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        z.extend_from_slice(&[0, 0, 0, 0]);
+        z.extend_from_slice(&(files.len() as u16).to_le_bytes());
+        z.extend_from_slice(&(files.len() as u16).to_le_bytes());
+        z.extend_from_slice(&size.to_le_bytes());
+        z.extend_from_slice(&at.to_le_bytes());
+        z.extend_from_slice(&0u16.to_le_bytes());
+        z
+    }
+
+    /// A workbook of two sheets, the second found by its relation.
+    pub(crate) fn xlsx() -> Vec<u8> {
+        zip_of(&[
+            (
+                "xl/workbook.xml",
+                r#"<workbook><sheets><sheet name="Итоги &amp; план" sheetId="1" r:id="rId1"/><sheet name="Второй" sheetId="2" r:id="rId2"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Target="/xl/worksheets/other.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/sharedStrings.xml",
+                r#"<sst><si><t>Месяц</t></si><si><r><t>Сум</t></r><r><t xml:space="preserve">ма</t></r><rPh><t>x</t></rPh></si></sst>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<worksheet><cols><col min="1"/></cols><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>Январь</t></is></c><c r="C2"><v>1500.5</v></c></row><row r="3"/><row r="4"><c r="B4" t="b"><v>1</v></c><c r="C4" s="1"/></row></sheetData></worksheet>"#,
+            ),
+            (
+                "xl/worksheets/other.xml",
+                r#"<worksheet><sheetData><row r="1"><c r="A1" t="str"><v>=1+1</v></c></row></sheetData></worksheet>"#,
+            ),
+        ])
+    }
+
+    #[test]
+    fn excel_text_comes_out_by_sheets_rows_and_cells() {
+        let text = xlsx_text(&xlsx()).unwrap();
+        assert_eq!(
+            text,
+            "## Итоги & план\nМесяц\tСумма\nЯнварь\t\t1500.5\n\tTRUE\n\n## Второй\n=1+1\n"
+        );
+        assert!(xlsx_text(&zip_of(&[("x.txt", "x")])).is_err());
+        assert_eq!(column_of("A1"), Some(0));
+        assert_eq!(column_of("AB7"), Some(27));
+        assert_eq!(column_of("7"), None);
+    }
 
     #[test]
     fn word_text_comes_out_of_the_archive() {

@@ -148,7 +148,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     font: 12px var(--mono);
-    color: #cdd3ff;
+    color: var(--ink-v);
     user-select: text;
   }
   .lbl {

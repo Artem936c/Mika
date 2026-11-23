@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { listen } from '@tauri-apps/api/event';
   import { noteTyping } from './model/live.svelte';
   import { talkingNow } from './model/voice.svelte';
   import { tick } from 'svelte';
@@ -8,11 +9,13 @@
   import BgJobCard from './BgJobCard.svelte';
   import { dragRegion, toggleMaximize } from './drag';
   import ConfirmCard from './ConfirmCard.svelte';
+  import Conversations from './Conversations.svelte';
   import CostCard from './CostCard.svelte';
   import DayCard from './DayCard.svelte';
   import FfmpegCard from './FfmpegCard.svelte';
   import Icon from './Icon.svelte';
   import ImageCard from './ImageCard.svelte';
+  import PersonaMenu from './PersonaMenu.svelte';
   import ResearchCard from './ResearchCard.svelte';
   import SelectionCard from './SelectionCard.svelte';
   import ScreenAskCard from './ScreenAskCard.svelte';
@@ -22,7 +25,7 @@
   import type { TaskView } from './task';
   import WeatherCard from './WeatherCard.svelte';
   import type { Emotion } from './avatar';
-  import { formatSeconds, inlineMarkup, type ChatItem } from './chat';
+  import { attachView, formatSeconds, inlineMarkup, type ChatItem, type PendingChip } from './chat';
   import type { Pending } from './confirm';
   import { t } from './i18n';
   import { AVATAR_COLUMN, stateLabel, type AssistantState } from './island';
@@ -55,6 +58,7 @@
     onlisten,
     onwindowed,
     onnew,
+    onswitched = () => {},
     ontaskhide = () => {},
     onpoke,
     selection = null,
@@ -99,6 +103,8 @@
     /** Turn the island into an ordinary window, or back. */
     onwindowed: (v: boolean) => void;
     onnew: () => void;
+    /** The list of conversations opened, made or deleted the open one (decision 0052). */
+    onswitched?: () => void;
     /** Hide a finished task panel. */
     ontaskhide?: () => void;
     /** A click on the avatar. */
@@ -132,6 +138,8 @@
     }
   }
   let list: HTMLDivElement | undefined = $state();
+  /** The list of conversations slides over the chat. */
+  let conversations = $state(false);
   let input: HTMLTextAreaElement | undefined = $state();
   const busy = $derived(status !== 'idle');
 
@@ -140,7 +148,7 @@
   // and the user may be reading further up.
   const tail = $derived.by(() => {
     const last = items[items.length - 1];
-    return [items.length, last?.kind, last?.text.length, last?.data?.kind, last?.pending, last?.done].join('|');
+    return [items.length, last?.kind, last?.text.length, last?.data?.kind, last?.pending, last?.done, last?.attachments?.length].join('|');
   });
 
   $effect(() => {
@@ -161,11 +169,108 @@
     input.style.height = `${Math.min(input.scrollHeight, 84)}px`;
   });
 
+  // ---- attachments (decision 0053): the list lives in Rust, the chat only draws it ----
+
+  /** Files that go with the next message. */
+  let files: PendingChip[] = $state([]);
+  /** Lines of the files refused just now. */
+  let refused: string[] = $state([]);
+  /** Say once that a picture goes to the provider of the model. */
+  let pictureHint = $state(false);
+  /** Files are dragged over the window. */
+  let dropping = $state(false);
+  /** Files being read: the dialog, a drop or a paste. */
+  let reading = $state(0);
+  let refusedTimer: ReturnType<typeof setTimeout> | undefined;
+  const REFUSED_MS = 8000;
+
+  function showFiles(view: unknown) {
+    const v = attachView(view);
+    files = v.items;
+    pictureHint = v.hint;
+    refused = v.refused;
+    clearTimeout(refusedTimer);
+    if (v.refused.length > 0) refusedTimer = setTimeout(() => (refused = []), REFUSED_MS);
+  }
+
+  function showRefused(e: unknown) {
+    refused = [String(e)];
+    clearTimeout(refusedTimer);
+    refusedTimer = setTimeout(() => (refused = []), REFUSED_MS);
+  }
+
+  $effect(() => {
+    invoke<unknown>('list_attachments').then(showFiles).catch(() => {});
+    // Windows gives dropped files to the Rust side; the chat only lights up and waits for the list.
+    const offs = [
+      listen('attachments-changed', (e) => {
+        reading = 0;
+        showFiles(e.payload);
+      }),
+      listen('tauri://drag-enter', () => (dropping = true)),
+      listen('tauri://drag-over', () => (dropping = true)),
+      listen('tauri://drag-leave', () => (dropping = false)),
+      listen<{ paths?: unknown[] }>('tauri://drag-drop', (e) => {
+        dropping = false;
+        if ((e.payload?.paths?.length ?? 0) > 0) reading += 1;
+      }),
+    ];
+    return () => {
+      clearTimeout(refusedTimer);
+      for (const off of offs) off.then((stop) => stop()).catch(() => {});
+    };
+  });
+
+  /** The paperclip: the Windows dialog. */
+  async function pick() {
+    reading += 1;
+    try {
+      showFiles(await invoke<unknown>('pick_attachments'));
+    } catch (e) {
+      showRefused(e);
+    } finally {
+      reading = Math.max(0, reading - 1);
+    }
+  }
+
+  /** Ctrl+V with a picture or files: their bytes go to Rust. Plain text is pasted as always. */
+  async function onpaste(e: ClipboardEvent) {
+    const data = e.clipboardData;
+    const pasted = [...(data?.files ?? [])];
+    // Office puts a picture of copied text beside the text: the text wins.
+    if (pasted.length === 0 || (data?.getData('text/plain') ?? '').trim() !== '') return;
+    e.preventDefault();
+    for (const file of pasted) {
+      reading += 1;
+      try {
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        const name = encodeURIComponent(file.name || 'image.png');
+        showFiles(await invoke<unknown>('attach_bytes', bytes, { headers: { 'x-name': name } }));
+      } catch (err) {
+        showRefused(err);
+      } finally {
+        reading = Math.max(0, reading - 1);
+      }
+    }
+  }
+
+  async function removeFile(id: number) {
+    try {
+      showFiles(await invoke<unknown>('remove_attachment', { id }));
+    } catch (e) {
+      showRefused(e);
+    }
+  }
+
   function submit() {
     const text = draft.trim();
-    if (!text) return;
+    if (!text && files.length === 0) return;
     onsend(text);
     draft = '';
+    // Rust takes the files with the message, and gives them back if it did not go.
+    files = [];
+    pictureHint = false;
+    refused = [];
   }
 
   function onkey(e: KeyboardEvent) {
@@ -205,6 +310,8 @@
         <Icon name="mon" size={14} />{t('chat.screen')}
       </button>
       <span class="grow"></span>
+      <button class="ib" class:on={conversations} title={t('chat.conversations_title')} aria-label={t('chat.conversations')} aria-expanded={conversations} onclick={() => (conversations = !conversations)}><Icon name="chats" /></button>
+      <PersonaMenu onedit={onsettings} />
       <button class="ib" title={t('chat.new_title')} aria-label={t('chat.new')} onclick={onnew}><Icon name="plus" /></button>
       <button
         class="ib"
@@ -243,7 +350,16 @@
         {/if}
         {#each items as it, i (i)}
           {#if it.kind === 'user'}
-            <div class="bub u">{it.text}</div>
+            {#if it.text.trim() || !it.attachments?.length}
+              <div class="bub u">{it.text}</div>
+            {/if}
+            {#if it.attachments?.length}
+              <div class="uatt">
+                {#each it.attachments as a, j (j)}
+                  <span class="att" title={a.name}><Icon name={a.kind === 'image' ? 'image' : 'file'} size={13} /><span class="nm">{a.name}</span></span>
+                {/each}
+              </div>
+            {/if}
           {:else if it.kind === 'assistant'}
             <!-- One line: the bubble keeps whitespace (pre-wrap). -->
             <div class="bub a" class:pending={it.pending}>{#each inlineMarkup(it.text) as s, j (j)}{#if s.kind === 'code'}<code>{s.text}</code>{:else if s.kind === 'bold'}<b>{s.text}</b>{:else}{s.text}{/if}{/each}</div>
@@ -296,7 +412,7 @@
               </div>
             {/if}
           {:else if it.kind === 'reminder'}
-            <div class="rem"><Icon name="bell" size={15} /><span>{it.text}</span></div>
+            <div class="rem" class:game={it.companion}><Icon name={it.companion ? 'game' : 'bell'} size={15} /><span>{it.text}</span></div>
           {:else}
             <div class="err"><Icon name="alert" size={14} /><span>{it.text}</span></div>
           {/if}
@@ -317,16 +433,59 @@
       <ScreenAskCard ask={screenAsk} {busy} {mic} listening={status === 'listening'} onclose={onscreenaskclose} />
     {/if}
 
+    {#if conversations}
+      <Conversations
+        {onswitched}
+        onclose={() => {
+          conversations = false;
+          input?.focus();
+        }}
+      />
+    {/if}
+
+    {#if refused.length > 0 || files.length > 0 || pictureHint}
+      <div class="files">
+        {#each refused as line, i (i)}
+          <div class="refused" role="alert"><Icon name="alert" size={13} /><span>{line}</span></div>
+        {/each}
+        {#if files.length > 0}
+          <div class="chips">
+            {#each files as f (f.id)}
+              <span class="att" title={f.name}>
+                <Icon name={f.kind === 'image' ? 'image' : 'file'} size={13} />
+                <span class="nm">{f.name}</span>
+                {#if f.cut}<em title={t('chat.attach_cut_title')}>{t('chat.attach_cut')}</em>{/if}
+                <button class="rm" title={t('chat.attach_remove', { name: f.name })} aria-label={t('chat.attach_remove', { name: f.name })} onclick={() => removeFile(f.id)}>
+                  <Icon name="x" size={11} />
+                </button>
+              </span>
+            {/each}
+          </div>
+        {/if}
+        {#if pictureHint}
+          <div class="hint"><Icon name="shield" size={12} /><span>{t('chat.attach_hint')}</span></div>
+        {/if}
+      </div>
+    {/if}
+
+    {#if dropping}
+      <div class="drop" aria-hidden="true"><Icon name="clip" size={22} /><span>{t('chat.attach_drop')}</span></div>
+    {/if}
+
     <div class="comp">
       <textarea
         bind:this={input}
         bind:value={draft}
         oninput={ontyping}
         onkeydown={onkey}
+        onpaste={onpaste}
         rows="1"
         placeholder={t('chat.placeholder')}
         aria-label={t('chat.message')}
       ></textarea>
+      <button class="ib clip" disabled={reading > 0} title={reading > 0 ? t('chat.attach_reading') : t('chat.attach_title')} aria-label={t('chat.attach')} onclick={pick}>
+        {#if reading > 0}<span class="orb"></span>{:else}<Icon name="clip" />{/if}
+      </button>
       <button
         class="ib"
         class:rec={status === 'listening'}
@@ -338,10 +497,10 @@
       >
         <Icon name="mic" />
       </button>
-      {#if busy && !draft.trim()}
+      {#if busy && !draft.trim() && files.length === 0}
         <button class="ib stop" onclick={onstop} title={t('chat.stop')} aria-label={t('chat.stop')}><Icon name="stop" /></button>
       {:else}
-        <button class="ib on" onclick={submit} disabled={!draft.trim()} title={t('chat.send_title')} aria-label={t('chat.send')}>
+        <button class="ib on" onclick={submit} disabled={!draft.trim() && files.length === 0} title={t('chat.send_title')} aria-label={t('chat.send')}>
           <Icon name="up" />
         </button>
       {/if}
@@ -366,7 +525,7 @@
     position: relative;
     overflow: clip;
     border-right: 1px solid var(--line);
-    background: linear-gradient(180deg, #151331, #0b0b16);
+    background: linear-gradient(180deg, var(--deep-a), var(--deep-b));
   }
   .girlbox {
     position: absolute;
@@ -386,7 +545,7 @@
     gap: 10px;
     padding: 9px 12px;
     border-radius: 14px;
-    background: rgba(8, 9, 15, 0.66);
+    background: var(--veil);
     backdrop-filter: blur(14px);
     border: 1px solid var(--line);
     font-size: 13px;
@@ -420,6 +579,7 @@
 
   /* ---- chat column ---- */
   .chatcol {
+    position: relative;
     display: flex;
     flex-direction: column;
     min-width: 0;
@@ -445,8 +605,8 @@
     justify-content: space-between;
     gap: 12px;
     border-radius: 16px;
-    border: 1px solid rgba(143, 125, 255, 0.35);
-    background: rgba(143, 125, 255, 0.1);
+    border: 1px solid rgba(var(--v-rgb), 0.35);
+    background: rgba(var(--v-rgb), 0.1);
     font-size: 13px;
   }
   /* A calm line, not an alarm: the app works, it only tells where to look. */
@@ -479,7 +639,7 @@
     text-decoration: underline;
   }
   .crash .link:focus-visible {
-    outline: 2px solid rgba(143, 125, 255, 0.7);
+    outline: 2px solid rgba(var(--v-rgb), 0.7);
     outline-offset: 2px;
   }
   .crash .ib {
@@ -521,7 +681,8 @@
   }
   .bub.u {
     align-self: flex-end;
-    background: linear-gradient(135deg, var(--v), #6b58e6);
+    color: var(--on-v);
+    background: linear-gradient(135deg, var(--v), var(--v-deep));
     border-bottom-right-radius: 6px;
     font-weight: 500;
   }
@@ -558,8 +719,8 @@
     margin-top: -2px;
     padding: 5px 11px;
     border-radius: 999px;
-    border: 1px solid rgba(143, 125, 255, 0.35);
-    background: rgba(143, 125, 255, 0.1);
+    border: 1px solid rgba(var(--v-rgb), 0.35);
+    background: rgba(var(--v-rgb), 0.1);
     color: var(--v);
     font: inherit;
     font-size: 12px;
@@ -567,10 +728,10 @@
     cursor: pointer;
   }
   .offer:hover {
-    background: rgba(143, 125, 255, 0.18);
+    background: rgba(var(--v-rgb), 0.18);
   }
   .offer:focus-visible {
-    outline: 2px solid rgba(143, 125, 255, 0.7);
+    outline: 2px solid rgba(var(--v-rgb), 0.7);
     outline-offset: 2px;
   }
   .stp {
@@ -648,7 +809,7 @@
     padding: 9px 12px;
     border-radius: 14px;
     font-size: 13px;
-    color: #ffd0d6;
+    color: var(--bad-ink);
     background: rgba(255, 107, 125, 0.1);
     border: 1px solid rgba(255, 107, 125, 0.3);
     user-select: text;
@@ -678,14 +839,22 @@
     /* The end of focus lists what came, one line each. */
     white-space: pre-wrap;
     word-break: break-word;
-    background: rgba(111, 227, 255, 0.08);
-    border: 1px solid rgba(111, 227, 255, 0.3);
+    background: rgba(var(--c-rgb), 0.08);
+    border: 1px solid rgba(var(--c-rgb), 0.3);
     user-select: text;
   }
   .rem :global(.icon) {
     flex: none;
     color: var(--c);
     margin-top: 2px;
+  }
+  /* A line of the companion in games (decision 0054): her own colour, not a notice. */
+  .rem.game {
+    background: rgba(var(--p-rgb), 0.08);
+    border-color: rgba(var(--p-rgb), 0.3);
+  }
+  .rem.game :global(.icon) {
+    color: var(--p);
   }
   .comp {
     flex: none;
@@ -701,7 +870,7 @@
     border: 1px solid var(--line2);
   }
   .comp:focus-within {
-    border-color: rgba(143, 125, 255, 0.55);
+    border-color: rgba(var(--v-rgb), 0.55);
   }
   textarea {
     flex: 1;
@@ -731,7 +900,7 @@
   }
   @keyframes rec {
     50% {
-      box-shadow: 0 0 0 5px rgba(143, 125, 255, 0.22);
+      box-shadow: 0 0 0 5px rgba(var(--v-rgb), 0.22);
     }
   }
   @media (prefers-reduced-motion: reduce) {
@@ -743,5 +912,118 @@
     color: var(--bad);
     border-color: rgba(255, 107, 125, 0.4);
     background: rgba(255, 107, 125, 0.12);
+  }
+
+  /* ---- attachments (decision 0053) ---- */
+  .uatt {
+    align-self: flex-end;
+    max-width: 80%;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: -3px;
+  }
+  .att {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    max-width: 220px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid rgba(var(--v-rgb), 0.35);
+    background: rgba(var(--v-rgb), 0.1);
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .att :global(.icon) {
+    color: var(--v);
+  }
+  .att .nm {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .att em {
+    flex: none;
+    font-style: normal;
+    font-weight: 700;
+    font-size: 11px;
+    color: var(--mute);
+  }
+  .files {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 0 14px 8px;
+  }
+  .chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .chips .att {
+    padding-right: 4px;
+  }
+  .rm {
+    all: unset;
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    cursor: pointer;
+    color: var(--mute);
+  }
+  .rm:hover {
+    color: var(--ink);
+    background: rgba(255, 255, 255, 0.1);
+  }
+  .rm:focus-visible {
+    outline: 2px solid rgba(var(--v-rgb), 0.7);
+  }
+  .refused {
+    display: flex;
+    gap: 7px;
+    align-items: flex-start;
+    font-size: 12px;
+    color: var(--bad-ink);
+  }
+  .refused :global(.icon) {
+    color: var(--bad);
+    margin-top: 1px;
+  }
+  .hint {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    font-size: 11.5px;
+    color: var(--mute);
+  }
+  .drop {
+    position: absolute;
+    inset: 62px 10px 10px;
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    border-radius: 20px;
+    border: 2px dashed rgba(var(--v-rgb), 0.7);
+    background: var(--veil);
+    backdrop-filter: blur(6px);
+    color: var(--v);
+    font-weight: 700;
+    pointer-events: none;
+  }
+  .ib.clip .orb {
+    width: 14px;
+    height: 14px;
   }
 </style>

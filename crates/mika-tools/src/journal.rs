@@ -395,7 +395,7 @@ mod tests {
         let refused = Ask::parse(&json!({"category": "kernel"})).unwrap_err();
         assert!(
             matches!(&refused, ToolError::BadArguments(m)
-                if m.starts_with("неизвестная категория «kernel»: app, turn, llm, tool, ")),
+                if m.starts_with("неизвестная категория «kernel»: app, turn, llm, vision, tool, ")),
             "{refused:?}"
         );
         let tool = JournalReadTool(None);

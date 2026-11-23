@@ -2,7 +2,10 @@ import { describe, expect, it } from 'vitest';
 import {
   BREAK_RANGE,
   REMIND_RANGE,
+  COMPANION_RANGE,
   calendarArgs,
+  companionArgs,
+  companionFlip,
   linkAfterSave,
   rhythmArgs,
   uniqueFolders,
@@ -83,5 +86,23 @@ describe('folders', () => {
   });
   it('removes every spelling of a folder', () => {
     expect(withoutFolder(['D:\\Договоры', 'E:\\Работа', 'd:/договоры'], 'D:\\Договоры')).toEqual(['E:\\Работа']);
+  });
+});
+
+describe('companion', () => {
+  const companion = { enabled: false, every_s: 60, max_per_hour: 40 };
+
+  it('sends the interval inside its range and keeps the saved one for an empty field', () => {
+    expect(companionArgs(companion, 30)).toEqual({ enabled: false, everyS: 30 });
+    expect(companionArgs(companion, 5)).toEqual({ enabled: false, everyS: COMPANION_RANGE[0] });
+    expect(companionArgs(companion, 1000)).toEqual({ enabled: false, everyS: COMPANION_RANGE[1] });
+    expect(companionArgs(companion, null, true)).toEqual({ enabled: true, everyS: 60 });
+  });
+
+  it('asks before turning on, explains without the screen and turns off at once', () => {
+    expect(companionFlip(true, false, true)).toBe('ask');
+    expect(companionFlip(true, false, false)).toBe('needs_screen');
+    expect(companionFlip(false, true, false)).toBe('off');
+    expect(companionFlip(true, true, true)).toBe('none');
   });
 });

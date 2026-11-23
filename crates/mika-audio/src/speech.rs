@@ -1106,6 +1106,9 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
     let mut confirming = false;
     // The pause after a full stop (decision 0045): reminders only show.
     let mut paused = false;
+    // She sleeps (decision 0050): nothing of a running task or of a
+    // question sounds, only the line she says when she falls asleep.
+    let mut sleeping = false;
     let say = |text: &str| {
         let clean = clean_for_speech(text);
         if !clean.is_empty() && switch.heard() {
@@ -1151,7 +1154,17 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
         };
         match &event {
             Event::ConfirmRequested { .. } => confirming = true,
-            Event::PauseChanged { paused: now } => paused = *now,
+            Event::PauseChanged {
+                paused: now,
+                sleeping: asleep,
+            } => {
+                paused = *now;
+                // Falling asleep cuts what she is saying.
+                if *asleep && !sleeping {
+                    stop();
+                }
+                sleeping = *asleep;
+            }
             Event::ConfirmResolved { .. }
             | Event::StateChanged {
                 to: AssistantState::Idle,
@@ -1180,7 +1193,7 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
                 let broke_off = turn.task_end == Some(false);
                 turn = Turn::default();
                 streamed = false;
-                if broke_off && switch.get() {
+                if broke_off && switch.get() && !sleeping {
                     say(&format!("Задача оборвалась. {message}"));
                 }
             }
@@ -1210,6 +1223,13 @@ pub async fn run_speaker(bus: EventBus, voice: Arc<dyn Voice>, switch: SpeakerSw
                 turn.task_end = task.finished.then_some(task.ok);
             }
             _ if !switch.get() => {}
+            // The one line said while she sleeps: that she falls asleep.
+            Event::Remark { text, kind } if kind == mika_core::pause::REMARK_SLEEP => say(&text),
+            // Asleep, a task goes on in silence: its result only shows.
+            Event::AssistantDelta { .. }
+            | Event::AssistantText { .. }
+            | Event::ConfirmRequested { .. }
+                if sleeping => {}
             Event::AssistantDelta { .. } if turn.task => streamed = true,
             Event::AssistantDelta { text, spoken } => {
                 streamed = true;
@@ -1517,15 +1537,62 @@ mod tests {
         };
         let v = run(
             vec![
-                Event::PauseChanged { paused: true },
+                Event::PauseChanged {
+                    paused: true,
+                    sleeping: false,
+                },
                 remind("чайник"),
-                Event::PauseChanged { paused: false },
+                Event::PauseChanged {
+                    paused: false,
+                    sleeping: false,
+                },
                 remind("цветы"),
             ],
             true,
         )
         .await;
         assert_eq!(*v.said.lock(), vec!["Напоминаю: цветы"]);
+    }
+
+    #[tokio::test]
+    async fn falling_asleep_cuts_her_speech_and_a_task_goes_on_in_silence() {
+        let asleep = |on: bool| Event::PauseChanged {
+            paused: on,
+            sleeping: on,
+        };
+        let v = run(
+            vec![
+                Event::AssistantText {
+                    text: "Длинная сказка.".into(),
+                    spoken: None,
+                },
+                asleep(true),
+                Event::UserText {
+                    text: "усни".into(),
+                },
+                Event::Remark {
+                    text: "Сплю. Позови по имени.".into(),
+                    kind: mika_core::pause::REMARK_SLEEP.into(),
+                },
+                // The task that went on ends while she sleeps.
+                Event::AssistantText {
+                    text: "Отчёт готов.".into(),
+                    spoken: None,
+                },
+                asleep(false),
+                Event::AssistantText {
+                    text: "Привет.".into(),
+                    spoken: None,
+                },
+            ],
+            true,
+        )
+        .await;
+        assert_eq!(
+            *v.said.lock(),
+            vec!["Длинная сказка.", "Сплю. Позови по имени.", "Привет."]
+        );
+        assert!(*v.stops.lock() >= 1, "her speech was cut");
     }
 
     #[tokio::test]

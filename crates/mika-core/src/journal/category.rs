@@ -8,9 +8,9 @@ pub const APP: &str = "app";
 pub const LIB: &str = "lib";
 
 /// Every category, in the order the interface lists them.
-pub const CATEGORIES: [&str; 16] = [
-    "app", "turn", "llm", "tool", "policy", "voice", "telegram", "mcp", "events", "jobs", "costs",
-    "backup", "update", "hotkeys", "web", "lib",
+pub const CATEGORIES: [&str; 17] = [
+    "app", "turn", "llm", "vision", "tool", "policy", "voice", "telegram", "mcp", "events", "jobs",
+    "costs", "backup", "update", "hotkeys", "web", "lib",
 ];
 
 /// Module path -> category. A path matches an entry when it is the entry or
@@ -59,6 +59,7 @@ const BY_MODULE: &[(&str, &str)] = &[
     ("mika_gui::research", "web"),
     ("mika_gui::vosk", "voice"),
     ("mika_gui::sherpa", "voice"),
+    ("mika_gui::companion", "vision"),
 ];
 
 /// The category of a record by its target: a category name as it is, a module

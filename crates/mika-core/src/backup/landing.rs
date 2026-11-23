@@ -23,6 +23,9 @@ pub enum SwitchedOff {
     /// The question about a picture of the window in front: it looks at the
     /// screen and sends the picture to the provider.
     ScreenAsk,
+    /// The companion in games (decision 0054): it looks at the screen and
+    /// pays for each look by itself.
+    Companion,
     Telegram,
     /// Voice messages of the Telegram bridge, in or out: paid recognition
     /// and synthesis nobody at this PC asked for, and a sound sent away.
@@ -57,6 +60,9 @@ pub enum SwitchedOff {
     Scenarios {
         count: usize,
     },
+    /// Adult mode (decision 0051): the answer «есть 18» is given at this
+    /// PC, a file never gives it.
+    Adult,
 }
 
 /// Settings ready for this PC and what was changed in them.
@@ -110,6 +116,9 @@ pub fn land_config(incoming: Config, here: &Config) -> Landing {
     if config.screen_ask.enabled {
         switched_off.push(SwitchedOff::ScreenAsk);
     }
+    if config.companion.enabled {
+        switched_off.push(SwitchedOff::Companion);
+    }
     if config.telegram.enabled {
         switched_off.push(SwitchedOff::Telegram);
     }
@@ -144,6 +153,9 @@ pub fn land_config(incoming: Config, here: &Config) -> Landing {
     if config.log.content {
         switched_off.push(SwitchedOff::JournalContent);
     }
+    if config.assistant.adult && !here.assistant.adult {
+        switched_off.push(SwitchedOff::Adult);
+    }
 
     config.privacy.microphone_enabled = false;
     config.privacy.screen_enabled = false;
@@ -154,6 +166,9 @@ pub fn land_config(incoming: Config, here: &Config) -> Landing {
     // its own besides the microphone and the screen, and both land off.
     config.dictation.enabled = false;
     config.screen_ask.enabled = false;
+    // The companion looks at the screen and pays for it: it is turned on at
+    // this PC, after its question (decision 0054).
+    config.companion.enabled = false;
     // The owner id is kept: the bridge stays off until the user turns it on.
     config.telegram.enabled = false;
     // So do its voice messages: turning the bridge on again must not start
@@ -174,6 +189,8 @@ pub fn land_config(incoming: Config, here: &Config) -> Landing {
     config.briefing.evening_enabled &= here.briefing.evening_enabled;
     // Scenarios paused on this PC stay paused: every run is a paid request.
     config.events.enabled &= here.events.enabled;
+    // Adult mode is turned on by the person at this PC, after «Тебе есть 18?».
+    config.assistant.adult &= here.assistant.adult;
     // And a file never lifts the pause that a reached budget puts on the
     // paid work she starts by herself (decision 0028). The switch alone is
     // not the pause: a file with counting off, with no limit or a higher
@@ -238,6 +255,7 @@ mod tests {
         c.tracking.clipboard = true;
         c.dictation.enabled = true;
         c.screen_ask.enabled = true;
+        c.companion.enabled = true;
         c.telegram.enabled = true;
         c.telegram.user_id = 123_456_789;
         c.telegram.voice_in = true;
@@ -266,6 +284,7 @@ mod tests {
         assert!(!c.notifications.enabled);
         assert!(!c.tracking.app_time && !c.tracking.clipboard);
         assert!(!c.dictation.enabled && !c.screen_ask.enabled);
+        assert!(!c.companion.enabled);
         assert!(!c.telegram.enabled);
         assert!(!c.telegram.voice_in && !c.telegram.voice_reply);
         assert_eq!(c.telegram.user_id, 123_456_789);
@@ -287,6 +306,7 @@ mod tests {
                 SwitchedOff::Clipboard,
                 SwitchedOff::Dictation,
                 SwitchedOff::ScreenAsk,
+                SwitchedOff::Companion,
                 SwitchedOff::Telegram,
                 SwitchedOff::TelegramVoice,
                 SwitchedOff::Web,
@@ -312,6 +332,7 @@ mod tests {
             ("tracking.clipboard", c.tracking.clipboard),
             ("dictation.enabled", c.dictation.enabled),
             ("screen_ask.enabled", c.screen_ask.enabled),
+            ("companion.enabled", c.companion.enabled),
             ("telegram.enabled", c.telegram.enabled),
             ("telegram.voice_in", c.telegram.voice_in),
             ("telegram.voice_reply", c.telegram.voice_reply),
@@ -381,6 +402,10 @@ mod tests {
         assert_eq!(
             one(|c| c.screen_ask.enabled = true),
             vec![SwitchedOff::ScreenAsk]
+        );
+        assert_eq!(
+            one(|c| c.companion.enabled = true),
+            vec![SwitchedOff::Companion]
         );
         // Either voice switch of the bridge gives the one line.
         assert_eq!(
@@ -655,6 +680,7 @@ mod tests {
             SwitchedOff::Docs { count: 1 },
             SwitchedOff::JournalContent,
             SwitchedOff::Scenarios { count: 3 },
+            SwitchedOff::Adult,
         ])
         .unwrap();
         assert_eq!(
@@ -674,6 +700,7 @@ mod tests {
                 { "id": "docs", "count": 1 },
                 { "id": "journal_content" },
                 { "id": "scenarios", "count": 3 },
+                { "id": "adult" },
             ])
         );
     }
@@ -790,5 +817,31 @@ mod tests {
         assert_eq!(c.llm, before.llm);
         assert_eq!(c.island, before.island);
         assert_eq!(c.assistant.persona, before.assistant.persona);
+    }
+
+    #[test]
+    fn own_characters_travel_and_a_file_never_turns_the_adult_mode_on() {
+        let mut incoming = loud();
+        incoming
+            .assistant
+            .save_custom_persona(None, "Котёнок", "Мурлычешь.")
+            .unwrap();
+        incoming.assistant.choose_persona("Котёнок").unwrap();
+        incoming.assistant.adult = true;
+        let before = incoming.assistant.clone();
+
+        let landing = land_config(incoming.clone(), &Config::default());
+        let a = &landing.config.assistant;
+        assert_eq!(a.custom_personas, before.custom_personas);
+        assert_eq!(a.persona_choice(), "Котёнок");
+        assert!(!a.adult);
+        assert!(landing.switched_off.contains(&SwitchedOff::Adult));
+
+        // Already on at this PC: it stays on and is not listed.
+        let mut here = Config::default();
+        here.assistant.adult = true;
+        let landing = land_config(incoming, &here);
+        assert!(landing.config.assistant.adult);
+        assert!(!landing.switched_off.contains(&SwitchedOff::Adult));
     }
 }

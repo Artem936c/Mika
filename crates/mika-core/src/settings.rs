@@ -12,8 +12,9 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::{json, Value as Json};
 
-use crate::config::{Config, Persona, TtsEngine};
+use crate::config::{Config, TtsEngine};
 use crate::i18n::Lang;
+use crate::persona::{fold, READY_NAMES};
 use crate::tools::{Assessment, RiskLevel};
 
 /// A value of a setting.
@@ -46,7 +47,8 @@ pub enum Kind {
         step: f64,
         unit: &'static str,
     },
-    /// One of these ids, each with its Russian name.
+    /// One of these ids, each with its Russian name, or one of the values
+    /// the application lists besides them: the user's own characters by name.
     Choice(&'static [(&'static str, &'static str)]),
     /// One of the values the application lists, such as installed voices.
     /// Empty is «автоматически».
@@ -85,13 +87,16 @@ const PRIVATE: Risk = Risk::Switch {
 };
 const COMFORT: Risk = Risk::Same(RiskLevel::Low);
 
-const PERSONAS: &[(&str, &str)] = &[
-    ("caring", "заботливая"),
-    ("cheerful", "весёлая"),
-    ("calm", "спокойная"),
-    ("bold", "дерзкая"),
-];
 const LANGUAGES: &[(&str, &str)] = &[("ru", "русский"), ("en", "английский")];
+/// The ready themes (decision 0049), ids as in `ThemeChoice::id`.
+const THEMES: &[(&str, &str)] = &[
+    ("violet", "фиалка"),
+    ("night", "ночь"),
+    ("sakura", "сакура"),
+    ("mint", "мята"),
+    ("amber", "янтарь"),
+    ("graphite", "графит"),
+];
 
 /// The keys whose value lives outside `config.toml`: the application reads them.
 pub const OUTSIDE_CONFIG: &[&str] = &["voice.volume", "autostart"];
@@ -219,6 +224,27 @@ pub const SETTINGS: &[Setting] = &[
         risk: PRIVATE,
         at_pc_only: false,
     },
+    // Adult mode (decision 0051): turned on only at the computer, asking
+    // every time; off is safe.
+    Setting {
+        key: "assistant.adult",
+        name: "взрослый режим",
+        about: "мат и грубый юмор в её ответах; пользователя она не оскорбляет и опасного не делает",
+        kind: Kind::Switch,
+        risk: PRIVATE,
+        at_pc_only: true,
+    },
+    // The companion in games (decision 0054): she looks at the screen and
+    // pays for each look. Turned on only at the computer, asking every time,
+    // and only with «Экран» on; off is safe.
+    Setting {
+        key: "companion.enabled",
+        name: "напарника в играх",
+        about: "в игре на весь экран раз в несколько секунд смотреть на экран и коротко комментировать голосом; каждый снимок — платный запрос к зрительной модели; нужен включённый privacy.screen; «посмотри, как я играю» — вкл, «хватит комментировать» — выкл",
+        kind: Kind::Switch,
+        risk: PRIVATE,
+        at_pc_only: true,
+    },
     // Comfort: easy to change back.
     Setting {
         key: "voice.speak_replies",
@@ -308,8 +334,8 @@ pub const SETTINGS: &[Setting] = &[
     Setting {
         key: "assistant.persona",
         name: "характер",
-        about: "её характер",
-        kind: Kind::Choice(PERSONAS),
+        about: "её характер: готовый или свой, созданный пользователем, по имени",
+        kind: Kind::Choice(READY_NAMES),
         risk: COMFORT,
         at_pc_only: false,
     },
@@ -343,9 +369,30 @@ pub const SETTINGS: &[Setting] = &[
         at_pc_only: false,
     },
     Setting {
+        key: "companion.every_s",
+        name: "частоту взгляда напарника",
+        about: "через сколько секунд напарник в играх снова смотрит на экран",
+        kind: Kind::Number {
+            min: 20.0,
+            max: 300.0,
+            step: 1.0,
+            unit: " с",
+        },
+        risk: COMFORT,
+        at_pc_only: false,
+    },
+    Setting {
         key: "skills.suggest",
         name: "предложения сохранить навык",
         about: "после трёх действий подряд предлагать сохранить их как навык",
+        kind: Kind::Switch,
+        risk: COMFORT,
+        at_pc_only: false,
+    },
+    Setting {
+        key: "quick.enabled",
+        name: "быстрые команды",
+        about: "короткие просьбы вроде «громче», «пауза», «который час» выполнять сразу, без модели; действия всё равно проходят проверку риска",
         kind: Kind::Switch,
         risk: COMFORT,
         at_pc_only: false,
@@ -371,6 +418,14 @@ pub const SETTINGS: &[Setting] = &[
         name: "аватар на рабочем столе",
         about: "показывать аватар в углу рабочего стола",
         kind: Kind::Switch,
+        risk: COMFORT,
+        at_pc_only: false,
+    },
+    Setting {
+        key: "ui.theme",
+        name: "тему оформления",
+        about: "цвета окон: фиалка — фиолетовая, ночь — синяя, сакура — розовая, мята — бирюзово-зелёная, янтарь — тёплая, графит — почти без цвета; свой акцентный цвет при этом сбрасывается",
+        kind: Kind::Choice(THEMES),
         risk: COMFORT,
         at_pc_only: false,
     },
@@ -410,6 +465,19 @@ pub const SETTINGS: &[Setting] = &[
     },
 ];
 
+/// Settings that turn on only while another one is on: the key, and the
+/// key it needs. The other one is not turned on along the way: the user is
+/// told, and it asks for itself.
+const NEEDS: &[(&str, &str)] = &[("companion.enabled", "privacy.screen")];
+
+/// The setting `key` needs on before it may be turned on.
+pub fn needs(key: &str) -> Option<&'static Setting> {
+    NEEDS
+        .iter()
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, other)| find(other))
+}
+
 /// The setting of `key`, if she may change it.
 pub fn find(key: &str) -> Option<&'static Setting> {
     let key = key.trim().to_lowercase();
@@ -425,13 +493,18 @@ pub fn keys() -> String {
         .join(", ")
 }
 
-fn persona_id(persona: Persona) -> &'static str {
-    match persona {
-        Persona::Caring => "caring",
-        Persona::Cheerful => "cheerful",
-        Persona::Calm => "calm",
-        Persona::Bold => "bold",
-        Persona::Custom => "custom",
+/// The values the application offers for `key` besides those of its kind:
+/// the names of the user's own characters for `assistant.persona`. The voices
+/// of `voice.voice` the application lists itself.
+pub fn options(config: &Config, key: &str) -> Vec<String> {
+    match key {
+        "assistant.persona" => config
+            .assistant
+            .custom_personas
+            .iter()
+            .map(|p| p.name.clone())
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -467,14 +540,19 @@ pub fn read(config: &Config, key: &str) -> Option<Value> {
         "voice.duck_media" => on(voice.duck_media),
         "voice.tone_by_mood" => on(voice.tone_by_mood),
         "notifications.read_aloud" => on(config.notifications.read_aloud),
-        "assistant.persona" => text(persona_id(config.assistant.persona)),
+        "assistant.persona" => text(&config.assistant.persona_choice()),
+        "assistant.adult" => on(config.assistant.adult),
+        "companion.enabled" => on(config.companion.enabled),
+        "companion.every_s" => number(config.companion.every() as f64, 1.0),
         "rhythm.lively" => on(rhythm.lively),
         "rhythm.breaks" => on(rhythm.breaks),
         "rhythm.break_every_min" => number(rhythm.break_every_min as f64, 1.0),
         "island.hide_in_games" => on(config.island.hide_in_games),
         "skills.suggest" => on(config.skills.suggest),
+        "quick.enabled" => on(config.quick.enabled),
         "avatar.in_island" => on(config.avatar.in_island),
         "avatar.on_desktop" => on(config.avatar.on_desktop),
+        "ui.theme" => text(config.ui.theme.id()),
         "i18n.language" => text(
             Lang::from_code(&config.i18n.language)
                 .unwrap_or(Lang::Ru)
@@ -582,15 +660,20 @@ impl Setting {
                 };
                 Ok(Value::Number(rounded(value, step).clamp(min, max)))
             }
-            Kind::Choice(list) => raw
-                .as_str()
-                .map(|s| s.trim().to_lowercase())
-                .and_then(|word| {
-                    list.iter()
-                        .find(|(id, name)| *id == word || name.to_lowercase() == word)
-                })
-                .map(|(id, _)| Value::Text(id.to_string()))
-                .ok_or_else(wrong),
+            Kind::Choice(list) => {
+                let word = raw.as_str().map(fold).ok_or_else(wrong)?;
+                if let Some((id, _)) = list
+                    .iter()
+                    .find(|(id, name)| fold(id) == word || fold(name) == word)
+                {
+                    return Ok(Value::Text(id.to_string()));
+                }
+                options
+                    .iter()
+                    .find(|o| fold(o) == word)
+                    .map(|o| Value::Text(o.clone()))
+                    .ok_or_else(wrong)
+            }
             Kind::Listed => {
                 let word = raw
                     .as_str()
@@ -646,7 +729,6 @@ impl Setting {
             (Value::Text(t), Kind::Listed) if t.is_empty() => "автоматически".into(),
             (Value::Text(t), Kind::Choice(list)) => match list.iter().find(|(id, _)| id == t) {
                 Some((_, name)) => name.to_string(),
-                None if t == "custom" => "свой".into(),
                 None => t.clone(),
             },
             (Value::Text(t), _) => t.clone(),
@@ -665,11 +747,18 @@ impl Setting {
                 }
                 text
             }
-            Kind::Choice(list) => list
-                .iter()
-                .map(|(id, name)| format!("{id} ({name})"))
-                .collect::<Vec<_>>()
-                .join(", "),
+            Kind::Choice(list) => {
+                let mut text = list
+                    .iter()
+                    .map(|(id, name)| format!("{id} ({name})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if !options.is_empty() {
+                    text.push_str("; свои по имени: ");
+                    text.push_str(&joined(options.iter().map(|o| o.as_str())));
+                }
+                text
+            }
             Kind::Listed if options.is_empty() => {
                 "выбрать не из чего: приложение не дало списка вариантов".into()
             }
@@ -688,6 +777,12 @@ impl Setting {
         };
         let target = format!("было: {} → станет: {}", self.shown(old), self.shown(new));
         let reason = match level {
+            RiskLevel::High if self.key == "assistant.adult" => {
+                "мат и грубые шутки в ответах, только если тебе есть 18; спрашивается каждый раз"
+            }
+            RiskLevel::High if self.key == "companion.enabled" => {
+                "в игре она будет посылать снимки экрана зрительной модели, каждый снимок платный; спрашивается каждый раз"
+            }
             RiskLevel::High => {
                 "открывает то, что она слышит, видит, хранит или отправляет; спрашивается каждый раз"
             }
@@ -795,6 +890,7 @@ mod tests {
             "notifications",
             "tracking.app_time",
             "tracking.clipboard",
+            "assistant.adult",
         ] {
             let s = s(key);
             assert_eq!(s.risk_of(&OFF, &ON), RiskLevel::High, "{key} on");
@@ -918,6 +1014,134 @@ mod tests {
     }
 
     #[test]
+    fn a_character_is_a_ready_one_or_an_own_one_by_name() {
+        use crate::config::Persona;
+        let t = |v: &str| Value::Text(v.into());
+        let persona = s("assistant.persona");
+        let Kind::Choice(list) = persona.kind else {
+            panic!("assistant.persona is not a choice");
+        };
+        let ids: Vec<&str> = list.iter().map(|(id, _)| *id).collect();
+        let ready: Vec<&str> = Persona::READY.iter().map(|p| p.id()).collect();
+        assert_eq!(ids, ready);
+        for (word, id) in [
+            ("Деловая", "business"),
+            ("ехидная", "sarcastic"),
+            ("sleepy", "sleepy"),
+            ("Веселая", "cheerful"),
+        ] {
+            assert_eq!(persona.parse(&json!(word), &t("caring"), &[]), Ok(t(id)));
+        }
+        // Own characters come from the application, by name, in any case.
+        let mut c = Config::default();
+        c.assistant
+            .save_custom_persona(None, "Котёнок", "Мурлычешь.")
+            .unwrap();
+        let own = options(&c, "assistant.persona");
+        assert_eq!(own, vec!["Котёнок".to_string()]);
+        assert!(options(&c, "i18n.language").is_empty());
+        assert_eq!(
+            persona.parse(&json!("котенок"), &t("caring"), &own),
+            Ok(t("Котёнок"))
+        );
+        assert!(persona.parse(&json!("Пират"), &t("caring"), &own).is_err());
+        assert!(persona.allowed(&own).ends_with("свои по имени: Котёнок"));
+        // The model reads the name in force and sees it on the card.
+        c.assistant.choose_persona("Котёнок").unwrap();
+        assert_eq!(read(&c, "assistant.persona"), Some(t("Котёнок")));
+        let card = persona.assess(&t("caring"), &t("Котёнок"));
+        assert_eq!(card.target, "было: заботливая → станет: Котёнок");
+        assert_eq!(card.level, RiskLevel::Low);
+    }
+
+    #[test]
+    fn the_adult_mode_turns_on_only_at_the_computer_asking_every_time() {
+        let adult = s("assistant.adult");
+        assert_eq!(adult.kind, Kind::Switch);
+        assert!(adult.at_pc_only);
+        let on = adult.assess(&OFF, &ON);
+        assert_eq!(on.level, RiskLevel::High);
+        assert_eq!(on.summary, "Включить взрослый режим");
+        assert!(on.reason.contains("18"), "{}", on.reason);
+        assert!(crate::policy::forever_block_for(&on).is_some());
+        let off = adult.assess(&ON, &OFF);
+        assert_eq!(off.level, RiskLevel::Low);
+        let mut c = Config::default();
+        assert_eq!(read(&c, "assistant.adult"), Some(OFF));
+        c.assistant.adult = true;
+        assert_eq!(read(&c, "assistant.adult"), Some(ON));
+    }
+
+    #[test]
+    fn the_companion_turns_on_at_the_computer_asking_and_needs_the_screen() {
+        let companion = s("companion.enabled");
+        assert_eq!(companion.kind, Kind::Switch);
+        assert!(companion.at_pc_only);
+        let on = companion.assess(&OFF, &ON);
+        assert_eq!(on.level, RiskLevel::High);
+        assert_eq!(on.summary, "Включить напарника в играх");
+        assert!(on.reason.contains("платный"), "{}", on.reason);
+        assert!(crate::policy::forever_block_for(&on).is_some());
+        assert_eq!(companion.assess(&ON, &OFF).level, RiskLevel::Low);
+        assert_eq!(
+            needs("companion.enabled").map(|s| s.key),
+            Some("privacy.screen")
+        );
+        assert!(needs("privacy.screen").is_none());
+        let mut c = Config::default();
+        assert_eq!(read(&c, "companion.enabled"), Some(OFF));
+        c.companion.enabled = true;
+        assert_eq!(read(&c, "companion.enabled"), Some(ON));
+
+        // The interval changes freely, inside 20–300 s.
+        let every = s("companion.every_s");
+        let n = Value::Number;
+        assert!(!every.at_pc_only);
+        assert_eq!(every.risk_of(&n(60.0), &n(20.0)), RiskLevel::Low);
+        assert_eq!(every.parse(&json!("+30"), &n(60.0), &[]), Ok(n(90.0)));
+        assert_eq!(every.parse(&json!("-100"), &n(60.0), &[]), Ok(n(20.0)));
+        assert!(every.parse(&json!(10), &n(60.0), &[]).is_err());
+        assert_eq!(read(&c, "companion.every_s"), Some(n(60.0)));
+        c.companion.every_s = 7;
+        assert_eq!(read(&c, "companion.every_s"), Some(n(20.0)));
+    }
+
+    #[test]
+    fn the_theme_is_a_choice_of_every_ready_theme_without_confirmation() {
+        use crate::config::ThemeChoice;
+        let t = |v: &str| Value::Text(v.into());
+        let theme = s("ui.theme");
+        let Kind::Choice(list) = theme.kind else {
+            panic!("ui.theme is not a choice");
+        };
+        let ids: Vec<&str> = list.iter().map(|(id, _)| *id).collect();
+        let all: Vec<&str> = ThemeChoice::ALL.iter().map(|t| t.id()).collect();
+        assert_eq!(ids, all);
+        assert!(!theme.at_pc_only);
+        let (old, new) = (t("violet"), t("sakura"));
+        assert_eq!(theme.risk_of(&old, &new), RiskLevel::Low);
+        assert_eq!(theme.parse(&json!("Сакура"), &old, &[]), Ok(new));
+        assert!(theme.parse(&json!("light"), &old, &[]).is_err());
+        let mut c = Config::default();
+        assert_eq!(read(&c, "ui.theme"), Some(t("violet")));
+        c.ui.theme = ThemeChoice::Mint;
+        assert_eq!(read(&c, "ui.theme"), Some(t("mint")));
+    }
+
+    #[test]
+    fn quick_commands_are_a_switch_without_confirmation() {
+        let quick = s("quick.enabled");
+        assert_eq!(quick.kind, Kind::Switch);
+        assert_eq!(quick.risk_of(&OFF, &ON), RiskLevel::Low);
+        assert_eq!(quick.risk_of(&ON, &OFF), RiskLevel::Low);
+        assert!(!quick.at_pc_only);
+        let mut c = Config::default();
+        assert_eq!(read(&c, "quick.enabled"), Some(ON));
+        c.quick.enabled = false;
+        assert_eq!(read(&c, "quick.enabled"), Some(OFF));
+    }
+
+    #[test]
     fn a_listed_value_is_one_of_the_options() {
         let voice = s("voice.voice");
         let t = |v: &str| Value::Text(v.into());
@@ -997,7 +1221,7 @@ mod tests {
         c.privacy.microphone_enabled = true;
         c.voice.rate = 1.4;
         c.voice.voice = "Pavel".into();
-        c.assistant.persona = Persona::Bold;
+        c.assistant.persona = crate::config::Persona::Bold;
         c.costs.month_limit = 1000.0;
         c.rhythm.break_every_min = 40;
         assert_eq!(read(&c, "privacy.microphone"), Some(ON));

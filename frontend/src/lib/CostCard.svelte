@@ -57,13 +57,13 @@
     padding: 12px 16px;
     border-radius: 18px;
     border: 1px solid rgba(95, 227, 161, 0.22);
-    background: linear-gradient(135deg, rgba(95, 227, 161, 0.1), rgba(111, 227, 255, 0.07));
+    background: linear-gradient(135deg, rgba(95, 227, 161, 0.1), rgba(var(--c-rgb), 0.07));
     user-select: text;
   }
   small {
     display: block;
     font-size: 11.5px;
-    color: #b9c3e6;
+    color: var(--ink3);
   }
   .sum {
     margin-top: 2px;
@@ -106,7 +106,7 @@
     background: var(--warn);
   }
   .bar.over i {
-    background: #ff6b7d;
+    background: var(--bad);
   }
   .rows {
     display: grid;

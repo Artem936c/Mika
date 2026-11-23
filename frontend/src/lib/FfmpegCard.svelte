@@ -68,8 +68,8 @@
     box-sizing: border-box;
     padding: 12px 14px;
     border-radius: 16px;
-    border: 1px solid rgba(143, 125, 255, 0.35);
-    background: rgba(143, 125, 255, 0.1);
+    border: 1px solid rgba(var(--v-rgb), 0.35);
+    background: rgba(var(--v-rgb), 0.1);
     font-size: 13px;
     line-height: 1.45;
   }

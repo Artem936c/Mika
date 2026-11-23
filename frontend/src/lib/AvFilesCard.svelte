@@ -70,7 +70,7 @@
     height: 30px;
     border-radius: 10px;
     color: var(--c);
-    background: rgba(111, 227, 255, 0.1);
+    background: rgba(var(--c-rgb), 0.1);
   }
   .txt {
     min-width: 0;

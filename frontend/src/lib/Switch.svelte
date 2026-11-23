@@ -64,7 +64,7 @@
     translate: 16px 0;
   }
   input:focus-visible + .knob {
-    outline: 2px solid rgba(143, 125, 255, 0.7);
+    outline: 2px solid rgba(var(--v-rgb), 0.7);
     outline-offset: 2px;
   }
   .text {

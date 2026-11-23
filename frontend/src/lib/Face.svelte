@@ -24,6 +24,7 @@
     track = null,
     dictation = null,
     paused = false,
+    sleeping = false,
     onspeak,
   }: {
     status: AssistantState;
@@ -46,6 +47,8 @@
     dictation?: DictationPhase | null;
     /** The pause after a full stop: she waits to be called (decision 0045). */
     paused?: boolean;
+    /** She was asked to sleep (decision 0050): the same calm line, its own words. */
+    sleeping?: boolean;
     onspeak: (v: boolean) => void;
   } = $props();
 
@@ -72,7 +75,7 @@
 {#if status === 'idle' && paused}
   <div class="rowl">
     <Avatar view="head" {emotion} size={30} />
-    <span class="name paused">{t('face.paused')}</span>
+    <span class="name paused">{sleeping ? t('face.sleeping') : t('face.paused')}</span>
     <span class="pad"></span>
   </div>
 {:else if status === 'idle'}
@@ -191,7 +194,7 @@
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
-    background: linear-gradient(90deg, #8d93ab 20%, #fff 50%, #8d93ab 80%);
+    background: linear-gradient(90deg, var(--mute) 20%, #fff 50%, var(--mute) 80%);
     background-size: 200% 100%;
     -webkit-background-clip: text;
     background-clip: text;
@@ -211,8 +214,8 @@
     font-size: 11px;
     font-weight: 600;
     color: var(--c);
-    background: rgba(111, 227, 255, 0.1);
-    border: 1px solid rgba(111, 227, 255, 0.25);
+    background: rgba(var(--c-rgb), 0.1);
+    border: 1px solid rgba(var(--c-rgb), 0.25);
     padding: 3px 9px;
     border-radius: 999px;
   }

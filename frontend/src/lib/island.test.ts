@@ -14,6 +14,7 @@ import {
   foldsAway,
   opensChat,
   reducePaused,
+  reduceSleeping,
   reduceState,
   shapeFor,
   stateLabel,
@@ -165,6 +166,24 @@ describe('reducePaused', () => {
   });
 });
 
+describe('reduceSleeping', () => {
+  it('follows pause_changed with sleeping', () => {
+    expect(reduceSleeping(false, { type: 'pause_changed', paused: true, sleeping: true })).toBe(true);
+    expect(reduceSleeping(true, { type: 'pause_changed', paused: false, sleeping: false })).toBe(false);
+    // A full stop is a pause, not a sleep.
+    expect(reduceSleeping(true, { type: 'pause_changed', paused: true, sleeping: false })).toBe(false);
+    expect(reduceSleeping(true, { type: 'pause_changed', paused: true })).toBe(false);
+  });
+  it('ignores other events and malformed payloads', () => {
+    expect(reduceSleeping(true, { type: 'state_changed', from: 'idle', to: 'thinking' })).toBe(true);
+    expect(reduceSleeping(true, { type: 'pause_changed', paused: 'no', sleeping: false })).toBe(true);
+    expect(reduceSleeping(false, null)).toBe(false);
+  });
+  it('the sleeping line of the island is a text of the locales', () => {
+    expect(isMessageKey('face.sleeping')).toBe(true);
+  });
+});
+
 describe('reduceState', () => {
   it('follows state_changed', () => {
     expect(reduceState('idle', { type: 'state_changed', from: 'idle', to: 'listening' })).toBe('listening');
@@ -223,6 +242,7 @@ describe('noticeOf', () => {
 
   it('keeps greetings and the late-night line in the chat', () => {
     expect(noticeOf({ type: 'remark', text: 'Уже поздно', kind: 'life' })).toBeNull();
+    expect(noticeOf({ type: 'remark', text: 'Красиво ушёл от удара!', kind: 'companion' })).toBeNull();
     expect(noticeOf({ type: 'remark', text: '  ', kind: 'calendar' })).toBeNull();
     expect(noticeOf({ type: 'assistant_delta', text: 'привет' })).toBeNull();
     expect(noticeOf(null)).toBeNull();

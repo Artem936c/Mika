@@ -406,7 +406,7 @@ impl Memory {
         Ok(scored.into_iter().take(limit).map(|(_, h)| h).collect())
     }
 
-    /// Pieces of past conversations for a query, archived ones included.
+    /// Pieces of past conversations for a query, from every conversation of the list.
     pub async fn search_history(
         &self,
         query: &str,
@@ -625,7 +625,7 @@ mod tests {
         assert_eq!(hits[0].role, Role::User);
 
         let e = FakeEmbedder::new();
-        let m = Memory::new(d, Some(e.clone()));
+        let m = Memory::new(d.clone(), Some(e.clone()));
         let hits = m
             .search_history("что я говорил про питомца", 1)
             .await
@@ -634,6 +634,17 @@ mod tests {
         // Second search reuses the stored vectors: only the query is embedded.
         m.search_history("напиток", 1).await.unwrap();
         assert_eq!(*e.calls.lock().last().unwrap(), 1);
+
+        // A deleted conversation is found neither by meaning nor by words,
+        // and its vectors are gone with it (decision 0052).
+        d.delete_conversation("archive-1").unwrap();
+        let hits = m
+            .search_history("что я говорил про питомца", 5)
+            .await
+            .unwrap();
+        assert!(hits.iter().all(|h| h.text != "Мой кот опять не ест"));
+        assert!(words.search_history("кот", 5).await.unwrap().is_empty());
+        assert_eq!(m.message_vectors("fake-1").unwrap().len(), 1);
     }
 
     #[test]

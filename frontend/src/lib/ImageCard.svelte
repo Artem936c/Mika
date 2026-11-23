@@ -40,7 +40,7 @@
     line-height: 0;
   }
   .pic:hover {
-    border-color: rgba(143, 125, 255, 0.5);
+    border-color: rgba(var(--v-rgb), 0.5);
   }
   img {
     display: block;

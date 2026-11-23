@@ -35,6 +35,161 @@ pub struct Config {
     pub research: ResearchConfig,
     pub log: LogConfig,
     pub skills: SkillsConfig,
+    pub ui: UiConfig,
+    pub quick: QuickConfig,
+    pub history: HistoryConfig,
+    pub companion: CompanionConfig,
+}
+
+/// The companion in games (decision 0054): while a game fills the screen she
+/// looks at it now and then and says a short line.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompanionConfig {
+    /// The switch «Напарник в играх». Off until the user turns it on.
+    pub enabled: bool,
+    /// Seconds between two looks, `EVERY_MIN..=EVERY_MAX`.
+    pub every_s: u32,
+    /// Most lines she says in any hour.
+    pub max_per_hour: u32,
+}
+
+impl CompanionConfig {
+    pub const EVERY_MIN: u32 = 20;
+    pub const EVERY_MAX: u32 = 300;
+
+    /// The seconds between looks, a number written by hand cut to the bounds.
+    pub fn every(&self) -> u32 {
+        self.every_s.clamp(Self::EVERY_MIN, Self::EVERY_MAX)
+    }
+}
+
+impl Default for CompanionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            every_s: 60,
+            max_per_hour: 40,
+        }
+    }
+}
+
+/// The list of conversations (decision 0052).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HistoryConfig {
+    /// Conversations without a message for this many days are deleted, but
+    /// for the pinned ones and the open one. 0 keeps them all.
+    pub keep_days: u32,
+}
+
+impl HistoryConfig {
+    /// The choices of the «Память» page; 0 is «никогда».
+    pub const CHOICES: [u32; 5] = [7, 30, 90, 365, 0];
+
+    /// The days to keep, `None` for «никогда». A number the page does not
+    /// offer, written by hand, counts as the nearest longer choice.
+    pub fn keep(&self) -> Option<u32> {
+        match self.keep_days {
+            0 => None,
+            d => Some(
+                Self::CHOICES
+                    .into_iter()
+                    .filter(|c| *c != 0)
+                    .find(|c| *c >= d)
+                    .unwrap_or(365),
+            ),
+        }
+    }
+}
+
+impl Default for HistoryConfig {
+    fn default() -> Self {
+        Self { keep_days: 30 }
+    }
+}
+
+/// Quick commands (decision 0050): short requests run without the model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QuickConfig {
+    /// The switch «Быстрые команды». The sleep words work without it.
+    pub enabled: bool,
+}
+
+impl Default for QuickConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+/// How the windows look (decision 0049): a ready theme and an own accent.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    pub theme: ThemeChoice,
+    /// Own accent colour `#rrggbb`; empty means the colour of the theme.
+    pub accent: String,
+}
+
+impl UiConfig {
+    /// The own accent in the form `#rrggbb`, lower case; `None` for the
+    /// colour of the theme, also when the file holds something else.
+    pub fn accent_hex(&self) -> Option<String> {
+        accent_hex(&self.accent)
+    }
+}
+
+/// `#rrggbb` (or `rrggbb`) in lower case with the hash; `None` for anything else.
+pub fn accent_hex(value: &str) -> Option<String> {
+    let hex = value.trim();
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    (hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| format!("#{}", hex.to_ascii_lowercase()))
+}
+
+/// A ready theme. All are dark; the look of each lives in the interface
+/// (`frontend/src/lib/theme.ts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeChoice {
+    /// The violet look the app had from the start.
+    #[default]
+    Violet,
+    Night,
+    Sakura,
+    Mint,
+    Amber,
+    Graphite,
+}
+
+impl ThemeChoice {
+    pub const ALL: [ThemeChoice; 6] = [
+        ThemeChoice::Violet,
+        ThemeChoice::Night,
+        ThemeChoice::Sakura,
+        ThemeChoice::Mint,
+        ThemeChoice::Amber,
+        ThemeChoice::Graphite,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            ThemeChoice::Violet => "violet",
+            ThemeChoice::Night => "night",
+            ThemeChoice::Sakura => "sakura",
+            ThemeChoice::Mint => "mint",
+            ThemeChoice::Amber => "amber",
+            ThemeChoice::Graphite => "graphite",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<ThemeChoice> {
+        let id = id.trim();
+        Self::ALL
+            .into_iter()
+            .find(|t| t.id().eq_ignore_ascii_case(id))
+    }
 }
 
 /// Skills (decision 0047).
@@ -453,16 +608,27 @@ pub fn mcp_token_key(server: &str) -> String {
     format!("mcp.{}.token", server.trim())
 }
 
+/// Who she is: her name, the word that wakes her and her character
+/// (decision 0051). Read through `AssistantFile`, which moves the single
+/// own text of older files into the list of own characters.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "crate::persona::AssistantFile")]
 pub struct AssistantConfig {
     pub name: String,
     pub wake_phrase: String,
+    /// A ready character, or `custom`: the user's own one named `active_custom`.
     pub persona: Persona,
-    /// Used when `persona` is `custom`.
-    pub custom_prompt: String,
+    /// Name of the user's own character in force while `persona` is `custom`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_custom: Option<String>,
+    /// Adult mode: swearing and crude humour are allowed. Off by default,
+    /// turned on only at the computer after «Тебе есть 18?».
+    pub adult: bool,
     /// The first-run screen was passed.
     pub onboarded: bool,
+    /// The user's own characters, at most `MAX_CUSTOM_PERSONAS`. Last: a
+    /// list of tables follows the plain values in TOML.
+    pub custom_personas: Vec<CustomPersona>,
 }
 
 impl Default for AssistantConfig {
@@ -471,8 +637,10 @@ impl Default for AssistantConfig {
             name: "Мика".into(),
             wake_phrase: "Мика".into(),
             persona: Persona::default(),
-            custom_prompt: String::new(),
+            active_custom: None,
+            adult: false,
             onboarded: false,
+            custom_personas: Vec::new(),
         }
     }
 }
@@ -486,35 +654,48 @@ pub enum Persona {
     Cheerful,
     Calm,
     Bold,
+    Business,
+    Sarcastic,
+    Sleepy,
+    /// One of the user's own characters, `AssistantConfig::active_custom`.
     Custom,
 }
 
-/// Longest custom character text that goes into the system prompt, characters.
-pub const MAX_CUSTOM_PROMPT: usize = 1000;
+impl Persona {
+    /// The ready characters, in the order the page shows them.
+    pub const READY: [Persona; 7] = [
+        Persona::Caring,
+        Persona::Cheerful,
+        Persona::Calm,
+        Persona::Bold,
+        Persona::Business,
+        Persona::Sarcastic,
+        Persona::Sleepy,
+    ];
 
-impl AssistantConfig {
-    /// One paragraph about the character for the system prompt.
-    pub fn persona_prompt(&self) -> String {
-        let custom = self.custom_prompt.trim();
-        match self.persona {
-            Persona::Custom if !custom.is_empty() => {
-                custom.chars().take(MAX_CUSTOM_PROMPT).collect()
-            }
-            Persona::Caring | Persona::Custom => "Характер: заботливая и внимательная. \
-Замечаешь, когда собеседнику тяжело, и поддерживаешь его."
-                .into(),
-            Persona::Cheerful => "Характер: весёлая и игривая. \
-Любишь лёгкие шутки, но делу они не мешают."
-                .into(),
-            Persona::Calm => "Характер: спокойная и собранная. \
-Говоришь ровно и по делу, без восклицаний."
-                .into(),
-            Persona::Bold => "Характер: дерзкая и остроумная. \
-Можешь по-дружески поддеть, но без грубости, и всегда помогаешь."
-                .into(),
+    pub fn id(self) -> &'static str {
+        match self {
+            Persona::Caring => "caring",
+            Persona::Cheerful => "cheerful",
+            Persona::Calm => "calm",
+            Persona::Bold => "bold",
+            Persona::Business => "business",
+            Persona::Sarcastic => "sarcastic",
+            Persona::Sleepy => "sleepy",
+            Persona::Custom => "custom",
         }
     }
+
+    /// A ready character by its id; `custom` is none of them.
+    pub fn from_id(id: &str) -> Option<Persona> {
+        let id = id.trim();
+        Self::READY
+            .into_iter()
+            .find(|p| p.id().eq_ignore_ascii_case(id))
+    }
 }
+
+pub use crate::persona::{CustomPersona, MAX_CUSTOM_PROMPT};
 
 /// Where the avatar is shown, which one and how it looks (decision 0040).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1254,6 +1435,111 @@ mod tests {
     }
 
     #[test]
+    fn conversations_are_kept_thirty_days_by_default_and_an_old_file_reads() {
+        let (_d, p) = tmp();
+        std::fs::write(&p, "[assistant]\nname = \"Айри\"\n").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.history.keep_days, 30);
+        assert_eq!(c.history.keep(), Some(30));
+        let mut c = Config::default();
+        c.history.keep_days = 0;
+        c.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[history]") && text.contains("keep_days = 0"));
+        assert_eq!(Config::load(&p).unwrap().history.keep(), None);
+        let keep = |d| HistoryConfig { keep_days: d }.keep();
+        assert_eq!(keep(7), Some(7));
+        assert_eq!(keep(1), Some(7));
+        assert_eq!(keep(45), Some(90));
+        assert_eq!(keep(5000), Some(365));
+    }
+
+    #[test]
+    fn the_companion_is_off_by_default_and_an_old_file_reads() {
+        let (_d, p) = tmp();
+        std::fs::write(&p, "[assistant]\nname = \"Айри\"\n").unwrap();
+        let old = Config::load(&p).unwrap().companion;
+        assert_eq!(old, CompanionConfig::default());
+        assert!(!old.enabled);
+        assert_eq!((old.every_s, old.max_per_hour), (60, 40));
+        let mut c = Config::default();
+        c.companion.enabled = true;
+        c.companion.every_s = 30;
+        c.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[companion]") && text.contains("every_s = 30"));
+        let back = Config::load(&p).unwrap().companion;
+        assert!(back.enabled);
+        assert_eq!(back.every(), 30);
+        // A number written by hand stays inside the bounds.
+        std::fs::write(&p, "[companion]\nevery_s = 5\n").unwrap();
+        let low = Config::load(&p).unwrap().companion;
+        assert_eq!(low.every(), CompanionConfig::EVERY_MIN);
+        assert_eq!((low.max_per_hour, low.enabled), (40, false));
+        let high = CompanionConfig {
+            every_s: 9999,
+            ..Default::default()
+        };
+        assert_eq!(high.every(), CompanionConfig::EVERY_MAX);
+    }
+
+    #[test]
+    fn quick_commands_are_on_by_default_and_an_old_file_reads() {
+        let (_d, p) = tmp();
+        std::fs::write(&p, "[assistant]\nname = \"Айри\"\n").unwrap();
+        assert!(Config::load(&p).unwrap().quick.enabled);
+        let mut c = Config::default();
+        assert!(c.quick.enabled);
+        c.quick.enabled = false;
+        c.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[quick]") && text.contains("enabled = false"));
+        assert!(!Config::load(&p).unwrap().quick.enabled);
+    }
+
+    #[test]
+    fn an_old_file_without_ui_has_the_violet_theme() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            &p,
+            "[assistant]\nname = \"Айри\"\n[island]\ncity = \"Казань\"\n",
+        )
+        .unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.ui.theme, ThemeChoice::Violet);
+        assert_eq!(c.ui.accent, "");
+        assert_eq!(c.ui.accent_hex(), None);
+    }
+
+    #[test]
+    fn the_theme_and_accent_are_saved_and_read_back() {
+        let (_d, p) = tmp();
+        let mut c = Config::default();
+        c.ui.theme = ThemeChoice::Sakura;
+        c.ui.accent = "#40c0a0".into();
+        c.save(&p).unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(text.contains("[ui]") && text.contains("theme = \"sakura\""));
+        assert_eq!(Config::load(&p).unwrap().ui, c.ui);
+    }
+
+    #[test]
+    fn themes_have_ids_and_an_accent_is_a_hex_colour() {
+        for t in ThemeChoice::ALL {
+            assert_eq!(ThemeChoice::from_id(t.id()), Some(t));
+            let json = serde_json::to_value(t).unwrap();
+            assert_eq!(json, serde_json::json!(t.id()));
+        }
+        assert_eq!(ThemeChoice::from_id(" Mint "), Some(ThemeChoice::Mint));
+        assert_eq!(ThemeChoice::from_id("light"), None);
+        assert_eq!(accent_hex("#8F7DFF"), Some("#8f7dff".into()));
+        assert_eq!(accent_hex(" 8f7dff "), Some("#8f7dff".into()));
+        for bad in ["", "#fff", "#12345g", "red", "#8f7dff00"] {
+            assert_eq!(accent_hex(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
     fn unknown_keys_are_ignored() {
         let (_d, p) = tmp();
         std::fs::write(
@@ -1297,7 +1583,7 @@ mod tests {
         std::fs::write(&p, "[assistant]\nname = \"Айри\"\nwake_phrase = \"Айри\"\n").unwrap();
         let c = Config::load(&p).unwrap();
         assert_eq!(c.assistant.persona, Persona::Caring);
-        assert_eq!(c.assistant.custom_prompt, "");
+        assert!(c.assistant.custom_personas.is_empty() && !c.assistant.adult);
         assert!(c.avatar.in_island && !c.avatar.on_desktop);
     }
 
@@ -1429,17 +1715,6 @@ model = \"\"
         c.island.city = "Пермь".into();
         c.save(&p).unwrap();
         assert_eq!(Config::load(&p).unwrap(), c);
-    }
-
-    #[test]
-    fn empty_custom_persona_falls_back_to_caring() {
-        let mut a = AssistantConfig {
-            persona: Persona::Custom,
-            ..Default::default()
-        };
-        assert!(a.persona_prompt().contains("заботливая"));
-        a.custom_prompt = "я".repeat(MAX_CUSTOM_PROMPT + 50);
-        assert_eq!(a.persona_prompt().chars().count(), MAX_CUSTOM_PROMPT);
     }
 
     #[test]

@@ -49,6 +49,7 @@
     wake_engine: WakeEngine;
     wake_engine_used: WakeEngine;
     follow_up: boolean;
+    quick: boolean;
     duck_media: boolean;
     tts_style: string;
     tone_by_mood: boolean;
@@ -85,6 +86,16 @@
     try {
       await invoke('set_follow_up', { value: v });
       s.follow_up = v;
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  async function setQuick(v: boolean) {
+    if (!s) return;
+    try {
+      await invoke('set_quick_commands', { value: v });
+      s.quick = v;
     } catch (e) {
       fail(e);
     }
@@ -472,6 +483,7 @@
   {#if wakeNote}<p class="hint">{wakeNote}</p>{/if}
   <Switch checked={s.follow_up} title={t('voice.follow_up')} sub={t('voice.follow_up_sub')} onchange={setFollowUp} />
   <Switch checked={s.duck_media} title={t('voice.duck')} sub={t('voice.duck_sub')} onchange={setDuck} />
+  <Switch checked={s.quick} title={t('voice.quick')} sub={t('voice.quick_sub')} onchange={setQuick} />
   <div class="lbl top">{t('voice.sherpa')}</div>
   {#if s.sherpa_downloading}
     <p class="hint">{t('voice.vosk_loading', { share: sherpaShare })}</p>
@@ -551,7 +563,7 @@
     cursor: pointer;
   }
   select.fld option {
-    background: #14151f;
+    background: var(--raised);
   }
   .vrow {
     display: flex;
@@ -562,7 +574,7 @@
     min-width: 0;
   }
   .bt.on {
-    border-color: rgba(143, 125, 255, 0.55);
+    border-color: rgba(var(--v-rgb), 0.55);
   }
   .voices {
     display: flex;
@@ -580,8 +592,8 @@
     overflow: hidden;
   }
   .vc.on {
-    border-color: rgba(143, 125, 255, 0.6);
-    background: rgba(143, 125, 255, 0.14);
+    border-color: rgba(var(--v-rgb), 0.6);
+    background: rgba(var(--v-rgb), 0.14);
   }
   .vc button {
     all: unset;

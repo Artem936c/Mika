@@ -125,7 +125,7 @@
   }
   .tile.on {
     border-color: var(--v);
-    box-shadow: 0 0 0 3px rgba(143, 125, 255, 0.2);
+    box-shadow: 0 0 0 3px rgba(var(--v-rgb), 0.2);
     color: #fff;
   }
   .tile b,

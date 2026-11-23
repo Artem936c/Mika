@@ -8,12 +8,14 @@ use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+use crate::attach::Eyes;
 use crate::config::AssistantConfig;
 use crate::emotion::Emotion;
 use crate::events::{Event, EventBus};
 use crate::gate::{Gate, GateDecision};
 use crate::llm::{
-    ChatMessage, LlmChunk, LlmError, LlmProvider, LlmRequest, ThoughtFilter, ToolCall,
+    Attachment, AttachmentKind, ChatMessage, LlmChunk, LlmError, LlmProvider, LlmRequest,
+    ThoughtFilter, ToolCall,
 };
 use crate::marks::MarkFilter;
 use crate::memory::Recall;
@@ -58,8 +60,15 @@ pub const HISTORY_BUDGET: usize = 40_000;
 /// Error of a direct turn whose answer came back empty.
 const EMPTY_DIRECT_REPLY: &str = "модель ничего не ответила";
 
+/// What one attached file counts for in the history budget, characters: its
+/// line «[файл: имя]». The text of a file is not counted: it goes only with
+/// the newest messages that have files (decision 0053), and counting it would
+/// drop the very message the user asks about.
+const ATTACHMENT_SIZE: usize = 60;
+
 fn message_size(m: &ChatMessage) -> usize {
     m.content.chars().count()
+        + m.attachments.len() * ATTACHMENT_SIZE
         + m.tool_calls
             .iter()
             .map(|c| c.name.len() + c.arguments.to_string().len())
@@ -81,6 +90,16 @@ pub fn trim_history(history: &[ChatMessage], budget: usize) -> &[ChatMessage] {
         }
     }
     &history[start..]
+}
+
+/// True when a stop came while the turn waited for the one before it: the
+/// turn is dropped then, before anything is shown, run or kept.
+fn dropped(cancel: &CancellationToken) -> bool {
+    let stopped = cancel.is_cancelled();
+    if stopped {
+        log::info!(target: "turn", "turn dropped: stopped while it waited");
+    }
+    stopped
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -578,13 +597,29 @@ pub struct Agent {
     bus: EventBus,
     state: StateHandle,
     system_prompt: RwLock<String>,
-    history: Mutex<Vec<ChatMessage>>,
-    store: Option<(Arc<Db>, String)>,
+    /// The open conversation and its messages, under one lock: a message is
+    /// stored and joins the history in the conversation it was meant for.
+    log: Mutex<Log>,
+    store: Option<Arc<Db>>,
     turn: tokio::sync::Mutex<()>,
     /// Plan of the message being answered; with a plan the step limit is higher.
     tasks: RwLock<Option<TaskBoard>>,
     /// What the turn did, for a skill (decision 0047); nothing is recorded while unset.
     skills: RwLock<Option<SkillBook>>,
+    /// How attached pictures reach the model (decision 0053); while unset the
+    /// main model gets them.
+    eyes: RwLock<Option<Eyes>>,
+}
+
+/// The open conversation and what it keeps.
+#[derive(Default)]
+struct Log {
+    /// The conversation the messages go to (decision 0052).
+    conversation: String,
+    messages: Vec<ChatMessage>,
+    /// While a turn runs: exchanges that came meanwhile, such as «усни» said
+    /// during a task. They are kept after the messages of the turn.
+    held: Option<Vec<ChatMessage>>,
 }
 
 /// How one call ended.
@@ -592,6 +627,8 @@ struct Done {
     ok: bool,
     /// For the model: the output or what went wrong.
     text: String,
+    /// What the tool gave for the chat card, if anything.
+    data: Option<Value>,
     /// The steps of a skill the call gave, to run next.
     replay: Option<Replay>,
 }
@@ -601,9 +638,19 @@ impl Done {
         Self {
             ok: false,
             text,
+            data: None,
             replay: None,
         }
     }
+}
+
+/// How the call of a quick command ended (decision 0050).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuickDone {
+    pub ok: bool,
+    /// The output of the tool, or why it failed or was refused.
+    pub text: String,
+    pub data: Option<Value>,
 }
 
 /// Output of one step of a skill in the answer to the model, characters.
@@ -629,11 +676,90 @@ impl Agent {
             bus,
             state,
             system_prompt: RwLock::new(system_prompt),
-            history: Mutex::new(Vec::new()),
+            log: Mutex::new(Log::default()),
             store: None,
             turn: tokio::sync::Mutex::new(()),
             tasks: RwLock::new(None),
             skills: RwLock::new(None),
+            eyes: RwLock::new(None),
+        }
+    }
+
+    /// The vision model and whether the main model sees, for attached
+    /// pictures (decision 0053).
+    pub fn set_eyes(&self, eyes: Eyes) {
+        *self.eyes.write() = Some(eyes);
+    }
+
+    /// The folder of attached files; `None` without a store on disk.
+    fn attachments_root(&self) -> Option<std::path::PathBuf> {
+        self.store
+            .as_ref()
+            .and_then(|db| db.attachments_dir())
+            .map(std::path::Path::to_path_buf)
+    }
+
+    /// Whether the main model gets attached pictures itself.
+    fn pictures_direct(&self) -> bool {
+        let eyes = self.eyes.read().clone();
+        eyes.is_none_or(|e| (e.main_sees)())
+    }
+
+    /// While the main model gets no pictures, the vision model describes
+    /// each new one in words; the description stays with the message.
+    /// A picture it could not describe goes by its name, and the chat says why.
+    async fn describe_pictures(&self, attachments: &mut [Attachment], cancel: &CancellationToken) {
+        let eyes = self.eyes.read().clone();
+        let Some(eyes) = eyes.filter(|e| !(e.main_sees)()) else {
+            return;
+        };
+        let root = self.attachments_root();
+        for a in attachments
+            .iter_mut()
+            .filter(|a| a.kind == AttachmentKind::Image && a.description.is_none())
+        {
+            let Some(png) = root
+                .as_deref()
+                .and_then(|r| crate::attach::resolve(r, &a.path))
+                .and_then(|f| std::fs::read(f).ok())
+            else {
+                continue;
+            };
+            let asked = Instant::now();
+            let said = tokio::select! {
+                _ = cancel.cancelled() => return,
+                said = eyes.vision.ask(&png, crate::attach::DESCRIBE_QUESTION) => said,
+            };
+            let said = match said {
+                Ok(t) if !t.trim().is_empty() => Ok(t.trim().to_string()),
+                Ok(_) => Err(crate::i18n::tr("chat.attach_describe_empty")),
+                Err(e) => Err(e),
+            };
+            match said {
+                Ok(t) => {
+                    log::info!(
+                        target: "turn",
+                        "picture described for a model without vision: ms={} chars={}",
+                        asked.elapsed().as_millis(),
+                        t.chars().count()
+                    );
+                    a.description = Some(t);
+                }
+                Err(e) => {
+                    log::warn!(
+                        target: "turn",
+                        "picture not described: ms={} error={}",
+                        asked.elapsed().as_millis(),
+                        crate::journal::guarded(&e)
+                    );
+                    self.bus.publish(Event::Error {
+                        message: crate::i18n::tr_args(
+                            "chat.attach_describe_failed",
+                            &[("name", &a.name), ("error", &e)],
+                        ),
+                    });
+                }
+            }
         }
     }
 
@@ -657,12 +783,39 @@ impl Agent {
 
     /// Persists every finished exchange to `db` under `conversation`.
     pub fn with_store(mut self, db: Arc<Db>, conversation: impl Into<String>) -> Self {
-        self.store = Some((db, conversation.into()));
+        self.store = Some(db);
+        self.log.lock().conversation = conversation.into();
         self
     }
 
+    /// The conversation the messages go to; `None` without a store.
+    pub fn conversation(&self) -> Option<String> {
+        self.store
+            .as_ref()
+            .map(|_| self.log.lock().conversation.clone())
+    }
+
+    /// Opens another stored conversation (decision 0052): its messages become
+    /// the history, and what comes next is written to it. Waits for a running
+    /// turn to end, so no message of it lands in the wrong conversation; the
+    /// caller stops the turn first.
+    pub async fn switch_conversation(&self, id: &str) -> Result<(), crate::storage::DbError> {
+        let _turn = self.turn.lock().await;
+        let Some(db) = &self.store else {
+            return Ok(());
+        };
+        // Marked open before it is read: the cleanup of old conversations,
+        // which checks the mark when it deletes, then leaves it alone.
+        db.mark_opened(id)?;
+        let messages = db.load_messages(id)?;
+        let mut log = self.log.lock();
+        log.conversation = id.to_string();
+        log.messages = messages;
+        Ok(())
+    }
+
     pub fn with_history(self, messages: Vec<ChatMessage>) -> Self {
-        *self.history.lock() = messages;
+        self.log.lock().messages = messages;
         self
     }
 
@@ -737,15 +890,28 @@ impl Agent {
     /// Adds an assistant message that no reply produced, such as a fired reminder,
     /// so the next reply knows about it.
     pub fn append_note(&self, text: &str) {
-        self.commit(vec![ChatMessage::assistant(text)]);
+        let mut chat = self.log.lock();
+        let conversation = chat.conversation.clone();
+        self.keep(&mut chat, &conversation, vec![ChatMessage::assistant(text)]);
+    }
+
+    /// Adds a request of the user and her short answer that no model made,
+    /// such as «усни» (decision 0050), so the next reply knows what was.
+    /// While a turn runs the pair waits for it and is kept after its
+    /// messages: the request of the turn came first.
+    pub fn append_exchange(&self, user: &str, reply: &str) {
+        let pair = vec![ChatMessage::user(user), ChatMessage::assistant(reply)];
+        let mut chat = self.log.lock();
+        if let Some(held) = chat.held.as_mut() {
+            held.extend(pair);
+            return;
+        }
+        let conversation = chat.conversation.clone();
+        self.keep(&mut chat, &conversation, pair);
     }
 
     pub fn history(&self) -> Vec<ChatMessage> {
-        self.history.lock().clone()
-    }
-
-    pub fn clear_history(&self) {
-        self.history.lock().clear();
+        self.log.lock().messages.clone()
     }
 
     /// Handles one user message. Returns the final reply text.
@@ -765,13 +931,36 @@ impl Agent {
         text: &str,
         cancel: CancellationToken,
     ) -> Result<String, AgentError> {
+        self.handle_with(shown, text, Vec::new(), cancel).await
+    }
+
+    /// Like `handle_expanded`, with files the user attached (decision 0053):
+    /// the chat shows their cards under the message, and the message keeps
+    /// them in the history.
+    pub async fn handle_with(
+        &self,
+        shown: &str,
+        text: &str,
+        mut attachments: Vec<Attachment>,
+        cancel: CancellationToken,
+    ) -> Result<String, AgentError> {
         let _turn = self.turn.lock().await;
+        if dropped(&cancel) {
+            return Err(AgentError::Cancelled);
+        }
+        let conversation = self.begin_turn();
         let started = Instant::now();
         let text = text.trim();
         self.bus.publish(Event::UserText {
             text: shown.trim().into(),
         });
+        if !attachments.is_empty() {
+            self.bus.publish(Event::UserAttachments {
+                items: crate::attach::cards(&attachments),
+            });
+        }
         self.state.set(AssistantState::Thinking);
+        self.describe_pictures(&mut attachments, &cancel).await;
 
         let recall = self.recall.read().clone();
         let recalled = match recall {
@@ -791,7 +980,7 @@ impl Agent {
         if let Some(b) = &book {
             b.begin_turn();
         }
-        let mut new_msgs = vec![ChatMessage::user(text)];
+        let mut new_msgs = vec![ChatMessage::user_with_attachments(text, attachments)];
         let mut stats = TurnStats::default();
         let result = self.run_steps(&mut new_msgs, &cancel, &mut stats).await;
         if let Some(b) = &board {
@@ -838,7 +1027,7 @@ impl Agent {
         if matches!(result, Err(AgentError::TooManySteps)) {
             new_msgs.push(ChatMessage::assistant(AgentError::TooManySteps.to_string()));
         }
-        self.commit(new_msgs);
+        self.end_turn(&conversation, new_msgs);
         self.state.set(AssistantState::Idle);
         result.map(|(reply, _)| reply)
     }
@@ -859,6 +1048,10 @@ impl Agent {
         F: std::future::Future<Output = Result<String, String>> + Send,
     {
         let _turn = self.turn.lock().await;
+        if dropped(&cancel) {
+            return None;
+        }
+        let conversation = self.begin_turn();
         let started = Instant::now();
         let shown = shown.trim();
         self.bus.publish(Event::UserText { text: shown.into() });
@@ -888,10 +1081,13 @@ impl Agent {
                     text: reply.clone(),
                     spoken: None,
                 });
-                self.commit(vec![
-                    ChatMessage::user(shown),
-                    ChatMessage::assistant(reply.clone()),
-                ]);
+                self.end_turn(
+                    &conversation,
+                    vec![
+                        ChatMessage::user(shown),
+                        ChatMessage::assistant(reply.clone()),
+                    ],
+                );
                 Some(reply)
             }
             Some(Err(message)) => {
@@ -923,8 +1119,80 @@ impl Agent {
                 None
             }
         };
+        if reply.is_none() {
+            // Nothing of its own is kept; what waited for it is.
+            self.end_turn(&conversation, Vec::new());
+        }
         self.state.set(AssistantState::Idle);
         reply
+    }
+
+    /// A quick command (decision 0050): one tool call without the model. The
+    /// chat shows `shown`, the row of the call and the reply `reply` makes
+    /// from how the call ended. The call goes the way a call of the model
+    /// goes: assessment, the gate (a question when the policy asks), the
+    /// journal, `ToolStarted` and `ToolFinished`. The pair of `shown` and the
+    /// reply joins the history. «Стоп» ends it without a reply; `None` then.
+    pub async fn handle_quick<F>(
+        &self,
+        shown: &str,
+        call: ToolCall,
+        reply: F,
+        cancel: CancellationToken,
+    ) -> Option<String>
+    where
+        F: FnOnce(&QuickDone) -> String,
+    {
+        let _turn = self.turn.lock().await;
+        if dropped(&cancel) {
+            return None;
+        }
+        let conversation = self.begin_turn();
+        let started = Instant::now();
+        let shown = shown.trim();
+        self.bus.publish(Event::UserText { text: shown.into() });
+        self.state.set(AssistantState::Thinking);
+        // As a step of a skill: it is not recorded for a skill, and steps it
+        // would give are not run.
+        let done = self.run_call(&call, &cancel, false, true).await;
+        let answer = if cancel.is_cancelled() {
+            log::info!(
+                "turn finished: {}outcome=stopped ms={} quick={}",
+                crate::journal::turn_field(),
+                started.elapsed().as_millis(),
+                call.name
+            );
+            self.end_turn(&conversation, Vec::new());
+            None
+        } else {
+            let text = reply(&QuickDone {
+                ok: done.ok,
+                text: done.text,
+                data: done.data,
+            });
+            log::info!(
+                "turn finished: {}outcome={} ms={} quick={} reply_chars={}",
+                crate::journal::turn_field(),
+                if done.ok { "ok" } else { "tool_failed" },
+                started.elapsed().as_millis(),
+                call.name,
+                text.chars().count()
+            );
+            self.bus.publish(Event::AssistantText {
+                text: text.clone(),
+                spoken: None,
+            });
+            self.end_turn(
+                &conversation,
+                vec![
+                    ChatMessage::user(shown),
+                    ChatMessage::assistant(text.clone()),
+                ],
+            );
+            Some(text)
+        };
+        self.state.set(AssistantState::Idle);
+        answer
     }
 
     /// Whether a turn is running now, whatever the shared state shows. An
@@ -939,15 +1207,47 @@ impl Agent {
         self.tasks.read().as_ref().is_some_and(TaskBoard::active)
     }
 
-    fn commit(&self, msgs: Vec<ChatMessage>) {
-        if let Some((db, conv)) = &self.store {
+    /// A turn begins under the turn lock: it belongs to the conversation
+    /// open now, which it returns, and exchanges that come meanwhile wait
+    /// for it (`append_exchange`).
+    fn begin_turn(&self) -> String {
+        let mut chat = self.log.lock();
+        chat.held.get_or_insert_with(Vec::new);
+        chat.conversation.clone()
+    }
+
+    /// The turn of `conversation` ends: its messages are kept, then what
+    /// waited for it.
+    fn end_turn(&self, conversation: &str, msgs: Vec<ChatMessage>) {
+        let mut chat = self.log.lock();
+        let held = chat.held.take().unwrap_or_default();
+        self.keep(&mut chat, conversation, msgs);
+        self.keep(&mut chat, conversation, held);
+    }
+
+    /// Stores `msgs` in `conversation` and adds them to the history, under
+    /// the lock of the log. Messages of a conversation that is no longer
+    /// open are dropped: they never land in another one.
+    fn keep(&self, chat: &mut Log, conversation: &str, msgs: Vec<ChatMessage>) {
+        if msgs.is_empty() {
+            return;
+        }
+        if chat.conversation != conversation {
+            log::warn!(
+                target: "turn",
+                "messages of a conversation that is no longer open dropped: count={}",
+                msgs.len()
+            );
+            return;
+        }
+        if let Some(db) = &self.store {
             for m in &msgs {
-                if let Err(e) = db.append_message(conv, m) {
+                if let Err(e) = db.append_message(conversation, m) {
                     log::warn!("cannot save a message of the conversation: {e}");
                 }
             }
         }
-        self.history.lock().extend(msgs);
+        chat.messages.extend(msgs);
     }
 
     /// Runs LLM steps. On error `msgs` keeps only finished steps, so history stays valid.
@@ -1047,11 +1347,27 @@ impl Agent {
         let marks_on = self.marks_on();
         let mut messages = vec![ChatMessage::system(self.full_system_prompt(marks_on))];
         messages.extend(
-            trim_history(&self.history.lock(), HISTORY_BUDGET)
+            trim_history(&self.log.lock().messages, HISTORY_BUDGET)
                 .iter()
                 .cloned(),
         );
         messages.extend(msgs.iter().cloned());
+        // Attached files become lines, texts and pictures (decision 0053).
+        let messages = if messages.iter().any(|m| !m.attachments.is_empty()) {
+            let root = self.attachments_root();
+            let pictures = self.pictures_direct();
+            let built = tokio::task::spawn_blocking(move || {
+                crate::attach::for_request(messages, root.as_deref(), pictures)
+            });
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(AgentError::Cancelled),
+                built = built => built.map_err(|e| {
+                    AgentError::Llm(LlmError::Protocol(format!("вложения не прочитаны: {e}")))
+                })?,
+            }
+        } else {
+            messages
+        };
         let req = LlmRequest {
             messages,
             tools: self.registry().specs(),
@@ -1438,7 +1754,10 @@ impl Agent {
         });
 
         let mut stopped = false;
+        // The stop is looked at first: a gate that answers at once (a rule
+        // «always») must not let a stopped call through.
         let decision = tokio::select! {
+            biased;
             _ = cancel.cancelled() => {
                 stopped = true;
                 GateDecision::Denied("остановлено пользователем".into())
@@ -1472,7 +1791,8 @@ impl Agent {
             tool.run(args, approval, cancel.child_token()),
         );
         let mut replay = None;
-        let (ok, text, data, note) = tokio::select! {
+        let (ok, text, data, note): (bool, String, Option<Value>, CallNote) = tokio::select! {
+            biased;
             _ = cancel.cancelled() => (
                 false,
                 "Остановлено пользователем.".to_string(),
@@ -1503,7 +1823,7 @@ impl Agent {
                 }
             },
         };
-        self.finish(call, ok, &text, data, started, &note, logged_args);
+        self.finish(call, ok, &text, data.clone(), started, &note, logged_args);
         if let Some(b) = &book {
             match (ok, recorded_args) {
                 (true, Some(args)) => b.record(&call.name, &args, is_read(&call.name, risk)),
@@ -1513,6 +1833,7 @@ impl Agent {
         Done {
             ok,
             text: truncate(&text, MAX_TOOL_RESULT),
+            data,
             replay,
         }
     }
@@ -2360,6 +2681,268 @@ Actually, I'll call generate_image.
         assert_eq!(db.load_messages("main").unwrap().len(), 2);
     }
 
+    struct FakeVision(Mutex<usize>);
+
+    #[async_trait]
+    impl crate::llm::Vision for FakeVision {
+        async fn ask(&self, png: &[u8], _question: &str) -> Result<String, String> {
+            *self.0.lock() += 1;
+            Ok(format!("картинка из {} байт", png.len()))
+        }
+    }
+
+    /// An agent over a database on disk with one picture attached in `c`.
+    fn agent_with_picture(
+        p: Arc<FakeProvider>,
+        main_sees: bool,
+    ) -> (Agent, tempfile::TempDir, Arc<FakeVision>, Attachment) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Db::open(&dir.path().join("mika.db")).unwrap());
+        let folder = crate::attach::conversation_dir(db.attachments_dir().unwrap(), "c");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("1.png"), [7u8; 5]).unwrap();
+        let (a, _rx, _) = agent(p);
+        let a = a.with_store(db, "c");
+        let vision = Arc::new(FakeVision(Mutex::new(0)));
+        a.set_eyes(Eyes {
+            vision: vision.clone(),
+            main_sees: Arc::new(move || main_sees),
+        });
+        let picture = Attachment {
+            kind: AttachmentKind::Image,
+            name: "кот.png".into(),
+            path: "c/1.png".into(),
+            description: None,
+        };
+        (a, dir, vision, picture)
+    }
+
+    #[tokio::test]
+    async fn an_attached_picture_goes_to_a_model_that_sees() {
+        let p = FakeProvider::new(vec![Some(vec![text("рыжий")])]);
+        let (a, _dir, vision, picture) = agent_with_picture(p.clone(), true);
+        let reply = a
+            .handle_with(
+                "кто это?",
+                "кто это?",
+                vec![picture.clone()],
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply, "рыжий");
+        assert_eq!(*vision.0.lock(), 0, "nobody describes it");
+        let req = &p.requests.lock()[0];
+        let user = req.messages.last().unwrap();
+        assert_eq!(user.content, "кто это?\n\n[картинка: кот.png]");
+        assert_eq!(user.images.len(), 1);
+        assert!(user.attachments.is_empty(), "no path goes to the provider");
+        // The history keeps the file, not the picture.
+        let kept = &a.history()[0];
+        assert_eq!(kept.attachments, vec![picture]);
+        assert!(kept.images.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_model_without_vision_gets_the_description_once() {
+        let p = FakeProvider::new(vec![Some(vec![text("ок")]), Some(vec![text("ещё")])]);
+        let (a, _dir, vision, picture) = agent_with_picture(p.clone(), false);
+        a.handle_with("", "", vec![picture], CancellationToken::new())
+            .await
+            .unwrap();
+        a.handle("а ещё?", CancellationToken::new()).await.unwrap();
+        assert_eq!(*vision.0.lock(), 1, "described once, kept with the message");
+        let requests = p.requests.lock();
+        for req in requests.iter() {
+            let first = req.messages.iter().find(|m| m.role == Role::User).unwrap();
+            assert_eq!(
+                first.content,
+                "[картинка: кот.png. Что на ней: картинка из 5 байт]"
+            );
+            assert!(first.images.is_empty());
+        }
+        assert_eq!(
+            a.history()[0].attachments[0].description.as_deref(),
+            Some("картинка из 5 байт")
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_loads_the_history_of_that_conversation_and_writes_there() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        db.append_message("old", &ChatMessage::user("про кота"))
+            .unwrap();
+        db.append_message("old", &ChatMessage::assistant("Барсик"))
+            .unwrap();
+        let p = FakeProvider::new(vec![Some(vec![text("ок")])]);
+        let (a, _rx, _) = agent(p);
+        let a = a
+            .with_history(vec![ChatMessage::user("сейчас")])
+            .with_store(db.clone(), "now");
+        assert_eq!(a.conversation().as_deref(), Some("now"));
+        a.switch_conversation("old").await.unwrap();
+        assert_eq!(a.conversation().as_deref(), Some("old"));
+        assert_eq!(
+            a.history(),
+            vec![
+                ChatMessage::user("про кота"),
+                ChatMessage::assistant("Барсик")
+            ]
+        );
+        a.append_note("заметка");
+        assert_eq!(db.load_messages("old").unwrap().len(), 3);
+        assert!(db.load_messages("now").unwrap().is_empty());
+        assert_eq!(db.last_opened().unwrap().as_deref(), Some("old"));
+        // An empty new conversation: an empty history.
+        let id = db.create_conversation().unwrap();
+        a.switch_conversation(&id).await.unwrap();
+        assert!(a.history().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_turn_stopped_before_it_began_shows_runs_and_keeps_nothing() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let p = FakeProvider::new(vec![Some(vec![text("ок")])]);
+        let (a, mut rx, state) = agent(p.clone());
+        let a = a.with_store(db.clone(), "c");
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        assert!(matches!(
+            a.handle("привет", stopped.clone()).await,
+            Err(AgentError::Cancelled)
+        ));
+        let quick = ToolCall {
+            id: "quick-1".into(),
+            name: "echo".into(),
+            arguments: json!({"text": "громче"}),
+        };
+        let said = a
+            .handle_quick("громче", quick, |_| "Громче.".to_string(), stopped)
+            .await;
+        assert_eq!(said, None);
+        let events = drain(&mut rx);
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                Event::UserText { .. } | Event::ToolStarted { .. } | Event::ToolFinished { .. }
+            )),
+            "{events:?}"
+        );
+        assert!(p.requests.lock().is_empty(), "the model was not asked");
+        assert!(a.history().is_empty());
+        assert!(db.load_messages("c").unwrap().is_empty());
+        assert_eq!(state.get(), AssistantState::Idle);
+    }
+
+    #[tokio::test]
+    async fn a_stopped_call_never_starts_even_when_the_gate_answers_at_once() {
+        let mut reg = ToolRegistry::new();
+        let runs = act(&mut reg, "louder", RiskLevel::Low);
+        let gate = Arc::new(Watching {
+            refuse: &[],
+            asked: Mutex::new(Vec::new()),
+        });
+        let (a, _book, _rx) = skill_agent(FakeProvider::new(vec![]), reg, gate);
+        let stopped = CancellationToken::new();
+        stopped.cancel();
+        let louder = ToolCall {
+            id: "1".into(),
+            name: "louder".into(),
+            arguments: json!({}),
+        };
+        for _ in 0..64 {
+            let done = a.run_call(&louder, &stopped, false, true).await;
+            assert!(!done.ok);
+        }
+        assert!(runs.lock().is_empty(), "a stopped call ran");
+    }
+
+    /// Answers once it is let go.
+    struct Held(Arc<tokio::sync::Notify>);
+
+    #[async_trait]
+    impl LlmProvider for Held {
+        fn name(&self) -> &str {
+            "held"
+        }
+        async fn stream(&self, _req: LlmRequest) -> Result<LlmStream, LlmError> {
+            self.0.notified().await;
+            Ok(futures::stream::iter(vec![text("готово")]).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exchange_during_a_turn_is_kept_after_the_messages_of_the_turn() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let go = Arc::new(tokio::sync::Notify::new());
+        let bus = EventBus::new(256);
+        let a = Agent::new(
+            Arc::new(Held(go.clone())),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(LowRiskOnlyGate),
+            bus.clone(),
+            StateHandle::new(bus),
+            "sys".into(),
+        );
+        let a = Arc::new(a.with_store(db.clone(), "c"));
+        let turn = {
+            let a = a.clone();
+            tokio::spawn(async move {
+                a.handle("сделай отчёт", CancellationToken::new()).await
+            })
+        };
+        for _ in 0..1000 {
+            if a.turn_running() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(a.turn_running());
+        // «Усни» said while the task runs.
+        a.append_exchange("усни", "Сплю.");
+        go.notify_one();
+        turn.await.unwrap().unwrap();
+        let want = ["сделай отчёт", "готово", "усни", "Сплю."];
+        let kept: Vec<String> = a.history().into_iter().map(|m| m.content).collect();
+        assert_eq!(kept, want);
+        let stored: Vec<String> = db
+            .load_messages("c")
+            .unwrap()
+            .into_iter()
+            .map(|m| m.content)
+            .collect();
+        assert_eq!(stored, want);
+        // Without a turn it is kept at once.
+        a.append_exchange("тише", "Тише.");
+        assert_eq!(a.history().len(), 6);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn notes_beside_switches_keep_the_history_and_the_store_alike() {
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let (a, _rx, _) = agent(FakeProvider::new(vec![]));
+        let a = Arc::new(a.with_store(db.clone(), "a"));
+        for round in 0..300 {
+            let writer = {
+                let a = a.clone();
+                std::thread::spawn(move || {
+                    for i in 0..20 {
+                        a.append_note(&format!("{round}-{i}"));
+                    }
+                })
+            };
+            let to = if round % 2 == 0 { "b" } else { "a" };
+            a.switch_conversation(to).await.unwrap();
+            writer.join().unwrap();
+            let open = a.conversation().unwrap();
+            assert_eq!(
+                a.history(),
+                db.load_messages(&open).unwrap(),
+                "round {round}"
+            );
+        }
+    }
+
     fn filter(chunks: &[&str]) -> (String, Vec<Emotion>) {
         let mut f = TagFilter::default();
         let mut text = String::new();
@@ -2646,8 +3229,9 @@ Actually, I'll call generate_image.
         assert!(p.contains("[joy]") && p.contains("[worry]"));
 
         cfg.name = "Айри".into();
-        cfg.persona = crate::config::Persona::Custom;
-        cfg.custom_prompt = "  Говоришь как пират.  ".into();
+        cfg.save_custom_persona(None, "Пират", "  Говоришь как пират.  ")
+            .unwrap();
+        cfg.choose_persona("Пират").unwrap();
         let p = system_prompt(&cfg);
         assert!(p.starts_with("Ты Айри,"));
         assert!(p.contains("\nГоворишь как пират.\n"));

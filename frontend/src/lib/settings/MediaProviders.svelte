@@ -100,7 +100,7 @@
     border-radius: 12px;
     display: grid;
     place-items: center;
-    background: rgba(143, 125, 255, 0.16);
+    background: rgba(var(--v-rgb), 0.16);
     color: var(--v);
   }
   .what {

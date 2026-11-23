@@ -127,7 +127,7 @@
     color: var(--bad);
   }
   .live:not(.st-done, .st-failed, .st-stopped) .state {
-    color: #ff8a80;
+    color: var(--bad-hi);
   }
   .dot {
     flex: none;
@@ -199,7 +199,7 @@
     overflow: hidden;
   }
   .st-failed .text {
-    color: #ffd0d6;
+    color: var(--bad-ink);
   }
   .bad {
     font-size: 12px;

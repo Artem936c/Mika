@@ -43,8 +43,8 @@
     margin: 0 14px 10px;
     padding: 10px 12px;
     border-radius: 16px;
-    border: 1px solid rgba(111, 227, 255, 0.28);
-    background: rgba(111, 227, 255, 0.06);
+    border: 1px solid rgba(var(--c-rgb), 0.28);
+    background: rgba(var(--c-rgb), 0.06);
     font-size: 12.5px;
   }
   .task.fin {
@@ -126,7 +126,7 @@
     color: var(--dim);
   }
   li.failed {
-    color: #ffd0d6;
+    color: var(--bad-ink);
   }
   .mk {
     flex: none;

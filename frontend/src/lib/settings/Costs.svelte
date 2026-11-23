@@ -330,7 +330,7 @@
     background: var(--warn);
   }
   .bar.over i {
-    background: #ff6b7d;
+    background: var(--bad);
   }
   .of {
     font-variant-numeric: tabular-nums;
@@ -428,7 +428,7 @@
     text-decoration: underline;
   }
   .link:focus-visible {
-    outline: 2px solid rgba(143, 125, 255, 0.7);
+    outline: 2px solid rgba(var(--v-rgb), 0.7);
     outline-offset: 2px;
   }
   .form {
@@ -458,7 +458,7 @@
     cursor: pointer;
   }
   select.fld option {
-    background: #14151f;
+    background: var(--raised);
   }
   .line {
     display: flex;

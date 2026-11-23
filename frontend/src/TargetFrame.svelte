@@ -10,19 +10,19 @@
     position: fixed;
     inset: 0;
     box-sizing: border-box;
-    border: 3px solid #6fe3ff;
+    border: 3px solid var(--c);
     border-radius: 9px;
     box-shadow:
-      0 0 14px rgba(111, 227, 255, 0.8),
-      inset 0 0 10px rgba(111, 227, 255, 0.35);
+      0 0 14px rgba(var(--c-rgb), 0.8),
+      inset 0 0 10px rgba(var(--c-rgb), 0.35);
     animation: pulse 0.45s ease-in-out infinite alternate;
   }
   @keyframes pulse {
     to {
-      border-color: #ff7eb6;
+      border-color: var(--p);
       box-shadow:
-        0 0 14px rgba(255, 126, 182, 0.8),
-        inset 0 0 10px rgba(255, 126, 182, 0.35);
+        0 0 14px rgba(var(--p-rgb), 0.8),
+        inset 0 0 10px rgba(var(--p-rgb), 0.35);
     }
   }
   @media (prefers-reduced-motion: reduce) {

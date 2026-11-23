@@ -437,8 +437,12 @@ pub async fn handle_update_with(
                 if let Some(v) = voice {
                     v.typed();
                 }
-                if session.submit_from(other, Origin::Telegram) == Submitted::Unseen {
-                    show_unseen(api, session, owner, other).await;
+                match session.submit_from(other, Origin::Telegram) {
+                    Submitted::Unseen => show_unseen(api, session, owner, other).await,
+                    // «Усни» (decision 0050): her line is a line of the chat,
+                    // not a reply, so it is sent from here.
+                    Submitted::Asleep => voice::tell(api, owner, &tr("core.quick.sleep")).await,
+                    _ => {}
                 }
             }
         },
@@ -969,6 +973,31 @@ mod tests {
         assert!(rx.try_recv().is_err(), "no event may reach the bus");
         assert_eq!(api.sent.lock()[0], (666, FOREIGN_REPLY.to_string(), vec![]));
         assert!(api.answered.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sleep_from_telegram_is_answered_there_and_a_message_wakes_her() {
+        let (s, _bus, state) = session();
+        let api = FakeApi::default();
+        let sleep = Update::Text {
+            from: 42,
+            text: "Усни".into(),
+        };
+        assert!(handle_update(&api, &s, 42, sleep).await);
+        assert!(s.pause().is_sleeping());
+        assert_eq!(
+            api.sent.lock().as_slice(),
+            &[(42, tr("core.quick.sleep"), vec![])]
+        );
+        // The next message wakes her and starts a turn as usual.
+        let msg = Update::Text {
+            from: 42,
+            text: "который час".into(),
+        };
+        assert!(handle_update(&api, &s, 42, msg).await);
+        assert!(!s.pause().is_on());
+        s.stop();
+        wait_for(|| state.get() == AssistantState::Idle).await;
     }
 
     #[tokio::test]

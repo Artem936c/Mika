@@ -20,6 +20,11 @@ pub enum Event {
     UserText {
         text: String,
     },
+    /// The files attached to the user message just shown (decision 0053):
+    /// the chat draws them under it.
+    UserAttachments {
+        items: Vec<crate::attach::AttachmentCard>,
+    },
     /// Final text of one reply.
     AssistantText {
         text: String,
@@ -154,10 +159,13 @@ pub enum Event {
         id: u64,
         actions: usize,
     },
-    /// The pause after a full stop began or ended (decision 0045): while
-    /// it lasts she starts nothing on her own.
+    /// The pause after a full stop or her sleep began or ended (decisions
+    /// 0045 and 0050): while it lasts she starts nothing on her own.
+    /// `sleeping`: she was asked to sleep; then nothing of hers sounds.
     PauseChanged {
         paused: bool,
+        #[serde(default)]
+        sleeping: bool,
     },
     /// The avatar makes a gesture (decision 0040): one of her own by `name`,
     /// or an animation the user brought in, by its id in `motion`.

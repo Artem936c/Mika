@@ -4,26 +4,36 @@
   import Avatar from '../Avatar.svelte';
   import { EMOTION_ORDER, type Emotion } from '../avatar';
   import { t } from '../i18n';
+  import { personaLabel, type PersonaView } from '../persona';
+  import Switch from '../Switch.svelte';
   import ModelLook from './ModelLook.svelte';
   import ModelMotions from './ModelMotions.svelte';
   import ModelSlots from './ModelSlots.svelte';
   import ModelTiles from './ModelTiles.svelte';
 
-  const PERSONAS = ['caring', 'cheerful', 'calm', 'bold', 'custom'] as const;
-  type Persona = (typeof PERSONAS)[number];
-
   interface UiSettings {
     name: string;
-    persona: Persona;
-    custom_prompt: string;
     avatar_in_island: boolean;
     avatar_on_desktop: boolean;
   }
 
+  /** An own character open for editing: `old` is its saved name, null for a new one. */
+  interface Draft {
+    old: string | null;
+    name: string;
+    prompt: string;
+  }
+
   let name = $state('');
   let savedName = $state('');
-  let persona = $state<Persona>('caring');
-  let customPrompt = $state('');
+  let view = $state<PersonaView | null>(null);
+  let draft = $state<Draft | null>(null);
+  /** Why the open character was not saved: shown in its editor. */
+  let draftError = $state('');
+  /** The own character whose deletion waits for a second click. */
+  let deleting = $state<string | null>(null);
+  /** The question about the age (18+) is on screen. */
+  let askingAge = $state(false);
   let inIsland = $state(true);
   let onDesktop = $state(false);
   let shown = $state<Emotion>('neutral');
@@ -32,8 +42,7 @@
   onMount(async () => {
     const s = await invoke<UiSettings>('get_ui_settings');
     name = savedName = s.name;
-    persona = s.persona;
-    customPrompt = s.custom_prompt;
+    view = await invoke<PersonaView>('get_personas');
     inIsland = s.avatar_in_island;
     onDesktop = s.avatar_on_desktop;
   });
@@ -58,9 +67,63 @@
     }
   }
 
-  function savePersona(next: Persona) {
-    persona = next;
-    run('set_persona', { persona, customPrompt });
+  /** Runs a command of the character part and draws what it answers. */
+  async function change(command: string, args: Record<string, unknown>): Promise<boolean> {
+    try {
+      view = await invoke<PersonaView>(command, args);
+      error = '';
+      return true;
+    } catch (e) {
+      error = String(e);
+      return false;
+    }
+  }
+
+  function choose(choice: string) {
+    if (view?.choice === choice) return;
+    change('set_persona', { choice });
+  }
+
+  function edit(old: string | null) {
+    const own = view?.custom.find((c) => c.name === old);
+    draft = { old, name: own?.name ?? '', prompt: own?.prompt ?? '' };
+    draftError = '';
+    deleting = null;
+  }
+
+  async function saveDraft() {
+    if (!draft) return;
+    if (await change('save_custom_persona', { old: draft.old, name: draft.name, prompt: draft.prompt })) {
+      draft = null;
+    } else {
+      draftError = error;
+      error = '';
+    }
+  }
+
+  async function remove(own: string) {
+    if (deleting !== own) {
+      deleting = own;
+      return;
+    }
+    deleting = null;
+    if (draft?.old === own) draft = null;
+    await change('delete_custom_persona', { name: own });
+  }
+
+  /** Turning on asks the age first; turning off needs no question. */
+  function toggleAdult(on: boolean) {
+    if (on && !view?.adult) {
+      askingAge = true;
+      return;
+    }
+    askingAge = false;
+    if (!on && view?.adult) change('set_adult', { on: false });
+  }
+
+  async function answerAge(adult: boolean) {
+    askingAge = false;
+    if (adult) await change('set_adult', { on: true });
   }
 
   function place(island: boolean, desktop: boolean) {
@@ -105,24 +168,76 @@
     <ModelSlots onshow={(e) => (shown = e)} />
     <ModelMotions />
 
-    <div class="lbl">{t('persona.character')}</div>
-    <div class="chips" role="radiogroup" aria-label={t('persona.character')}>
-      {#each PERSONAS as p (p)}
-        <button role="radio" aria-checked={persona === p} class:on={persona === p} onclick={() => savePersona(p)}>
-          {t(`persona.${p}`)}
-        </button>
-      {/each}
-    </div>
-    {#if persona === 'custom'}
-      <textarea
-        class="fld custom"
-        rows="3"
-        maxlength="1000"
-        bind:value={customPrompt}
-        placeholder={t('persona.custom_placeholder')}
-        aria-label={t('persona.custom')}
-        onblur={() => savePersona('custom')}
-      ></textarea>
+    {#if view}
+      {@const v = view}
+      <div class="lbl">{t('persona.character')}</div>
+      <div class="chips" role="radiogroup" aria-label={t('persona.character')}>
+        {#each [...v.ready, ...v.custom.map((c) => c.name)] as p (p)}
+          <button role="radio" aria-checked={v.choice === p} class:on={v.choice === p} class:own={!v.ready.includes(p)} onclick={() => choose(p)}>
+            {personaLabel(p, v.ready)}
+          </button>
+        {/each}
+      </div>
+
+      <div class="lbl head">
+        <span>{t('persona.own')}</span>
+        <span class="count">{t('persona.own_count', { n: v.custom.length, max: v.max_custom })}</span>
+      </div>
+      <p class="sub">{t('persona.own_lead', { max: v.max_custom })}</p>
+      {#snippet editor(d: Draft)}
+        <div class="editor">
+          <input
+            class="fld"
+            bind:value={d.name}
+            maxlength={v.max_name}
+            spellcheck="false"
+            placeholder={t('persona.own_name')}
+            aria-label={t('persona.own_name')}
+          />
+          <textarea class="fld" rows="4" maxlength={v.max_prompt} bind:value={d.prompt} placeholder={t('persona.own_prompt')} aria-label={t('persona.own_prompt')}
+          ></textarea>
+          <div class="acts">
+            <span class="chars">{t('persona.own_chars', { n: d.prompt.length, max: v.max_prompt })}</span>
+            <button class="bt" onclick={() => (draft = null)}>{t('persona.own_cancel')}</button>
+            <button class="bt pri" disabled={!d.name.trim() || !d.prompt.trim()} onclick={saveDraft}>{t('persona.own_save')}</button>
+          </div>
+          {#if draftError}<p class="err">{draftError}</p>{/if}
+        </div>
+      {/snippet}
+      <div class="own">
+        {#each v.custom as c (c.name)}
+          {#if draft && draft.old === c.name}
+            {@render editor(draft)}
+          {:else}
+            <div class="row">
+              <div class="txt">
+                <b>{c.name}</b>
+                <span>{c.prompt}</span>
+              </div>
+              <button class="bt" onclick={() => edit(c.name)}>{t('persona.own_edit')}</button>
+              <button class="bt no" onclick={() => remove(c.name)}>
+                {deleting === c.name ? t('persona.own_delete_confirm', { name: c.name }) : t('persona.own_delete')}
+              </button>
+            </div>
+          {/if}
+        {/each}
+        {#if draft && draft.old === null}
+          {@render editor(draft)}
+        {:else if v.custom.length < v.max_custom}
+          <button class="add" onclick={() => edit(null)}>{t('persona.own_add')}</button>
+        {/if}
+      </div>
+
+      <div class="adult"></div>
+      <Switch checked={v.adult || askingAge} title={t('persona.adult')} sub={t('persona.adult_lead')} onchange={toggleAdult} />
+      {#if askingAge}
+        <div class="ask" role="alertdialog" aria-label={t('persona.adult_ask')}>
+          <b>{t('persona.adult_ask')}</b>
+          <span class="grow"></span>
+          <button class="bt" onclick={() => answerAge(false)}>{t('persona.adult_no')}</button>
+          <button class="bt pri" onclick={() => answerAge(true)}>{t('persona.adult_yes')}</button>
+        </div>
+      {/if}
     {/if}
 
     <div class="lbl">{t('persona.where')}</div>
@@ -154,7 +269,7 @@
     margin-bottom: 14px;
     border-radius: 20px;
     overflow: hidden;
-    background: linear-gradient(180deg, #191640, #0b0b16);
+    background: linear-gradient(180deg, var(--deep-c), var(--deep-b));
     border: 1px solid var(--line);
   }
   .prev :global(.halo) {
@@ -175,7 +290,7 @@
     bottom: 8px;
     padding: 6px 10px;
     border-radius: 12px;
-    background: rgba(8, 9, 15, 0.66);
+    background: var(--veil);
     backdrop-filter: blur(14px);
     border: 1px solid var(--line);
     font-size: 12px;
@@ -230,11 +345,124 @@
   .chips button.on {
     color: #fff;
     border-color: transparent;
-    background: linear-gradient(135deg, rgba(143, 125, 255, 0.55), rgba(255, 126, 182, 0.4));
+    background: linear-gradient(135deg, rgba(var(--v-rgb), 0.55), rgba(var(--p-rgb), 0.4));
   }
-  .custom {
-    margin-top: 10px;
+  /* A long own text is cut with an ellipsis; without this the column would grow to fit it. */
+  .right {
+    min-width: 0;
+  }
+  .chips button.own {
+    border-style: dashed;
+  }
+  .chips button.own.on {
+    border-style: solid;
+  }
+  .lbl.head {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  .count {
+    letter-spacing: 0;
+    text-transform: none;
+    font-weight: 600;
+  }
+  .sub {
+    margin: -2px 0 10px;
+    font-size: 12.5px;
+    color: var(--mute);
+  }
+  .own {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 10px 10px 14px;
+    border-radius: 14px;
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.03);
+  }
+  .row .txt {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
     font-size: 13px;
+  }
+  .row .txt span {
+    color: var(--mute);
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .row .bt {
+    height: 30px;
+    padding: 0 11px;
+    font-size: 12px;
+  }
+  .editor {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px;
+    border-radius: 14px;
+    border: 1px solid rgba(var(--v-rgb), 0.35);
+    background: rgba(var(--v-rgb), 0.06);
+  }
+  .editor textarea {
+    font-size: 13px;
+  }
+  .acts {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .chars {
+    flex: 1;
+    font-size: 11.5px;
+    color: var(--dim);
+    font-variant-numeric: tabular-nums;
+  }
+  .add {
+    all: unset;
+    cursor: pointer;
+    align-self: flex-start;
+    padding: 8px 14px;
+    border-radius: 12px;
+    border: 1px dashed var(--line2);
+    color: var(--mute);
+    font-size: 13px;
+    font-weight: 700;
+  }
+  .add:hover {
+    color: var(--v);
+    border-color: rgba(var(--v-rgb), 0.5);
+  }
+  .adult {
+    height: 18px;
+  }
+  .ask {
+    margin-top: 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 10px 10px 16px;
+    border-radius: 14px;
+    border: 1px solid rgba(var(--p-rgb), 0.4);
+    background: rgba(var(--p-rgb), 0.1);
+    font-size: 14px;
+  }
+  .grow {
+    flex: 1;
+  }
+  .editor .err {
+    margin: 0;
   }
   .err {
     margin: 12px 0 0;

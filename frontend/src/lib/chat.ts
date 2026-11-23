@@ -27,6 +27,30 @@ export interface ChatItem {
   progress?: number;
   /** Under a reply: the recording it may save as a skill (decision 0047). */
   offer?: number;
+  /** Under a user message: the files attached to it (decision 0053). */
+  attachments?: AttachmentChip[];
+  /** For her own line: a line of the companion in games (decision 0054). */
+  companion?: boolean;
+}
+
+/** A file attached to a user message, as the chat shows it (decision 0053). */
+export interface AttachmentChip {
+  kind: 'image' | 'text';
+  name: string;
+}
+
+/** A file waiting under the field to go with the next message. */
+export interface PendingChip extends AttachmentChip {
+  id: number;
+  /** Its text was longer than the limit and was cut. */
+  cut: boolean;
+}
+
+/** The files waiting under the field, the lines of those refused just now and the hint about pictures. */
+export interface AttachView {
+  items: PendingChip[];
+  refused: string[];
+  hint: boolean;
 }
 
 /** Stages of a reply: speech to text, first piece of the answer, first sound. */
@@ -229,6 +253,32 @@ function finishedCard(ok: boolean, data: unknown): CardData | undefined {
   return ok || card?.kind === 'ffmpeg_missing' ? card : undefined;
 }
 
+function attachmentChip(v: unknown): AttachmentChip | null {
+  const a = obj(v);
+  if (!a || (a.kind !== 'image' && a.kind !== 'text') || typeof a.name !== 'string' || !a.name) return null;
+  return { kind: a.kind, name: a.name };
+}
+
+/** Chips of a user message; broken entries are dropped. */
+export function attachmentChips(v: unknown): AttachmentChip[] {
+  return Array.isArray(v) ? v.map(attachmentChip).filter((c): c is AttachmentChip => c !== null) : [];
+}
+
+/** The answer of the attachment commands and of `attachments-changed`; anything broken counts as nothing. */
+export function attachView(v: unknown): AttachView {
+  const d = obj(v);
+  if (!d) return { items: [], refused: [], hint: false };
+  const items = Array.isArray(d.items)
+    ? d.items.flatMap((it): PendingChip[] => {
+        const chip = attachmentChip(it);
+        const o = obj(it);
+        return chip && o && num(o.id) ? [{ ...chip, id: o.id, cut: o.cut === true }] : [];
+      })
+    : [];
+  const refused = Array.isArray(d.refused) ? d.refused.filter((r): r is string => typeof r === 'string' && r !== '') : [];
+  return { items, refused, hint: d.hint === true && items.some((it) => it.kind === 'image') };
+}
+
 export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
   const e = obj(event);
   if (!e) return items;
@@ -236,6 +286,16 @@ export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
     case 'user_text': {
       const text = str(e.text);
       return text === null ? items : [...dropStaleTimings(finishStreaming(dropOffers(items))), { kind: 'user', text }];
+    }
+    case 'user_attachments': {
+      // The files of the message just shown: they go under it.
+      const chips = attachmentChips(e.items);
+      let at = items.length - 1;
+      while (at >= 0 && items[at].kind !== 'user') at -= 1;
+      if (chips.length === 0 || at < 0) return items;
+      const next = items.slice();
+      next[at] = { ...next[at], attachments: chips };
+      return next;
     }
     case 'timing': {
       if (!isStage(e.stage) || !num(e.ms)) return items;
@@ -362,6 +422,8 @@ export function reduceChat(items: ChatItem[], event: unknown): ChatItem[] {
       // Her own short line: a break, the end of focus, a meeting soon, a greeting.
       const text = str(e.text)?.trim();
       if (!text) return items;
+      // A line about the game she watches looks like her own, with a pad.
+      if (e.kind === 'companion') return [...finishStreaming(items), { kind: 'reminder', text, companion: true }];
       return [...finishStreaming(items), { kind: 'reminder', text }];
     }
     default:
@@ -564,7 +626,55 @@ export function fromHistory(history: unknown): ChatItem[] {
   return history
     .map(obj)
     .filter((h): h is Record<string, unknown> => !!h && (h.role === 'user' || h.role === 'assistant') && typeof h.text === 'string')
-    .map((h) => ({ kind: h.role as 'user' | 'assistant', text: h.text as string }));
+    .map((h) => {
+      const item: ChatItem = { kind: h.role as 'user' | 'assistant', text: h.text as string };
+      const chips = h.role === 'user' ? attachmentChips(h.attachments) : [];
+      return chips.length > 0 ? { ...item, attachments: chips } : item;
+    });
+}
+
+/** One row of the list of conversations (decision 0052). */
+export interface ConversationRow {
+  id: string;
+  /** Empty until the first message of the user; the panel shows the untitled label. */
+  title: string;
+  /** When the last message came: a time for today, a date otherwise. */
+  when: string;
+  pinned: boolean;
+  /** The conversation open in the chat. */
+  current: boolean;
+  messages: number;
+}
+
+/** When a conversation was last written to, short: a clock time today, day and month this year, a full date before. */
+export function conversationWhen(at: string, now: Date): string {
+  const d = new Date(at);
+  if (Number.isNaN(d.getTime())) return '';
+  if (d.toDateString() === now.toDateString()) {
+    return d.toLocaleTimeString(dateLocale(), { hour: '2-digit', minute: '2-digit' });
+  }
+  if (d.getFullYear() === now.getFullYear()) {
+    return d.toLocaleDateString(dateLocale(), { day: 'numeric', month: 'short' });
+  }
+  return d.toLocaleDateString(dateLocale(), { day: '2-digit', month: '2-digit', year: 'numeric' });
+}
+
+/** The rows of the list `list_conversations` returns, in its order; broken entries are left out. */
+export function conversationRows(view: unknown, now: Date): ConversationRow[] {
+  const v = obj(view);
+  if (!v || !Array.isArray(v.items)) return [];
+  const current = typeof v.current === 'string' ? v.current : '';
+  return v.items
+    .map(obj)
+    .filter((c): c is Record<string, unknown> => !!c && typeof c.id === 'string' && c.id !== '')
+    .map((c) => ({
+      id: c.id as string,
+      title: typeof c.title === 'string' ? c.title : '',
+      when: typeof c.updated_at === 'string' ? conversationWhen(c.updated_at, now) : '',
+      pinned: c.pinned === true,
+      current: c.id === current,
+      messages: typeof c.messages === 'number' ? c.messages : 0,
+    }));
 }
 
 const hasJobCard = (items: ChatItem[], id: number) => items.some((it) => it.data?.kind === 'bg_job' && it.data.job.id === id);

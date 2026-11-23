@@ -123,7 +123,7 @@
     width: 100%;
     height: 100%;
     text-align: left;
-    background: #0d0e17;
+    background: var(--panel);
   }
   .side {
     background: rgba(255, 255, 255, 0.025);
@@ -175,7 +175,7 @@
   }
   nav button.on {
     color: #fff;
-    background: rgba(143, 125, 255, 0.18);
+    background: rgba(var(--v-rgb), 0.18);
   }
   /* A size container: a page can ask how tall the room is (the journal sizes its list by it). */
   .page {

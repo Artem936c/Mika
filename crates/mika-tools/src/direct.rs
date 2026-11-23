@@ -210,17 +210,22 @@ impl Direct {
     /// A picture of the window in front, as `screen_look` takes it. Every
     /// refusal comes before the capture.
     pub async fn capture_front(&self) -> Result<FrontShot, DirectError> {
+        self.capture_front_at(crate::screen::VISION_MAX_SIDE).await
+    }
+
+    /// The same picture shrunk to `max_side` pixels on its long side: the
+    /// companion in games sends a smaller one (decision 0054). Every refusal
+    /// comes before the capture.
+    pub async fn capture_front_at(&self, max_side: u32) -> Result<FrontShot, DirectError> {
         if !self.screen_enabled.load(Ordering::Relaxed) {
             return Err(DirectError::ScreenOff);
         }
         let window = self.front()?;
         let (screen, id) = (self.screen.clone(), window.id);
-        let shot = tokio::task::spawn_blocking(move || {
-            screen.capture(Some(id), crate::screen::VISION_MAX_SIDE)
-        })
-        .await
-        .map_err(|e| DirectError::Failed(e.to_string()))?
-        .map_err(DirectError::Failed)?;
+        let shot = tokio::task::spawn_blocking(move || screen.capture(Some(id), max_side))
+            .await
+            .map_err(|e| DirectError::Failed(e.to_string()))?
+            .map_err(DirectError::Failed)?;
         Ok(FrontShot { window, shot })
     }
 }
@@ -782,6 +787,25 @@ mod tests {
         // Shrunk for the vision model, like `screen_look`.
         assert_eq!((front.shot.width, front.shot.height), (1600, 900));
         assert!(f.focused.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_companion_picture_is_smaller_and_refused_the_same_way() {
+        let (d, f) = direct();
+        assert_eq!(d.capture_front_at(1024).await, Err(DirectError::ScreenOff));
+        d.screen_enabled.store(true, Ordering::Relaxed);
+        // The title of the window in front is checked before every picture.
+        *f.foreground.lock() = Some(window(9, "Оплата заказа — Chrome", "chrome.exe"));
+        assert_eq!(d.capture_front_at(1024).await, Err(DirectError::Blind));
+        *f.foreground.lock() = Some(window(1, "Мика", "mika.exe"));
+        assert_eq!(d.capture_front_at(1024).await, Err(DirectError::OwnWindow));
+        assert!(f.captures.lock().is_empty(), "nothing was captured");
+
+        *f.foreground.lock() = Some(window(5, "Elden Ring", "eldenring.exe"));
+        let front = d.capture_front_at(1024).await.unwrap();
+        assert_eq!(front.window.process, "eldenring.exe");
+        assert_eq!((front.shot.width, front.shot.height), (1024, 576));
+        assert_eq!(*f.captures.lock(), [Some(5)]);
     }
 
     #[test]

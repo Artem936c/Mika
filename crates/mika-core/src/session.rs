@@ -12,7 +12,11 @@ use crate::confirm::{
     parse_answer, voice_answer, ConfirmError, Confirmations, DecidedBy, VoiceAnswer,
 };
 use crate::events::{Event, EventBus};
-use crate::pause::{skipped_line, Pause, SkipKind, StopReport, REMARK_PAUSE, REMARK_STOP};
+use crate::llm::{Attachment, ToolCall};
+use crate::pause::{
+    skipped_line_of, Pause, SkipKind, StopReport, REMARK_PAUSE, REMARK_SLEEP, REMARK_STOP,
+};
+use crate::quick::{match_quick, QuickAction};
 use crate::skills::SkillStore;
 
 /// Said in the chat when something else is typed while a question about an action is open.
@@ -31,7 +35,23 @@ pub enum Submitted {
     /// question there (`Confirmations::pending`) and then calls
     /// `Session::question_shown`; the next message from there answers it.
     Unseen,
+    /// The message asked her to sleep (decision 0050): she sleeps now, no
+    /// turn started. Her line is in the chat; where the message came from
+    /// shows it itself.
+    Asleep,
 }
+
+/// What the quick layer needs to know (decision 0050), read at each message.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QuickSetup {
+    /// The switch «Быстрые команды». The sleep words work without it.
+    pub enabled: bool,
+    /// Her names: one at the start of a phrase is cut, «Мика, тише».
+    pub names: Vec<String>,
+}
+
+/// Gives the quick setup as the settings are now.
+pub type QuickSource = Arc<dyn Fn() -> QuickSetup + Send + Sync>;
 
 /// Where the last user message came from. Replies go back the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,8 +137,10 @@ pub struct Session {
     /// One turn at a time, in the order they were asked for. A turn takes
     /// the origin when it starts, not when it is queued (decision 0031).
     turns: tokio::sync::Mutex<()>,
-    /// The pause after a full stop (decision 0045).
+    /// The pause after a full stop (decision 0045) and the sleep (decision 0050).
     pause: Pause,
+    /// The quick layer; without it only the sleep words are quick.
+    quick: Mutex<Option<QuickSource>>,
 }
 
 impl Session {
@@ -133,7 +155,119 @@ impl Session {
             origin: Mutex::new(Origin::Local),
             turns: tokio::sync::Mutex::new(()),
             pause: Pause::default(),
+            quick: Mutex::new(None),
         })
+    }
+
+    /// Turns on the quick commands as `source` says (decision 0050).
+    pub fn set_quick(&self, source: QuickSource) {
+        *self.quick.lock() = Some(source);
+    }
+
+    /// The quick command `text` asks for, if any: the sleep always, the
+    /// rest while the switch is on.
+    fn quick(&self, text: &str) -> Option<QuickAction> {
+        let source = self.quick.lock().clone();
+        let setup = source.map(|f| f()).unwrap_or_default();
+        let names: Vec<&str> = setup.names.iter().map(String::as_str).collect();
+        let action = match_quick(text, crate::i18n::lang(), &names)?;
+        (action == QuickAction::Sleep || setup.enabled).then_some(action)
+    }
+
+    /// True when `text` asks her to sleep and nothing else.
+    pub fn asks_sleep(&self, text: &str) -> bool {
+        self.quick(text) == Some(QuickAction::Sleep)
+    }
+
+    /// Puts her to sleep (decision 0050). A reply that is being made ends,
+    /// with the queued ones and an open question, as after «Стоп»; a running
+    /// task with a plan and the background jobs go on. The pause begins as
+    /// a sleep: she starts nothing by herself and nothing of hers sounds
+    /// (the speaker follows `PauseChanged`). `shown`: the user's request,
+    /// shown in the chat and kept in the history with her line; `None` for
+    /// a word the wake listener heard, which is not shown, like a stop word.
+    /// False when she slept already.
+    pub fn sleep(&self, shown: Option<&str>) -> bool {
+        let task = self.agent.task_active();
+        if !task {
+            self.stop();
+        }
+        let began = self.pause.begin_sleep();
+        log::info!(
+            target: "turn",
+            "sleep: began={began} task_kept={task} shown={}",
+            shown.is_some()
+        );
+        if began {
+            self.bus.publish(Event::PauseChanged {
+                paused: true,
+                sleeping: true,
+            });
+        }
+        let line = crate::i18n::tr("core.quick.sleep");
+        if let Some(shown) = shown.map(str::trim).filter(|t| !t.is_empty()) {
+            self.bus.publish(Event::UserText { text: shown.into() });
+            self.agent.append_exchange(shown, &line);
+        }
+        self.bus.publish(Event::Remark {
+            text: line,
+            kind: REMARK_SLEEP.into(),
+        });
+        began
+    }
+
+    /// Runs a quick command as a turn of its own: it waits for the turn
+    /// before it, takes the origin when it starts, and its one tool call goes
+    /// through the gate as a call of the model does (decision 0050).
+    fn start_quick(
+        self: &Arc<Self>,
+        action: QuickAction,
+        shown: &str,
+        origin: Origin,
+    ) -> Submitted {
+        let lang = crate::i18n::lang();
+        let Some((tool, args)) = action.call(lang) else {
+            return Submitted::Empty;
+        };
+        let token = self.cancel.lock().clone();
+        let this = self.clone();
+        let shown = shown.to_string();
+        tokio::spawn(async move {
+            let asked = Instant::now();
+            let _own = this.turns.lock().await;
+            // A stop that came while it waited drops it: nothing is shown or run.
+            if token.is_cancelled() {
+                log::info!(
+                    target: "turn",
+                    "turn dropped: stopped while it waited quick={}",
+                    action.name()
+                );
+                return;
+            }
+            *this.origin.lock() = origin;
+            let number = crate::journal::next_turn();
+            // The text is the user's: only its size is written.
+            log::info!(
+                "turn started: turn={number} source={} chars={} quick={} waited_ms={}",
+                Source::of(origin).as_str(),
+                shown.chars().count(),
+                action.name(),
+                asked.elapsed().as_millis()
+            );
+            let call = ToolCall {
+                id: format!("quick-{number}"),
+                name: tool.to_string(),
+                arguments: args,
+            };
+            let work = this.agent.handle_quick(
+                &shown,
+                call,
+                move |done| action.reply(lang, done.ok, &done.text, done.data.as_ref()),
+                token,
+            );
+            let _ = crate::journal::in_turn(number, work).await;
+        });
+        Submitted::Started
     }
 
     /// The pause after a full stop: what she would start by herself asks it first.
@@ -177,7 +311,10 @@ impl Session {
             }
         );
         if began {
-            self.bus.publish(Event::PauseChanged { paused: true });
+            self.bus.publish(Event::PauseChanged {
+                paused: true,
+                sleeping: false,
+            });
         }
         if pause || !report.is_empty() {
             self.bus.publish(Event::Remark {
@@ -188,15 +325,23 @@ impl Session {
         report
     }
 
-    /// The user addressed her: the pause ends, and one line tells what it
-    /// skipped. `by` names how, for the journal. Without a pause nothing happens.
+    /// The user addressed her: the pause or the sleep ends, and one line
+    /// tells what it skipped. `by` names how, for the journal. Without a
+    /// pause nothing happens.
     pub fn addressed(&self, by: &str) {
-        let Some(skipped) = self.pause.end() else {
+        let Some((kind, skipped)) = self.pause.end_kind() else {
             return;
         };
-        log::info!("pause ended: by={by} skipped={}", skipped.len());
-        self.bus.publish(Event::PauseChanged { paused: false });
-        if let Some(text) = skipped_line(&skipped) {
+        log::info!(
+            "pause ended: by={by} kind={} skipped={}",
+            kind.as_str(),
+            skipped.len()
+        );
+        self.bus.publish(Event::PauseChanged {
+            paused: false,
+            sleeping: false,
+        });
+        if let Some(text) = skipped_line_of(crate::i18n::lang(), kind, &skipped) {
             self.bus.publish(Event::Remark {
                 text,
                 kind: REMARK_PAUSE.into(),
@@ -248,10 +393,14 @@ impl Session {
             return Submitted::Hinted;
         }
         let token = self.cancel.lock().clone();
-        tokio::spawn(
-            self.clone()
-                .turn(Origin::Local, Source::Window, shown, text, token),
-        );
+        tokio::spawn(self.clone().turn(
+            Origin::Local,
+            Source::Window,
+            shown,
+            text,
+            Vec::new(),
+            token,
+        ));
         Submitted::Started
     }
 
@@ -298,10 +447,21 @@ impl Session {
         source: Source,
         shown: String,
         text: String,
+        attachments: Vec<Attachment>,
         token: CancellationToken,
     ) {
         let asked = Instant::now();
         let _own = self.turns.lock().await;
+        // A stop or a switch of the conversation came while it waited: it
+        // is dropped, and the origin of the turn before stays.
+        if token.is_cancelled() {
+            log::info!(
+                target: "turn",
+                "turn dropped: stopped while it waited source={}",
+                source.as_str()
+            );
+            return;
+        }
         *self.origin.lock() = origin;
         // How the turn ended is written by the agent, with the same number.
         let number = crate::journal::next_turn();
@@ -314,7 +474,17 @@ impl Session {
             crate::journal::content_allowed(),
         );
         log::info!("{line}");
-        let work = self.agent.handle_expanded(&shown, &text, token);
+        if !attachments.is_empty() {
+            log::info!(
+                "turn attachments: turn={number} count={} pictures={}",
+                attachments.len(),
+                attachments
+                    .iter()
+                    .filter(|a| a.kind == crate::llm::AttachmentKind::Image)
+                    .count()
+            );
+        }
+        let work = self.agent.handle_with(&shown, &text, attachments, token);
         let _ = crate::journal::in_turn(number, work).await;
     }
 
@@ -335,7 +505,10 @@ impl Session {
         }
         // The token of now: a "stop" that comes before this turn drops it.
         let token = self.cancel.lock().clone();
-        tokio::spawn(self.clone().turn(Origin::Local, source, shown, text, token));
+        tokio::spawn(
+            self.clone()
+                .turn(Origin::Local, source, shown, text, Vec::new(), token),
+        );
     }
 
     /// Like `submit_task`, but the chat shows `shown` while the model gets
@@ -357,7 +530,46 @@ impl Session {
         if text.is_empty() {
             return Submitted::Empty;
         }
-        self.addressed(origin_name(origin));
+        let quick = self.quick(text);
+        self.submit_checked(text, quick, Vec::new(), origin)
+    }
+
+    /// A message of the chat with attached files (decision 0053). The text
+    /// may be empty. It is never a quick command and never answers an open
+    /// question: then the hint is shown and the caller keeps the files.
+    /// Anything but `Started` means the files were not taken.
+    /// Must run inside a tokio runtime, like `submit_from`.
+    pub fn submit_with_attachments(
+        self: &Arc<Self>,
+        text: &str,
+        attachments: Vec<Attachment>,
+    ) -> Submitted {
+        if attachments.is_empty() {
+            return self.submit(text);
+        }
+        let text = text.trim();
+        if self.confirms.pending().is_some() {
+            self.addressed(origin_name(Origin::Local));
+            self.bus.publish(Event::AssistantText {
+                text: answer_hint(),
+                spoken: None,
+            });
+            return Submitted::Hinted;
+        }
+        self.submit_checked(text, None, attachments, Origin::Local)
+    }
+
+    fn submit_checked(
+        self: &Arc<Self>,
+        text: &str,
+        quick: Option<QuickAction>,
+        attachments: Vec<Attachment>,
+        origin: Origin,
+    ) -> Submitted {
+        // «Усни» while she sleeps: she does not wake to fall asleep again.
+        if !(quick == Some(QuickAction::Sleep) && self.pause.is_sleeping()) {
+            self.addressed(origin_name(origin));
+        }
         let by = match origin {
             Origin::Local => DecidedBy::Chat,
             Origin::Telegram => DecidedBy::Telegram,
@@ -415,13 +627,27 @@ impl Session {
             });
             return Submitted::Hinted;
         }
+        // Quick commands come after the answers to a question and before
+        // own commands and skills (decision 0050).
+        match quick {
+            Some(QuickAction::Sleep) => {
+                self.sleep(Some(text));
+                return Submitted::Asleep;
+            }
+            Some(action) => return self.start_quick(action, text, origin),
+            None => {}
+        }
         let token = self.cancel.lock().clone();
         let shown = text.to_string();
         let full = self.expanded(text);
-        tokio::spawn(
-            self.clone()
-                .turn(origin, Source::of(origin), shown, full, token),
-        );
+        tokio::spawn(self.clone().turn(
+            origin,
+            Source::of(origin),
+            shown,
+            full,
+            attachments,
+            token,
+        ));
         Submitted::Started
     }
 
@@ -434,9 +660,20 @@ impl Session {
         if text.is_empty() {
             return Some(Submitted::Empty);
         }
-        self.addressed(origin_name(origin));
+        let quick = self.quick(text);
+        if !(quick == Some(QuickAction::Sleep) && self.pause.is_sleeping()) {
+            self.addressed(origin_name(origin));
+        }
         if self.confirms.pending().is_some() {
             return None;
+        }
+        match quick {
+            Some(QuickAction::Sleep) => {
+                self.sleep(Some(text));
+                return Some(Submitted::Asleep);
+            }
+            Some(action) => return Some(self.start_quick(action, text, origin)),
+            None => {}
         }
         let token = self.cancel.lock().clone();
         let shown = text.to_string();
@@ -445,7 +682,7 @@ impl Session {
         // it and takes the origin when it starts (decision 0031).
         tokio::spawn(
             self.clone()
-                .turn(origin, Source::of(origin), shown, full, token),
+                .turn(origin, Source::of(origin), shown, full, Vec::new(), token),
         );
         Some(Submitted::Started)
     }
@@ -1012,12 +1249,18 @@ mod tests {
         assert!(s.pause().is_on());
         wait_idle(&state).await;
         let events = drain(&mut rx);
-        assert!(events.contains(&Event::PauseChanged { paused: true }));
+        assert!(events.contains(&Event::PauseChanged {
+            paused: true,
+            sleeping: false
+        }));
         assert_eq!(remark_of(&events, REMARK_STOP), Some(report.line(true)));
         // A second stop during the pause changes nothing about it.
         let mut rx = bus.subscribe();
         s.full_stop(StopReport::default(), None, true);
-        assert!(!drain(&mut rx).contains(&Event::PauseChanged { paused: true }));
+        assert!(!drain(&mut rx).contains(&Event::PauseChanged {
+            paused: true,
+            sleeping: false
+        }));
     }
 
     #[tokio::test]
@@ -1073,7 +1316,13 @@ mod tests {
         );
         assert!(!s.pause().is_on());
         let events = drain(&mut rx);
-        assert_eq!(events.first(), Some(&Event::PauseChanged { paused: false }));
+        assert_eq!(
+            events.first(),
+            Some(&Event::PauseChanged {
+                paused: false,
+                sleeping: false
+            })
+        );
         let line = remark_of(&events, REMARK_PAUSE).expect("the line of what was skipped");
         assert!(line.contains("«полить цветы»"), "{line}");
         assert!(line.contains("«⚡ Сценарий «Наушники»»"), "{line}");
@@ -1091,7 +1340,13 @@ mod tests {
         s.full_stop(StopReport::default(), None, true);
         let mut rx = bus.subscribe();
         s.addressed("test");
-        assert_eq!(drain(&mut rx), vec![Event::PauseChanged { paused: false }]);
+        assert_eq!(
+            drain(&mut rx),
+            vec![Event::PauseChanged {
+                paused: false,
+                sleeping: false
+            }]
+        );
     }
 
     #[tokio::test]
@@ -1427,5 +1682,403 @@ mod tests {
         }
         assert_eq!(s.agent.history().len(), 2);
         wait_idle(&state).await;
+    }
+
+    /// Fails the test when asked: a quick command must not reach the model.
+    struct NoModel;
+
+    #[async_trait]
+    impl LlmProvider for NoModel {
+        fn name(&self) -> &str {
+            "no-model"
+        }
+        async fn stream(&self, _req: LlmRequest) -> Result<LlmStream, LlmError> {
+            panic!("the model was asked");
+        }
+    }
+
+    /// Stands for the volume of Windows: remembers what it was asked.
+    struct FakeVolume(Arc<Mutex<Vec<serde_json::Value>>>);
+
+    #[async_trait]
+    impl crate::tools::Tool for FakeVolume {
+        fn spec(&self) -> crate::llm::ToolSpec {
+            crate::tools::spec(
+                "volume",
+                "громкость",
+                serde_json::json!({"type": "object", "properties": {}}),
+            )
+        }
+        fn assess(
+            &self,
+            _args: &serde_json::Value,
+        ) -> Result<crate::tools::Assessment, crate::tools::ToolError> {
+            Ok(crate::tools::Assessment::new(
+                crate::tools::RiskLevel::Low,
+                "Сделать тише",
+                "громкость Windows",
+                "легко вернуть как было",
+            ))
+        }
+        async fn run(
+            &self,
+            args: serde_json::Value,
+            _a: crate::gate::Approval,
+            _c: CancellationToken,
+        ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+            self.0.lock().push(args);
+            Ok(crate::tools::ToolOutput::new("Громкость 40% (была 50%).")
+                .with_data(serde_json::json!({"kind": "volume", "level": 40, "was": 50})))
+        }
+    }
+
+    fn quick_session(
+        quick_on: bool,
+        provider: Arc<dyn LlmProvider>,
+    ) -> (
+        Arc<Session>,
+        EventBus,
+        StateHandle,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+    ) {
+        let bus = EventBus::new(256);
+        let state = StateHandle::new(bus.clone());
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let confirms = Confirmations::new(bus.clone(), state.clone());
+        let gate: Arc<dyn Gate> = Arc::new(PolicyGate::new(
+            RuleStore::new(db.clone()),
+            AuditLog::new(db),
+            confirms.clone(),
+        ));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(FakeVolume(calls.clone())));
+        let agent = Arc::new(Agent::new(
+            provider,
+            Arc::new(reg),
+            gate,
+            bus.clone(),
+            state.clone(),
+            "s".into(),
+        ));
+        let s = Session::new(agent, confirms, bus.clone());
+        s.set_quick(Arc::new(move || QuickSetup {
+            enabled: quick_on,
+            names: vec!["Мика".into()],
+        }));
+        (s, bus, state, calls)
+    }
+
+    #[tokio::test]
+    async fn a_quick_command_goes_through_the_policy_and_never_asks_the_model() {
+        let (s, bus, state, calls) = quick_session(true, Arc::new(NoModel));
+        let mut rx = bus.subscribe();
+        assert_eq!(s.submit("Мика, тише!"), Submitted::Started);
+        // The policy asks about the first call of the tool, as for the model.
+        wait_pending(&s).await;
+        assert!(calls.lock().is_empty(), "nothing runs before the answer");
+        assert_eq!(s.submit("да"), Submitted::Answered);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        wait_idle(&state).await;
+        assert_eq!(*calls.lock(), vec![serde_json::json!({"action": "down"})]);
+        let events = drain(&mut rx);
+        assert!(events.contains(&Event::UserText {
+            text: "Мика, тише!".into()
+        }));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ToolStarted { name, .. } if name == "volume")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ToolFinished { name, ok: true, .. } if name == "volume")));
+        assert!(events.contains(&Event::AssistantText {
+            text: "Громкость 40 %.".into(),
+            spoken: None
+        }));
+        // The pair joins the history: the model knows what was done.
+        let history = s.agent.history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "Мика, тише!");
+        assert_eq!(history[1].content, "Громкость 40 %.");
+    }
+
+    #[tokio::test]
+    async fn a_refused_quick_command_does_nothing() {
+        let (s, bus, state, calls) = quick_session(true, Arc::new(NoModel));
+        let mut rx = bus.subscribe();
+        assert_eq!(s.submit("громче"), Submitted::Started);
+        wait_pending(&s).await;
+        assert_eq!(s.submit("нет"), Submitted::Answered);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        wait_idle(&state).await;
+        assert!(calls.lock().is_empty(), "a refused action never runs");
+        let events = drain(&mut rx);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::AssistantText { text, .. } if text.starts_with("Действие не выполнено")
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_quick_command_queued_behind_a_stopped_reply_never_starts() {
+        let (s, bus, state, calls) = quick_session(true, Arc::new(SlowEcho));
+        let mut rx = bus.subscribe();
+        assert_eq!(s.submit("расскажи сказку"), Submitted::Started);
+        wait_state(&state, AssistantState::Thinking).await;
+        assert_eq!(s.submit("громче"), Submitted::Started);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        s.stop();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        wait_idle(&state).await;
+        assert!(calls.lock().is_empty());
+        assert!(s.confirms.pending().is_none(), "nothing asks about it");
+        let events = drain(&mut rx);
+        assert!(!events.contains(&Event::UserText {
+            text: "громче".into()
+        }));
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::ToolStarted { .. })));
+        assert_eq!(s.agent.history().len(), 1, "only the stopped request");
+    }
+
+    #[tokio::test]
+    async fn a_message_queued_before_a_switch_never_lands_in_the_new_conversation() {
+        let bus = EventBus::new(256);
+        let state = StateHandle::new(bus.clone());
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let confirms = Confirmations::new(bus.clone(), state.clone());
+        let gate: Arc<dyn Gate> = Arc::new(PolicyGate::new(
+            RuleStore::new(db.clone()),
+            AuditLog::new(db.clone()),
+            confirms.clone(),
+        ));
+        let agent = Agent::new(
+            Arc::new(SlowEcho),
+            Arc::new(ToolRegistry::new()),
+            gate,
+            bus.clone(),
+            state.clone(),
+            "s".into(),
+        )
+        .with_store(db.clone(), "first");
+        let s = Session::new(Arc::new(agent), confirms, bus.clone());
+        let mut rx = bus.subscribe();
+        assert_eq!(s.submit("первое"), Submitted::Started);
+        wait_state(&state, AssistantState::Thinking).await;
+        assert_eq!(s.submit("второе"), Submitted::Started);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // What the list of conversations does: a stop, then the switch.
+        s.stop();
+        s.agent.switch_conversation("second").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        wait_idle(&state).await;
+        assert!(db.load_messages("second").unwrap().is_empty());
+        assert!(s.agent.history().is_empty());
+        assert!(!drain(&mut rx).contains(&Event::UserText {
+            text: "второе".into()
+        }));
+    }
+
+    #[tokio::test]
+    async fn with_the_switch_off_a_quick_phrase_goes_to_the_model() {
+        let (s, bus, state, calls) = quick_session(false, Arc::new(EchoLast));
+        let mut rx = bus.subscribe();
+        assert_eq!(s.submit("тише"), Submitted::Started);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_idle(&state).await;
+        assert!(calls.lock().is_empty());
+        assert!(drain(&mut rx).contains(&Event::AssistantText {
+            text: "тише".into(),
+            spoken: None
+        }));
+    }
+
+    fn note_file() -> crate::llm::Attachment {
+        crate::llm::Attachment {
+            kind: crate::llm::AttachmentKind::Text,
+            name: "заметки.txt".into(),
+            path: "c/1.txt".into(),
+            description: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_with_attachments_is_never_a_quick_command() {
+        let (s, bus, state, calls) = quick_session(true, Arc::new(EchoLast));
+        let mut rx = bus.subscribe();
+        assert_eq!(
+            s.submit_with_attachments("тише", vec![note_file()]),
+            Submitted::Started
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_idle(&state).await;
+        assert!(calls.lock().is_empty(), "the quick command did not run");
+        let events = drain(&mut rx);
+        assert!(events.contains(&Event::UserAttachments {
+            items: vec![crate::attach::AttachmentCard {
+                kind: crate::llm::AttachmentKind::Text,
+                name: "заметки.txt".into(),
+            }]
+        }));
+        // The model got the message with the line of the file.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::AssistantText { text, .. } if text.starts_with("тише\n\n[файл: заметки.txt")
+        )));
+        // The history keeps the file with the message.
+        assert_eq!(s.agent.history()[0].attachments, vec![note_file()]);
+        // «Усни» with a file is not the sleep either.
+        assert_eq!(
+            s.submit_with_attachments("усни", vec![note_file()]),
+            Submitted::Started
+        );
+        assert!(!s.pause().is_sleeping());
+        wait_idle(&state).await;
+    }
+
+    #[tokio::test]
+    async fn a_message_with_attachments_never_answers_a_question() {
+        let (s, _bus, _state, calls) = quick_session(true, Arc::new(NoModel));
+        assert_eq!(s.submit("тише"), Submitted::Started);
+        wait_pending(&s).await;
+        assert_eq!(
+            s.submit_with_attachments("да", vec![note_file()]),
+            Submitted::Hinted
+        );
+        assert!(s.confirms.pending().is_some(), "the question is still open");
+        assert!(calls.lock().is_empty());
+        s.stop();
+    }
+
+    #[tokio::test]
+    async fn sleep_ends_a_reply_but_keeps_a_task_and_the_jobs() {
+        let (s, bus, state) = slow_session();
+        // A plain reply is being made: «усни» ends it.
+        assert_eq!(s.submit("расскажи сказку"), Submitted::Started);
+        wait_state(&state, AssistantState::Thinking).await;
+        let mut rx = bus.subscribe();
+        assert!(s.sleep(None));
+        assert!(s.pause().is_sleeping());
+        wait_idle(&state).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let events = drain(&mut rx);
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, Event::AssistantText { .. })));
+        assert!(events.contains(&Event::PauseChanged {
+            paused: true,
+            sleeping: true
+        }));
+        assert_eq!(
+            remark_of(&events, REMARK_SLEEP).as_deref(),
+            Some("Сплю. Позови по имени.")
+        );
+        // Asleep again: nothing changes.
+        assert!(!s.sleep(None));
+        s.addressed("test");
+
+        // A task with a plan runs, and a background job: both go on.
+        let board = crate::task::TaskBoard::new(bus.clone());
+        s.agent.set_task_board(board.clone());
+        let jobs = crate::bgjobs::JobBoard::new(bus.clone());
+        let job = jobs
+            .submit(
+                crate::bgjobs::JobSpec::live("screen_record", "rec", Duration::from_secs(5)),
+                Box::new(|ctx: crate::bgjobs::JobCtx| {
+                    Box::pin(async move {
+                        ctx.cancel.cancelled().await;
+                        Ok(crate::tools::ToolOutput::new("Запись сохранена."))
+                    })
+                }),
+            )
+            .unwrap();
+        assert_eq!(s.submit("сделай отчёт"), Submitted::Started);
+        wait_state(&state, AssistantState::Thinking).await;
+        board.plan("Отчёт", vec!["собрать".into()]).unwrap();
+        let mut rx = bus.subscribe();
+        assert_eq!(s.submit("усни"), Submitted::Asleep);
+        assert!(s.pause().is_sleeping());
+        let mut replies = Vec::new();
+        for _ in 0..2000 {
+            while let Ok(e) = rx.try_recv() {
+                if let Event::AssistantText { text, .. } = e {
+                    replies.push(text);
+                }
+            }
+            if !replies.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(!replies.is_empty(), "the task went on to its reply");
+        assert!(
+            jobs.active().iter().any(|j| j.id == job.job.id),
+            "the job still runs"
+        );
+        // The request and her line are in the history for the model.
+        assert!(s
+            .agent
+            .history()
+            .iter()
+            .any(|m| m.content == "Сплю. Позови по имени."));
+        jobs.stop_all();
+        wait_idle(&state).await;
+    }
+
+    #[tokio::test]
+    async fn being_addressed_wakes_her_and_lists_what_the_sleep_skipped() {
+        let (s, bus, state) = session();
+        let mut rx = bus.subscribe();
+        assert_eq!(s.submit_from("Усни.", Origin::Telegram), Submitted::Asleep);
+        let events = drain(&mut rx);
+        assert!(events.contains(&Event::UserText {
+            text: "Усни.".into()
+        }));
+        s.submit_task("полить цветы");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // «Усни» again does not wake her.
+        assert_eq!(
+            s.submit_new_from("спи", Origin::Telegram),
+            Some(Submitted::Asleep)
+        );
+        assert!(s.pause().is_sleeping());
+        let mut rx = bus.subscribe();
+        assert_eq!(s.submit_from("привет", Origin::Local), Submitted::Started);
+        assert!(!s.pause().is_on());
+        let events = drain(&mut rx);
+        assert_eq!(
+            events.first(),
+            Some(&Event::PauseChanged {
+                paused: false,
+                sleeping: false
+            })
+        );
+        let line = remark_of(&events, REMARK_PAUSE).expect("the line of what was skipped");
+        assert!(line.starts_with("Пока я спала"), "{line}");
+        assert!(line.contains("«полить цветы»"), "{line}");
+        s.stop();
+        wait_idle(&state).await;
+    }
+
+    fn slow_session() -> (Arc<Session>, EventBus, StateHandle) {
+        let bus = EventBus::new(256);
+        let state = StateHandle::new(bus.clone());
+        let db = Arc::new(Db::open_in_memory().unwrap());
+        let confirms = Confirmations::new(bus.clone(), state.clone());
+        let gate: Arc<dyn Gate> = Arc::new(PolicyGate::new(
+            RuleStore::new(db.clone()),
+            AuditLog::new(db),
+            confirms.clone(),
+        ));
+        let agent = Arc::new(Agent::new(
+            Arc::new(SlowEcho),
+            Arc::new(ToolRegistry::new()),
+            gate,
+            bus.clone(),
+            state.clone(),
+            "s".into(),
+        ));
+        (Session::new(agent, confirms, bus.clone()), bus, state)
     }
 }

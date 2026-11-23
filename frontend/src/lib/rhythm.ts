@@ -26,6 +26,31 @@ export function rhythmArgs(saved: Rhythm, every: unknown, change: Partial<Rhythm
   return { breaks: r.breaks, breakEveryMin: r.break_every_min, lively: r.lively };
 }
 
+/** The companion in games (decision 0054), as `get_rhythm_settings` gives it. */
+export interface Companion {
+  enabled: boolean;
+  every_s: number;
+  max_per_hour: number;
+}
+
+/** Seconds between two looks of the companion, as the core keeps them. */
+export const COMPANION_RANGE: [number, number] = [20, 300];
+
+/** Arguments of `set_companion`, in camelCase as Tauri takes them. An empty field keeps the saved interval. */
+export function companionArgs(saved: Companion, every: unknown, enabled = saved.enabled) {
+  return { enabled, everyS: wholeMinutes(every, COMPANION_RANGE, saved.every_s) };
+}
+
+/**
+ * What the switch of the companion does when flipped: turning on asks first,
+ * and without the Screen switch it only explains; turning off goes at once.
+ */
+export function companionFlip(on: boolean, saved: boolean, screen: boolean): 'ask' | 'needs_screen' | 'off' | 'none' {
+  if (on && !saved) return screen ? 'ask' : 'needs_screen';
+  if (!on && saved) return 'off';
+  return 'none';
+}
+
 /** Arguments of `save_calendar`. An empty link field leaves the saved link as it is. */
 export function calendarArgs(enabled: boolean, remind: unknown, savedRemind: number, url: string) {
   const link = url.trim();

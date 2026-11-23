@@ -12,7 +12,10 @@
   }
   interface MemoryView {
     facts: Fact[];
-    archived_messages: number;
+    /** Conversations that are neither pinned nor open (decision 0052). */
+    other_conversations: number;
+    /** Conversations older than this many days are deleted; 0 is never. */
+    keep_days: number;
     embedding_base_url: string;
     embedding_model: string;
     has_embedding_key: boolean;
@@ -27,7 +30,9 @@
   let status = $state('');
   let statusKind = $state<'ok' | 'bad' | ''>('');
   let sureFacts = $state(false);
-  let sureArchive = $state(false);
+  let sureOthers = $state(false);
+  /** The choices of the cleanup; Rust refuses any other. */
+  const KEEP = [7, 30, 90, 365, 0] as const;
   let busy = $state(false);
 
   onMount(load);
@@ -74,13 +79,30 @@
     await load();
   }
 
-  async function clearArchive() {
-    if (!sureArchive) {
-      sureArchive = true;
+  async function setKeep(days: number) {
+    try {
+      await invoke('set_history_keep', { days });
+      status = t('island.saved');
+      statusKind = 'ok';
+      await load();
+    } catch (e) {
+      fail(e);
+    }
+  }
+
+  async function deleteOthers() {
+    if (!sureOthers) {
+      sureOthers = true;
       return;
     }
-    sureArchive = false;
-    await invoke('clear_archive').catch(fail);
+    sureOthers = false;
+    try {
+      const count = await invoke<number>('delete_unpinned_conversations');
+      status = t('memory.deleted', { count });
+      statusKind = 'ok';
+    } catch (e) {
+      fail(e);
+    }
     await load();
   }
 
@@ -140,12 +162,21 @@
     </div>
   {/if}
 
-  <div class="lbl">{t('memory.archive')}</div>
-  <p class="hint">{t('memory.archive_sub', { count: m.archived_messages })}</p>
-  {#if m.archived_messages > 0}
+  <div class="lbl">{t('memory.history')}</div>
+  <p class="hint">{t('memory.history_sub')}</p>
+  <label class="keep">
+    <span>{t('memory.keep')}</span>
+    <select class="fld" value={m.keep_days} onchange={(e) => setKeep(Number(e.currentTarget.value))}>
+      {#each KEEP as d (d)}
+        <option value={d}>{t(`memory.keep_${d}`)}</option>
+      {/each}
+    </select>
+  </label>
+  <p class="hint">{t('memory.keep_hint')}</p>
+  {#if m.other_conversations > 0}
     <div class="acts">
-      <button class="bt no" onclick={clearArchive}>{t(sureArchive ? 'memory.clear_sure' : 'memory.archive_clear')}</button>
-      {#if sureArchive}<button class="bt" onclick={() => (sureArchive = false)}>{t('general.cancel')}</button>{/if}
+      <button class="bt no" onclick={deleteOthers}>{t(sureOthers ? 'memory.clear_sure' : 'memory.delete_others', { count: m.other_conversations })}</button>
+      {#if sureOthers}<button class="bt" onclick={() => (sureOthers = false)}>{t('general.cancel')}</button>{/if}
     </div>
   {/if}
 
@@ -212,6 +243,16 @@
   .line {
     display: flex;
     gap: 8px;
+  }
+  .keep {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0 2px 6px;
+    font-size: 13px;
+  }
+  .keep .fld {
+    width: auto;
   }
   .acts {
     display: flex;

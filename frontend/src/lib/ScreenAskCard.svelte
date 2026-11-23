@@ -227,7 +227,7 @@
   }
   @keyframes rec {
     50% {
-      box-shadow: 0 0 0 5px rgba(143, 125, 255, 0.22);
+      box-shadow: 0 0 0 5px rgba(var(--v-rgb), 0.22);
     }
   }
   @media (prefers-reduced-motion: reduce) {

@@ -374,7 +374,7 @@ describe('row texts', () => {
         expect(categoryLabel(category), category).not.toBe('');
       }
     }
-    expect(CATEGORIES.length).toBe(16);
+    expect(CATEGORIES.length).toBe(17);
     for (const level of LEVELS) {
       for (const group of ['level', 'tag', 'write']) expect(isMessageKey(`journal.${group}.${level}`), `${group}.${level}`).toBe(true);
     }

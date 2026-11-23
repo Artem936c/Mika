@@ -458,8 +458,12 @@ impl Screen for Fake {
                 origin: (10, 20),
             });
         }
-        // A 3200 px wide screen: shrinks when a limit is given.
-        let factor = if max_side == 0 { 1.0 } else { 2.0 };
+        // A 3200 px wide screen: shrinks to the limit when one is given.
+        let factor = if max_side == 0 || max_side >= 3200 {
+            1.0
+        } else {
+            3200.0 / max_side as f32
+        };
         Ok(Shot {
             png: b"\x89PNG".to_vec(),
             width: (3200.0 / factor) as u32,

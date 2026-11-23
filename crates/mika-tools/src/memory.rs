@@ -235,17 +235,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_search_reads_archived_conversations() {
+    async fn history_search_reads_other_conversations_and_not_deleted_ones() {
         let db = Arc::new(Db::open_in_memory().unwrap());
-        db.append_message("main", &ChatMessage::user("Купил велосипед Stels"))
+        db.append_message("old", &ChatMessage::user("Купил велосипед Stels"))
             .unwrap();
-        db.archive_messages("main").unwrap();
+        db.append_message("gone", &ChatMessage::user("Велосипед продан"))
+            .unwrap();
+        db.delete_conversation("gone").unwrap();
         let m = Memory::new(db, None);
         let out = run(&HistorySearchTool(m.clone()), json!({"query": "велосипед"}))
             .await
             .unwrap()
             .text;
         assert!(out.contains("пользователь: Купил велосипед Stels"), "{out}");
+        assert!(!out.contains("продан"), "{out}");
         assert_eq!(
             run(&HistorySearchTool(m.clone()), json!({"query": "самокат"}))
                 .await

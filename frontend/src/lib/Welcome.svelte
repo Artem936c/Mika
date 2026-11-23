@@ -129,12 +129,12 @@
     width: 100%;
     height: 100%;
     text-align: left;
-    background: #0d0e17;
+    background: var(--panel);
   }
   .side {
     padding: 22px 20px;
     border-right: 1px solid var(--line);
-    background: linear-gradient(180deg, #151331, #0b0b16);
+    background: linear-gradient(180deg, var(--deep-a), var(--deep-b));
   }
   .who {
     margin-bottom: 14px;

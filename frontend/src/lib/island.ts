@@ -136,6 +136,14 @@ export function reducePaused(current: boolean, event: unknown): boolean {
   return current;
 }
 
+/** Whether she sleeps (decision 0050): follows `pause_changed`; an older payload without `sleeping` is no sleep. */
+export function reduceSleeping(current: boolean, event: unknown): boolean {
+  if (typeof event !== 'object' || event === null) return current;
+  const e = event as { type?: unknown; paused?: unknown; sleeping?: unknown };
+  if (e.type !== 'pause_changed' || typeof e.paused !== 'boolean') return current;
+  return e.paused && e.sleeping === true;
+}
+
 export function reduceState(current: AssistantState, event: unknown): AssistantState {
   if (typeof event !== 'object' || event === null) return current;
   const e = event as { type?: unknown; to?: unknown };
@@ -175,7 +183,8 @@ export function unionRect(a: Rect, b: Rect): Rect {
  * Text that unfolds the island and the avatar bubble for a moment: a fired
  * reminder, and her own line about a break, the end of focus or a meeting soon.
  * They must be seen with replies not spoken. A scheduled task shows up as its
- * own message; greetings and the late-night line (`life`) stay in the chat.
+ * own message; greetings and the late-night line (`life`) stay in the chat,
+ * and so do the lines of the companion in games: the island is behind the game.
  * Of a line with a list (what came during focus) only the head is shown: the
  * list itself is in the chat.
  */
@@ -184,7 +193,7 @@ export function noticeOf(event: unknown): string | null {
   const e = event as { type?: unknown; text?: unknown; kind?: unknown };
   if (typeof e.text !== 'string' || !e.text.trim()) return null;
   if (e.type === 'reminder_fired' && e.kind !== 'task') return e.text;
-  if (e.type === 'remark' && e.kind !== 'life') {
+  if (e.type === 'remark' && e.kind !== 'life' && e.kind !== 'companion') {
     const head = e.text.trim().split('\n')[0].trim();
     return head.replace(/:$/, '.');
   }

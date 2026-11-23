@@ -108,6 +108,14 @@ pub const EXPORTED: &[TableSpec] = &[
         skip_columns: &[],
         keep_ids: true,
     },
+    // The list of conversations travels with their messages (decision 0052).
+    // Its rows are not counted: the history is told in messages.
+    TableSpec {
+        name: CONVERSATIONS,
+        category: Category::History,
+        skip_columns: &[],
+        keep_ids: true,
+    },
     // Vectors are a cache: she computes them again at the first search by meaning.
     TableSpec {
         name: "facts",
@@ -192,6 +200,7 @@ const RULES: &str = "rules";
 const REMINDERS: &str = "reminders";
 const SCENARIOS: &str = "triggers";
 const SKILLS: &str = "skills";
+const CONVERSATIONS: &str = "conversations";
 /// Longest time stamp of a scenario from a file, characters.
 const MAX_STAMP: usize = 64;
 /// Names of the file's commands a walk remembers, to tell which scenarios
@@ -384,7 +393,10 @@ pub(crate) fn export_tables<W: Write>(
                 _ => spec.category,
             };
             out.row(&cells)?;
-            *counts.entry(category).or_insert(0) += 1;
+            // The history is told in messages, not in conversations.
+            if spec.name != CONVERSATIONS {
+                *counts.entry(category).or_insert(0) += 1;
+            }
         }
     }
     Ok(counts)
@@ -512,6 +524,15 @@ impl Section {
                         serde_json::from_str::<ChatMessage>(body)
                             .is_ok_and(|m| m.role != Role::System)
                     })
+            }
+            CONVERSATIONS => {
+                filled("id")
+                    && short("id", MAX_CONVERSATION)
+                    && short("title", crate::storage::MAX_TITLE)
+                    && filled("created_at")
+                    && short("created_at", MAX_STAMP)
+                    && filled("updated_at")
+                    && short("updated_at", MAX_STAMP)
             }
             "facts" => {
                 self.text(cells, "text")
@@ -716,6 +737,7 @@ fn clear(conn: &Connection, category: Category) -> rusqlite::Result<()> {
         Category::History => {
             // Vectors of messages that are gone would match new ids.
             conn.execute("DELETE FROM message_vectors", [])?;
+            conn.execute("DELETE FROM conversations", [])?;
             conn.execute("DELETE FROM messages", [])?
         }
         other => match EXPORTED.iter().find(|s| s.category == other) {
@@ -849,7 +871,12 @@ impl<'a> TableWalk<'a> {
                 return Ok(());
             }
         }
-        *self.valid.entry(category).or_insert(0) += 1;
+        // The rows of the list of conversations go in with the messages
+        // and are not counted: the history is told in messages.
+        let counted = section.spec.name != CONVERSATIONS;
+        if counted {
+            *self.valid.entry(category).or_insert(0) += 1;
+        }
         // Counted, but neither listed nor written: the preview and the
         // restore walk the same rows in the same order, so what comes in is
         // exactly what was on the screen.
@@ -901,7 +928,9 @@ impl<'a> TableWalk<'a> {
             clear(conn, category)?;
         }
         let changed = section.insert(conn, cells, category)?;
-        *self.written.entry(category).or_insert(0) += changed;
+        if counted {
+            *self.written.entry(category).or_insert(0) += changed;
+        }
         Ok(())
     }
 
@@ -971,6 +1000,10 @@ pub(crate) mod tests {
         db.append_message("main", &ChatMessage::assistant("Здравствуй"))
             .unwrap();
         db.append_message("archive-20261110-101500", &ChatMessage::user("Старое"))
+            .unwrap();
+        // The list of conversations: a title of the user and a pin (decision 0052).
+        db.rename_conversation("main", "Приветствие").unwrap();
+        db.pin_conversation("archive-20261110-101500", true)
             .unwrap();
         db.with(|c| {
             c.execute_batch(
@@ -1044,6 +1077,7 @@ pub(crate) mod tests {
         let mut all = Vec::new();
         for table in [
             "messages",
+            "conversations",
             "facts",
             "notes",
             "todos",
@@ -1286,8 +1320,9 @@ pub(crate) mod tests {
             ["Ok(Int(0))"]
         );
 
-        // Row for row, ids included.
-        for table in ["messages", "notes", "todos", "commands"] {
+        // Row for row, ids included. The list of conversations comes back
+        // with its titles and pins (decision 0052).
+        for table in ["messages", "conversations", "notes", "todos", "commands"] {
             let sql = format!("SELECT * FROM {table} ORDER BY id");
             assert_eq!(rows_of(&target, &sql), rows_of(&source, &sql), "{table}");
         }
@@ -1341,6 +1376,7 @@ pub(crate) mod tests {
             named,
             [
                 "messages",
+                "conversations",
                 "facts",
                 "notes",
                 "todos",
@@ -2870,6 +2906,55 @@ pub(crate) mod tests {
             .map(|m| m.role)
             .collect();
         assert_eq!(roles, [Role::User, Role::Assistant, Role::Tool]);
+        // A file of an earlier version has no list of conversations: the
+        // list is made from the messages.
+        let list = target.list_conversations().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            (list[0].id.as_str(), list[0].title.as_str()),
+            ("main", "Привет")
+        );
+    }
+
+    #[test]
+    fn the_list_of_conversations_comes_back_with_its_titles_and_pins() {
+        let source = filled_db();
+        let payload = dump(&source);
+        // The list here goes: the file holds the history.
+        let target = Db::open_in_memory().unwrap();
+        target
+            .append_message("here", &ChatMessage::user("Здешний"))
+            .unwrap();
+        let outcome = restore(&target, &payload, &[Category::History]);
+        assert_eq!(outcome.written, [(Category::History, 3)].into());
+        let view = |db: &Db| -> Vec<(String, String, bool, usize)> {
+            db.list_conversations()
+                .unwrap()
+                .into_iter()
+                .map(|c| (c.id, c.title, c.pinned, c.messages))
+                .collect()
+        };
+        assert_eq!(view(&target), view(&source));
+        assert_eq!(
+            view(&target),
+            [
+                ("archive-20261110-101500".into(), "Старое".into(), true, 1),
+                ("main".into(), "Приветствие".into(), false, 2),
+            ]
+        );
+        // A row the app could not have written is dropped.
+        let payload = one_table(
+            r#"{"t":"table","name":"conversations","columns":["id","title","created_at","updated_at","pinned","opened_at"]}"#,
+            &[
+                r#"{"t":"row","v":["ok","Тема","2026-11-01T10:00:00+03:00","2026-11-01T10:00:00+03:00",0,null]}"#,
+                r#"{"t":"row","v":["","Пусто","2026-11-01T10:00:00+03:00","2026-11-01T10:00:00+03:00",0,null]}"#,
+                r#"{"t":"row","v":["long","Слишком длинное название для одного диалога в списке","d","d",0,null]}"#,
+            ],
+        );
+        let target = Db::open_in_memory().unwrap();
+        let outcome = restore(&target, &payload, &[Category::History]);
+        assert_eq!(outcome.dropped_rows, 2);
+        assert_eq!(view(&target), [("ok".into(), "Тема".into(), false, 0)]);
     }
 
     #[test]

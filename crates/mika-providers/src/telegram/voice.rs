@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use mika_core::events::{Event, EventBus};
 use mika_core::i18n::tr;
 use mika_core::llm::SpeechToText;
-use mika_core::session::{Origin, Session};
+use mika_core::session::{Origin, Session, Submitted};
 use mika_core::sound::{ogg_opus_length, SoundConverter, SoundKind};
 use parking_lot::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -449,9 +449,17 @@ pub(crate) async fn hear_and_run(
     voice.expect(&text);
     voice.drop_reply();
     // The question may have opened this very moment: the session refuses too.
-    if session.submit_new_from(&text, Origin::Telegram).is_none() {
-        voice.forget(&text);
-        tell(api, owner, &asked_reply(session)).await;
+    match session.submit_new_from(&text, Origin::Telegram) {
+        None => {
+            voice.forget(&text);
+            tell(api, owner, &asked_reply(session)).await;
+        }
+        // «Усни» (decision 0050): no turn started, her line is sent from here.
+        Some(Submitted::Asleep) => {
+            voice.forget(&text);
+            tell(api, owner, &tr("core.quick.sleep")).await;
+        }
+        Some(_) => {}
     }
 }
 

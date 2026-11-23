@@ -122,7 +122,7 @@
     box-sizing: border-box;
     margin: 0;
     font: 12.5px/1.45 var(--mono);
-    color: #cdd3ff;
+    color: var(--ink-v);
     background: rgba(0, 0, 0, 0.5);
     border: 1px solid var(--line);
     border-radius: 12px;

@@ -151,7 +151,7 @@
     gap: 6px;
   }
   .bt.on {
-    border-color: rgba(143, 125, 255, 0.55);
+    border-color: rgba(var(--v-rgb), 0.55);
   }
   .panel {
     margin-top: 8px;
@@ -204,7 +204,7 @@
     background: rgba(255, 255, 255, 0.05);
   }
   .item.sel {
-    background: rgba(143, 125, 255, 0.16);
+    background: rgba(var(--v-rgb), 0.16);
   }
   .item.cur .nm::after {
     content: ' ✓';

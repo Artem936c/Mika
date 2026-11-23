@@ -5,19 +5,45 @@
 }
 
 :root {
+  /* The violet theme; the others are in lib/theme.ts (decision 0049). */
   --ink: #f3f4fa;
+  --ink2: #c9cbe6;
+  --ink3: #b9c3e6;
   --mute: #8d93ab;
   --dim: #5d6279;
   --line: rgba(255, 255, 255, 0.08);
   --line2: rgba(255, 255, 255, 0.14);
   --v: #8f7dff;
+  --v-rgb: 143, 125, 255;
+  --v-deep: #6b58e6;
+  --v-mid: #7663ee;
+  --v-hi: #9d8dff;
+  /* Text on a button filled with the accent. */
+  --on-v: #f3f4fa;
+  /* Light text tinted by the accent. */
+  --ink-v: #cdd3ff;
   --p: #ff7eb6;
+  --p-rgb: 255, 126, 182;
   --c: #6fe3ff;
+  --c-rgb: 111, 227, 255;
   --ok: #5fe3a1;
   --warn: #ffc65c;
   --bad: #ff6b7d;
+  --bad-hi: #ff8a80;
+  --bad-ink: #ffd0d6;
+  --hot: #ffb36b;
   --island: #06070b;
   --glass: rgba(16, 17, 27, 0.78);
+  --veil: rgba(8, 9, 15, 0.66);
+  /* Window backgrounds: the settings window, popups over it, and tinted ones. */
+  --panel: #0d0e17;
+  --raised: #14151f;
+  --raised-v: #14131f;
+  --deep-a: #151331;
+  --deep-b: #0b0b16;
+  --deep-c: #191640;
+  --halo-a: #4a4090;
+  --halo-b: #1b1736;
   --spring: cubic-bezier(0.32, 1.28, 0.54, 1);
   --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
   --mono: 'Cascadia Code', 'Cascadia Mono', Consolas, monospace;
@@ -51,7 +77,7 @@ textarea {
 button:focus-visible,
 input:focus-visible,
 textarea:focus-visible {
-  outline: 2px solid rgba(143, 125, 255, 0.7);
+  outline: 2px solid rgba(var(--v-rgb), 0.7);
   outline-offset: 1px;
 }
 
@@ -88,7 +114,7 @@ textarea:focus-visible {
 }
 .ib.on {
   color: #fff;
-  background: linear-gradient(135deg, rgba(143, 125, 255, 0.5), rgba(255, 126, 182, 0.35));
+  background: linear-gradient(135deg, rgba(var(--v-rgb), 0.5), rgba(var(--p-rgb), 0.35));
   border-color: transparent;
 }
 .ib:disabled {
@@ -116,8 +142,8 @@ textarea:focus-visible {
 }
 .tg.on {
   color: #fff;
-  background: linear-gradient(135deg, rgba(143, 125, 255, 0.34), rgba(255, 126, 182, 0.2));
-  border-color: rgba(143, 125, 255, 0.5);
+  background: linear-gradient(135deg, rgba(var(--v-rgb), 0.34), rgba(var(--p-rgb), 0.2));
+  border-color: rgba(var(--v-rgb), 0.5);
 }
 .tg:disabled {
   opacity: 0.45;
@@ -146,11 +172,12 @@ textarea:focus-visible {
 }
 .bt.pri {
   border: 0;
-  background: linear-gradient(135deg, var(--v), #6b58e6);
-  box-shadow: 0 6px 20px rgba(143, 125, 255, 0.35);
+  color: var(--on-v);
+  background: linear-gradient(135deg, var(--v), var(--v-deep));
+  box-shadow: 0 6px 20px rgba(var(--v-rgb), 0.35);
 }
 .bt.pri:hover:not(:disabled) {
-  background: linear-gradient(135deg, #9d8dff, #7663ee);
+  background: linear-gradient(135deg, var(--v-hi), var(--v-mid));
 }
 .bt.no {
   color: var(--bad);
@@ -184,7 +211,7 @@ textarea:focus-visible {
 }
 .seg button.on {
   color: #fff;
-  background: linear-gradient(135deg, rgba(143, 125, 255, 0.55), rgba(255, 126, 182, 0.4));
+  background: linear-gradient(135deg, rgba(var(--v-rgb), 0.55), rgba(var(--p-rgb), 0.4));
 }
 
 /* Small caps label above a field. */
@@ -214,7 +241,7 @@ textarea:focus-visible {
   user-select: text;
 }
 .fld:focus {
-  border-color: rgba(143, 125, 255, 0.6);
+  border-color: rgba(var(--v-rgb), 0.6);
 }
 textarea.fld {
   height: auto;
@@ -255,7 +282,7 @@ textarea.fld {
   height: 300px;
   translate: -50% -50%;
   border-radius: 50%;
-  background: radial-gradient(circle, rgba(143, 125, 255, 0.5), rgba(255, 126, 182, 0.18) 45%, transparent 70%);
+  background: radial-gradient(circle, rgba(var(--v-rgb), 0.5), rgba(var(--p-rgb), 0.18) 45%, transparent 70%);
   animation: halo-pulse 5s ease-in-out infinite;
   pointer-events: none;
 }

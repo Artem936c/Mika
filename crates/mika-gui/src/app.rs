@@ -25,7 +25,26 @@ use mika_tools::{Shared, ToolEnv};
 use parking_lot::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+/// The conversation of the earlier versions; also the one used when the
+/// list of conversations cannot be read (decision 0052).
 pub const CONVERSATION: &str = "main";
+
+/// The conversation to open at start: the one open last, or a new one.
+fn conversation_at_start(db: &Db) -> String {
+    let found = match db.last_opened() {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) => db.create_conversation(),
+        Err(e) => Err(e),
+    };
+    let id = found.unwrap_or_else(|e| {
+        log::error!(target: "app", "cannot read the list of conversations: {e}");
+        CONVERSATION.to_string()
+    });
+    if let Err(e) = db.mark_opened(&id) {
+        log::warn!(target: "app", "cannot note the open conversation: {e}");
+    }
+    id
+}
 
 /// How a long reply is retold for the voice.
 const RETELL_PROMPT: &str = "Перескажи ответ помощника для озвучки голосом: одна-две короткие разговорные фразы, не больше 200 знаков, от первого лица, о себе в женском роде, по-русски. Главное — суть и итог. Без списков, ссылок, путей к файлам, кода и эмодзи. Ничего нового не добавляй. Ответь только пересказом.";
@@ -355,6 +374,8 @@ pub struct Ctx {
     /// A picture of a window that waits for the user's question, and what
     /// is known about its question.
     screen_ask: Arc<ScreenAskState>,
+    /// Files attached to the message being typed (decision 0053).
+    pub attachments: crate::attachments::Pending,
 }
 
 /// How an attempt to hear a phrase ended.
@@ -404,7 +425,8 @@ impl Ctx {
         };
         let secrets: Arc<dyn SecretStore> = Arc::new(KeyringSecretStore::new());
         let db = Arc::new(Db::open(&database_path()).map_err(|e| e.to_string())?);
-        let history = db.load_messages(CONVERSATION).unwrap_or_else(|e| {
+        let conversation = conversation_at_start(&db);
+        let history = db.load_messages(&conversation).unwrap_or_else(|e| {
             log::error!("cannot load the conversation, it starts empty: {e}");
             Vec::new()
         });
@@ -527,11 +549,18 @@ impl Ctx {
             system_prompt(&assistant),
         )
         .with_history(history)
-        .with_store(db.clone(), CONVERSATION);
+        .with_store(db.clone(), conversation);
         agent.add_prompt_extra(Arc::new(|| {
             Some(format!("Сейчас {}.", format_time(chrono::Local::now())))
         }));
         agent.set_recall(Arc::new(memory.clone()));
+        // Attached pictures (decision 0053): with a vision model of its own
+        // the main model gets their descriptions; read at every message.
+        let sees = config.clone();
+        agent.set_eyes(mika_core::attach::Eyes {
+            vision: env.shared.vision.clone(),
+            main_sees: Arc::new(move || mika_core::attach::main_sees(&sees.lock().llm)),
+        });
         agent.set_task_board(task_board);
         // What a turn did, for a skill (decision 0047).
         env.shared.skills.set_offers(config.lock().skills.suggest);
@@ -588,6 +617,16 @@ impl Ctx {
         let _ = asked_from.set(Arc::downgrade(&session));
         session.set_commands(commands.clone());
         session.set_skills(mika_core::skills::SkillStore::new(db.clone()));
+        // Quick commands (decision 0050): the switch and her names, as the
+        // settings are now.
+        let quick_config = config.clone();
+        session.set_quick(Arc::new(move || {
+            let c = quick_config.lock();
+            mika_core::session::QuickSetup {
+                enabled: c.quick.enabled,
+                names: vec![c.assistant.name.clone(), c.assistant.wake_phrase.clone()],
+            }
+        }));
         // A background job keeps where the turn that started it came from:
         // the end of a job asked for in Telegram is told there, the end of
         // any other never leaves this computer.
@@ -654,6 +693,7 @@ impl Ctx {
             direct,
             dictation: Mutex::new(None),
             screen_ask: Default::default(),
+            attachments: Default::default(),
         })
     }
 
@@ -799,6 +839,7 @@ impl Ctx {
         self.start_notifications();
         self.start_briefing();
         self.start_rhythm();
+        self.start_companion();
         self.start_calendar();
         self.start_docs();
         self.start_observer();
@@ -1152,12 +1193,15 @@ impl Ctx {
     }
 
     /// The wake phrase was heard: stop talking, come forward, listen. A stop
-    /// word stops everything while she is busy (decision 0045).
+    /// word stops everything while she is busy (decision 0045); a sleep
+    /// phrase puts her to sleep (decision 0050).
     fn on_wake(self: &Arc<Self>, heard: &str) {
+        use mika_audio::wake::HeardKind;
         let name = self.config.lock().assistant.wake_phrase.clone();
-        if mika_audio::wake::heard_kind(heard, &name) == Some(mika_audio::wake::HeardKind::Stop) {
-            self.on_stop_word(heard);
-            return;
+        match mika_audio::wake::heard_kind(heard, &name) {
+            Some(HeardKind::Stop) => return self.on_stop_word(heard),
+            Some(HeardKind::Sleep) => return self.on_sleep_word(heard),
+            _ => {}
         }
         if self.is_recording() {
             return;
@@ -1216,12 +1260,51 @@ impl Ctx {
         self.full_stop(true);
     }
 
+    /// A sleep phrase without the name (decision 0050): she goes to sleep.
+    /// Not during a dictation (the words are the user's text), not while she
+    /// records a phrase (it reaches her as a request anyway), not when it is
+    /// her own voice in the speakers, and not when she sleeps already.
+    fn on_sleep_word(&self, heard: &str) {
+        let dictation = self.dictation.lock().is_some();
+        let recording = self.is_recording();
+        let speaking = self.state.get() == AssistantState::Speaking || self.voice.busy();
+        let phrase = mika_core::pause::phrase_words(heard)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let echo = speaking && mika_audio::wake::is_echo(&phrase, &self.speaking.lock());
+        if dictation || recording || echo || self.session.pause().is_sleeping() {
+            log::debug!(
+                target: "voice",
+                "sleep phrase ignored: dictation={dictation} recording={recording} echo={echo} asleep={}",
+                self.session.pause().is_sleeping()
+            );
+            return;
+        }
+        log::info!(
+            target: "voice",
+            "sleep phrase heard, she goes to sleep: state={}",
+            self.state.get().as_str()
+        );
+        self.end_voice_dialog();
+        self.session.sleep(None);
+    }
+
     /// Stops everything (decision 0045): the reply and the queued ones, a
     /// task with its tool call, an open question, her voice and a phrase
     /// being recorded, the voice dialog, every background job. With `pause`
     /// she then starts nothing by herself until the user addresses her.
     /// The stop word and the Stop button of the chat come here.
     pub fn full_stop(&self, pause: bool) -> mika_core::pause::StopReport {
+        self.stop_all(pause, true)
+    }
+
+    /// Stops the reply, the task, the speech and the listening, but not the
+    /// background jobs: another conversation is opened (decision 0052).
+    pub fn stop_for_switch(&self) {
+        self.stop_all(false, false);
+    }
+
+    fn stop_all(&self, pause: bool, jobs: bool) -> mika_core::pause::StopReport {
         let report = mika_core::pause::StopReport {
             speech: self.state.get() == AssistantState::Speaking || self.voice.busy(),
             listening: self.is_recording(),
@@ -1229,7 +1312,9 @@ impl Ctx {
         };
         self.end_voice_dialog();
         self.cancel_listening();
-        let report = self.session.full_stop(report, Some(&self.jobs), pause);
+        let report = self
+            .session
+            .full_stop(report, jobs.then_some(&self.jobs), pause);
         // A retelling still being made and the sentences already queued.
         self.speaker.cancel();
         self.voice.stop();
@@ -1364,6 +1449,15 @@ impl Ctx {
                 );
                 self.full_stop(true);
             }
+            // «Усни»: she sleeps and does not listen after it (decision 0050).
+            Ok(Heard::Text(text)) if self.session.asks_sleep(&text) => {
+                log::info!(
+                    target: "voice",
+                    "spoken phrase asks her to sleep: follow_up={follow_up}"
+                );
+                self.end_voice_dialog();
+                self.session.submit_from(&text, Origin::Voice);
+            }
             Ok(Heard::Text(text)) => {
                 self.follow_up.store(true, Ordering::Relaxed);
                 self.session.submit_from(&text, Origin::Voice);
@@ -1484,6 +1578,12 @@ impl Ctx {
                 }
                 match event {
                     Event::Error { .. } => ctx.end_voice_dialog(),
+                    // Asleep she stops listening, wherever «усни» came from
+                    // (decision 0050).
+                    Event::PauseChanged { sleeping: true, .. } => {
+                        ctx.end_voice_dialog();
+                        ctx.cancel_listening();
+                    }
                     Event::StateChanged { to, .. }
                         if matches!(to, AssistantState::Idle | AssistantState::AwaitingConfirm)
                             && ctx.follow_up.load(Ordering::Relaxed) =>
@@ -1923,6 +2023,21 @@ impl Ctx {
     /// alone is not enough: a turn that has just taken its place may not show yet.
     fn occupied(&self) -> bool {
         self.state.get() != AssistantState::Idle || self.session.agent.turn_running()
+    }
+
+    /// She answers, does a task, asks about an action or still speaks, or the
+    /// user records a phrase or dictates: a line of her own would get in the
+    /// way (decision 0054).
+    pub(crate) fn engaged(&self) -> bool {
+        self.occupied()
+            || self.voice.busy()
+            || self.is_recording()
+            || self.dictation.lock().is_some()
+    }
+
+    /// The guarded picture of the window in front (decision 0030).
+    pub(crate) fn direct(&self) -> &mika_tools::direct::Direct {
+        &self.direct
     }
 
     /// The steps of a dictation. `Err(Some(line))`: it stopped and the user is

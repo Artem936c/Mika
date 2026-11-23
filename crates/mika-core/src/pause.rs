@@ -14,6 +14,8 @@ use crate::state::AssistantState;
 pub const REMARK_STOP: &str = "stop";
 /// `Event::Remark` kind: the line saying what the pause skipped.
 pub const REMARK_PAUSE: &str = "pause";
+/// `Event::Remark` kind: the line she says when she falls asleep (decision 0050).
+pub const REMARK_SLEEP: &str = "sleep";
 
 /// Words that stop her (decisions 0045 and 0048). One list for the wake
 /// phrase listener, the voice dialog and Telegram.
@@ -45,6 +47,15 @@ pub const STOP_TAIL: &[&str] = &[
     "не",
 ];
 
+/// Words that put her to sleep (decision 0050): she goes quiet and starts
+/// nothing by herself, but a running task and the background jobs go on.
+/// They act only as a whole phrase, see `only_sleep_words`.
+pub const SLEEP_WORDS: &[&str] = &["усни", "спи", "засыпай", "отдохни", "поспи", "спать"];
+
+/// Words a sleep phrase may hold besides the sleep words: «иди спать»,
+/// «усни, пожалуйста».
+pub const SLEEP_TAIL: &[&str] = &["иди", "давай", "пожалуйста", "немного", "уже", "можешь"];
+
 /// Words of a recognised phrase, lower case, without punctuation and
 /// without the `[unk]` of Vosk.
 pub fn phrase_words(text: &str) -> impl Iterator<Item = String> + '_ {
@@ -61,6 +72,20 @@ pub fn only_stop_words(text: &str) -> bool {
         if STOP_WORDS.contains(&w.as_str()) {
             any = true;
         } else if !STOP_TAIL.contains(&w.as_str()) {
+            return false;
+        }
+    }
+    any
+}
+
+/// True when the phrase asks her to sleep and nothing else: sleep words,
+/// maybe with a word of `SLEEP_TAIL`. «Спи спокойно» and «список» are not.
+pub fn only_sleep_words(text: &str) -> bool {
+    let mut any = false;
+    for w in phrase_words(text) {
+        if SLEEP_WORDS.contains(&w.as_str()) {
+            any = true;
+        } else if !SLEEP_TAIL.contains(&w.as_str()) {
             return false;
         }
     }
@@ -231,6 +256,8 @@ pub enum SkipKind {
     Break,
     /// A greeting or «уже поздно»: the «Живость» switch.
     Lively,
+    /// A line of the companion in games (decision 0054).
+    Companion,
 }
 
 impl SkipKind {
@@ -243,6 +270,7 @@ impl SkipKind {
             SkipKind::ChatReply => "chat_reply",
             SkipKind::Break => "break",
             SkipKind::Lively => "lively",
+            SkipKind::Companion => "companion",
         }
     }
 
@@ -252,6 +280,7 @@ impl SkipKind {
             SkipKind::Scenario | SkipKind::ChatReply => "events",
             SkipKind::Task | SkipKind::MorningSummary | SkipKind::EveningSummary => "jobs",
             SkipKind::Break | SkipKind::Lively => "app",
+            SkipKind::Companion => "vision",
         }
     }
 
@@ -264,6 +293,7 @@ impl SkipKind {
             SkipKind::ChatReply => "core.skip.chat_reply",
             SkipKind::Break => "core.skip.break",
             SkipKind::Lively => "core.skip.lively",
+            SkipKind::Companion => "core.skip.companion",
         }
     }
 }
@@ -284,6 +314,8 @@ pub fn held_in_pause(kind: &str) -> Option<SkipKind> {
         "break" => Some(SkipKind::Break),
         // The summary of the day comes as a line of hers.
         "day" => Some(SkipKind::EveningSummary),
+        // A line about the game is of no use later (decision 0054).
+        crate::companion::REMARK_COMPANION => Some(SkipKind::Companion),
         _ => None,
     }
 }
@@ -293,6 +325,12 @@ const SHOWN_SKIPPED: usize = 6;
 
 /// The line in `lang` that tells what the pause skipped; `None` when nothing.
 pub fn skipped_line_in(lang: Lang, items: &[Skipped]) -> Option<String> {
+    skipped_line_of(lang, PauseKind::Stopped, items)
+}
+
+/// The line in `lang` that tells what the pause of `kind` skipped: «Пока
+/// была пауза…» or «Пока я спала…»; `None` when nothing.
+pub fn skipped_line_of(lang: Lang, kind: PauseKind, items: &[Skipped]) -> Option<String> {
     if items.is_empty() {
         return None;
     }
@@ -305,54 +343,112 @@ pub fn skipped_line_in(lang: Lang, items: &[Skipped]) -> Option<String> {
         let rest = (items.len() - SHOWN_SKIPPED).to_string();
         what.push(tr_args_in(lang, "core.skip.more", &[("n", &rest)]));
     }
-    Some(tr_args_in(
-        lang,
-        "core.pause_skipped",
-        &[("what", &what.join(", "))],
-    ))
+    let key = match kind {
+        PauseKind::Stopped => "core.pause_skipped",
+        PauseKind::Sleeping => "core.sleep_skipped",
+    };
+    Some(tr_args_in(lang, key, &[("what", &what.join(", "))]))
 }
 
 pub fn skipped_line(items: &[Skipped]) -> Option<String> {
     skipped_line_in(lang(), items)
 }
 
-/// The pause after a full stop. It has no time limit: it lasts until the
-/// user addresses her.
+/// Why she waits to be called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseKind {
+    /// After a full stop (decision 0045).
+    Stopped,
+    /// She was asked to sleep (decision 0050): a running task and the
+    /// background jobs go on, nothing else starts and nothing sounds.
+    Sleeping,
+}
+
+impl PauseKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PauseKind::Stopped => "stopped",
+            PauseKind::Sleeping => "sleeping",
+        }
+    }
+}
+
+/// What the pause holds while it lasts.
+struct Held {
+    kind: PauseKind,
+    /// What was skipped so far, without repeats.
+    skipped: Vec<Skipped>,
+}
+
+/// The pause after a full stop, or her sleep. It has no time limit: it lasts
+/// until the user addresses her.
 #[derive(Default)]
 pub struct Pause {
-    /// `Some` while paused: what was skipped so far, without repeats.
-    skipped: Mutex<Option<Vec<Skipped>>>,
+    /// `Some` while paused.
+    held: Mutex<Option<Held>>,
 }
 
 impl Pause {
-    /// Starts the pause. False when it was on already.
+    /// Starts the pause after a full stop. False when a pause or a sleep
+    /// was on already: a sleep stays a sleep.
     pub fn begin(&self) -> bool {
-        let mut skipped = self.skipped.lock();
-        if skipped.is_some() {
+        let mut held = self.held.lock();
+        if held.is_some() {
             return false;
         }
-        *skipped = Some(Vec::new());
+        *held = Some(Held {
+            kind: PauseKind::Stopped,
+            skipped: Vec::new(),
+        });
         log::info!(target: "turn", "pause began: she starts nothing until she is called");
         true
     }
 
+    /// Puts her to sleep. A pause that was on becomes a sleep and keeps
+    /// what it skipped. False when she slept already.
+    pub fn begin_sleep(&self) -> bool {
+        let mut held = self.held.lock();
+        match held.as_mut() {
+            Some(h) if h.kind == PauseKind::Sleeping => return false,
+            Some(h) => h.kind = PauseKind::Sleeping,
+            None => {
+                *held = Some(Held {
+                    kind: PauseKind::Sleeping,
+                    skipped: Vec::new(),
+                })
+            }
+        }
+        log::info!(target: "turn", "sleep began: she starts nothing and says nothing until she is called");
+        true
+    }
+
     pub fn is_on(&self) -> bool {
-        self.skipped.lock().is_some()
+        self.held.lock().is_some()
+    }
+
+    /// True while she sleeps.
+    pub fn is_sleeping(&self) -> bool {
+        self.kind() == Some(PauseKind::Sleeping)
+    }
+
+    /// Why she waits, `None` when she does not.
+    pub fn kind(&self) -> Option<PauseKind> {
+        self.held.lock().as_ref().map(|h| h.kind)
     }
 
     /// During a pause: writes down `kind` and returns true, and the caller
     /// starts nothing. Outside a pause: false, nothing is written.
     pub fn skip(&self, kind: SkipKind, detail: &str) -> bool {
-        let mut guard = self.skipped.lock();
-        let Some(skipped) = guard.as_mut() else {
+        let mut guard = self.held.lock();
+        let Some(held) = guard.as_mut() else {
             return false;
         };
         let item = Skipped {
             kind,
             detail: detail.trim().to_string(),
         };
-        if !skipped.contains(&item) {
-            skipped.push(item);
+        if !held.skipped.contains(&item) {
+            held.skipped.push(item);
         }
         drop(guard);
         // The detail is the user's: a name, a task, who wrote.
@@ -367,7 +463,13 @@ impl Pause {
 
     /// Ends the pause: what it skipped, or `None` when there was no pause.
     pub fn end(&self) -> Option<Vec<Skipped>> {
-        self.skipped.lock().take()
+        self.end_kind().map(|(_, skipped)| skipped)
+    }
+
+    /// Ends the pause: why she waited and what it skipped, or `None` when
+    /// there was no pause.
+    pub fn end_kind(&self) -> Option<(PauseKind, Vec<Skipped>)> {
+        self.held.lock().take().map(|h| (h.kind, h.skipped))
     }
 }
 
@@ -602,10 +704,64 @@ mod tests {
     }
 
     #[test]
+    fn a_sleep_phrase_is_sleep_words_and_maybe_a_tail() {
+        for sleep in [
+            "усни",
+            "Спи.",
+            "Засыпай!",
+            "отдохни",
+            "иди спать",
+            "Усни, пожалуйста",
+            "[unk] поспи",
+        ] {
+            assert!(only_sleep_words(sleep), "{sleep}");
+        }
+        for other in [
+            "",
+            "[unk]",
+            "список",
+            "спи спокойно",
+            "хочу спать",
+            "сколько спать коту",
+            "иди",
+            "стоп",
+        ] {
+            assert!(!only_sleep_words(other), "{other}");
+        }
+        // A sleep phrase is no stop, and a stop is no sleep.
+        assert!(!only_stop_words("усни"));
+    }
+
+    #[test]
+    fn a_sleep_keeps_what_the_pause_skipped_and_is_told_apart() {
+        let pause = Pause::default();
+        assert_eq!(pause.kind(), None);
+        assert!(pause.begin());
+        assert!(pause.skip(SkipKind::Break, ""));
+        assert!(!pause.is_sleeping());
+        // A pause becomes a sleep; a second sleep changes nothing.
+        assert!(pause.begin_sleep());
+        assert!(!pause.begin_sleep());
+        // A full stop while she sleeps leaves her asleep.
+        assert!(!pause.begin());
+        assert!(pause.is_sleeping());
+        assert_eq!(pause.kind(), Some(PauseKind::Sleeping));
+        let (kind, skipped) = pause.end_kind().unwrap();
+        assert_eq!(kind, PauseKind::Sleeping);
+        assert_eq!(skipped.len(), 1);
+        assert!(!pause.is_on());
+        let line = skipped_line_of(Lang::Ru, kind, &skipped).unwrap();
+        assert!(line.starts_with("Пока я спала"), "{line}");
+        let en = skipped_line_of(Lang::En, kind, &skipped).unwrap();
+        assert!(en.starts_with("While I was asleep"), "{en}");
+    }
+
+    #[test]
     fn lively_lines_are_skipped_and_the_rest_only_go_quiet() {
         assert_eq!(held_in_pause("life"), Some(SkipKind::Lively));
         assert_eq!(held_in_pause("break"), Some(SkipKind::Break));
         assert_eq!(held_in_pause("day"), Some(SkipKind::EveningSummary));
+        assert_eq!(held_in_pause("companion"), Some(SkipKind::Companion));
         for shown in ["calendar", "focus", "watch", "job", "cost", "trigger"] {
             assert_eq!(held_in_pause(shown), None, "{shown}");
         }

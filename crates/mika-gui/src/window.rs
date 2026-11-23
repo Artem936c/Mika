@@ -932,12 +932,25 @@ pub fn stays_in_front(
     (!fullscreen || held || asking, held)
 }
 
+/// A full-screen program (a game) is in front now, as the last check of the
+/// game watch saw it. Kept only while someone wants to know: hiding in games
+/// or the companion in games is on.
+static GAME_IN_FRONT: AtomicBool = AtomicBool::new(false);
+
+/// Whether a full-screen program is in front, by the same check that hides
+/// the island (decision 0054). Cheap: reads what the game watch last saw.
+pub fn game_in_front() -> bool {
+    GAME_IN_FRONT.load(Ordering::Relaxed)
+}
+
 /// While a full-screen program is in front, the island and the desktop avatar go
 /// behind it; a call by shortcut or voice brings them back on top. `enabled`,
-/// `busy` and `asking` are read on every check.
+/// `companion`, `busy` and `asking` are read on every check. The windows are
+/// looked at only while hiding in games or the companion in games is on.
 pub fn spawn_game_watch(
     app: tauri::AppHandle,
     enabled: impl Fn() -> bool + Send + 'static,
+    companion: impl Fn() -> bool + Send + 'static,
     busy: impl Fn() -> bool + Send + 'static,
     asking: impl Fn() -> bool + Send + 'static,
 ) {
@@ -959,8 +972,11 @@ pub fn spawn_game_watch(
                     .iter()
                     .filter_map(|l| handle(l))
                     .collect();
-                let fullscreen =
-                    enabled() && (fullscreen_app_running() || front_app_fills_screen(island, &own));
+                let hide = enabled();
+                let game = (hide || companion())
+                    && (fullscreen_app_running() || front_app_fills_screen(island, &own));
+                GAME_IN_FRONT.store(game, Ordering::Relaxed);
+                let fullscreen = hide && game;
                 let summoned = SUMMONED.lock().is_some_and(|at| at.elapsed() < SUMMON_HOLD);
                 let focused = app
                     .get_webview_window("island")
