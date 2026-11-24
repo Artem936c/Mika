@@ -64,10 +64,13 @@ impl Ctx {
             .windows
             .foreground()
             .is_some_and(|w| core::not_a_game(&w.process));
+        // Read on its own: a guard inside the literal would live through
+        // every other check below.
+        let screen = self.config.lock().privacy.screen_enabled;
         Scene {
             game: true,
             not_game,
-            screen: self.config.lock().privacy.screen_enabled,
+            screen,
             paused: self.session.pause().is_on(),
             focus: self.tool_env().shared.focus.active(at),
             busy: self.engaged(),

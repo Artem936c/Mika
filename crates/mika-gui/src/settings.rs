@@ -1238,6 +1238,30 @@ pub fn set_voice_style(ctx: CtxState<'_>, style: String, tone_by_mood: bool) -> 
     Ok(())
 }
 
+/// What the voice page shows from the settings, read under one lock that is
+/// let go before anything else runs. Two locks in one expression wait on each
+/// other forever: the second `lock()` comes while the first guard still lives.
+struct VoicePageConfig {
+    voice: mika_core::config::VoiceConfig,
+    microphone_enabled: bool,
+    llm_base_url: String,
+    wake_phrase: String,
+    quick: bool,
+}
+
+impl VoicePageConfig {
+    fn read(config: &Mutex<mika_core::config::Config>) -> Self {
+        let c = config.lock();
+        Self {
+            voice: c.voice.clone(),
+            microphone_enabled: c.privacy.microphone_enabled,
+            llm_base_url: c.llm.effective_base_url(),
+            wake_phrase: c.assistant.wake_phrase.clone(),
+            quick: c.quick.enabled,
+        }
+    }
+}
+
 /// Async: listing voices waits for Windows and must not block the UI thread.
 #[tauri::command]
 pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<VoiceSettings, String> {
@@ -1258,14 +1282,13 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
         })
         .await
         .unwrap_or_default();
-    let (c, microphone_enabled, llm_base_url) = {
-        let cfg = ctx.config.lock();
-        (
-            cfg.voice.clone(),
-            cfg.privacy.microphone_enabled,
-            cfg.llm.effective_base_url(),
-        )
-    };
+    let VoicePageConfig {
+        voice: c,
+        microphone_enabled,
+        llm_base_url,
+        wake_phrase,
+        quick,
+    } = VoicePageConfig::read(&ctx.config);
     let marks_model = expressive_model(&c.tts_model);
     Ok(VoiceSettings {
         speak_replies: c.speak_replies,
@@ -1289,7 +1312,7 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
         input_device: c.input_device,
         input_devices,
         wake_enabled: c.wake_enabled,
-        wake_phrase: ctx.config.lock().assistant.wake_phrase.clone(),
+        wake_phrase,
         wake_status: ctx.wake_status.lock().clone(),
         vosk_installed: crate::vosk::installed(),
         vosk_downloading: crate::vosk::downloading(),
@@ -1300,7 +1323,7 @@ pub async fn get_voice_settings(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<Voice
         wake_engine: c.wake_engine,
         wake_engine_used: *ctx.wake_engine_used.lock(),
         follow_up: c.follow_up,
-        quick: ctx.config.lock().quick.enabled,
+        quick,
         duck_media: c.duck_media,
         tts_style: c.tts_style,
         tone_by_mood: c.tone_by_mood,
@@ -1699,6 +1722,27 @@ pub async fn problem_report(ctx: tauri::State<'_, Arc<Ctx>>) -> Result<String, S
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// The voice page once locked the settings twice in one expression and
+    /// waited on itself forever, holding them: the next command that read the
+    /// settings stopped the main thread and the whole app.
+    #[test]
+    fn the_voice_page_reads_the_settings_once_and_lets_go() {
+        let config = Arc::new(Mutex::new(mika_core::config::Config::default()));
+        config.lock().assistant.wake_phrase = "Мика".into();
+        config.lock().quick.enabled = false;
+        let reader = config.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(VoicePageConfig::read(&reader));
+        });
+        let read = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reading the settings for the voice page never ended");
+        assert_eq!(read.wake_phrase, "Мика");
+        assert!(!read.quick);
+        assert!(config.try_lock().is_some(), "the settings stay locked");
+    }
 
     #[test]
     fn the_companion_turns_on_only_with_the_screen() {
