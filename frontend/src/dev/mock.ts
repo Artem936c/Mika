@@ -849,7 +849,8 @@ export async function install(scenario: string) {
   const avatarStills = new Map<string, { name: string; png_base64: string }[]>();
   let activeModel = hasModel ? MOCK_MODEL_ID : '';
   const modelChanged = () => emit('mika://ui', { action: 'avatar_model_changed' });
-  let look = { pose: params.get('pose') ?? 'relaxed', scale: 1, frame: params.get('frame') ?? 'full', follow_cursor: true, idle_actions: true, idle_motion: '' };
+  // `&persona=bold` moves her in the manner of that character (decision 0055).
+  let look = { pose: params.get('pose') ?? 'relaxed', scale: 1, frame: params.get('frame') ?? 'full', follow_cursor: true, idle_actions: true, idle_motion: '', persona: params.get('persona') ?? 'caring' };
   // `&window` starts the preview as an ordinary window.
   let windowed = params.has('window');
   const ffmpeg = {
@@ -1325,7 +1326,8 @@ export async function install(scenario: string) {
         case 'get_update_info':
           return {
             current: '0.2.0-pre.1',
-            manifest_url: 'https://example.com/mika-update.json',
+            manifest_url: params.has('own_update') ? 'https://example.com/mika-update.json' : '',
+            default_url: 'https://raw.githubusercontent.com/Artem936c/Mika/main/updates/latest.json',
             check_at_start: true,
             available: params.has('update') ? { version: '0.3.0', notes: 'Перетаскивание островка\nАктивационная фраза' } : null,
           };
@@ -1893,6 +1895,12 @@ export async function install(scenario: string) {
           return null;
         case 'avatar_look':
           return look;
+        case 'poke_avatar': {
+          // The first click as the emotion core answers it for the caring character.
+          const faces: Record<string, string> = { crown: 'joy', face: 'shy', hand: 'joy', other: 'surprise' };
+          const face = faces[String(a.part)] ?? 'joy';
+          return face;
+        }
         case 'avatar_set_look':
           look = { ...(args as { look: typeof look }).look };
           emit('mika://ui', { action: 'avatar_look_changed' });

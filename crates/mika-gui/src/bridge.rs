@@ -81,14 +81,22 @@ pub fn send_message(app: AppHandle, ctx: CtxState<'_>, text: String) {
 
 /// A click on the avatar: the emotion core shows the reaction for a few seconds.
 #[tauri::command]
-pub fn poke_avatar(ctx: CtxState<'_>, part: Option<mika_core::emotion::TouchPart>) {
+pub fn poke_avatar(
+    ctx: CtxState<'_>,
+    part: Option<mika_core::emotion::TouchPart>,
+) -> mika_core::emotion::Emotion {
     static POKES: std::sync::OnceLock<parking_lot::Mutex<mika_core::emotion::Pokes>> =
         std::sync::OnceLock::new();
-    let emotion = POKES
-        .get_or_init(Default::default)
-        .lock()
-        .poke(std::time::Instant::now(), part);
+    // Read on its own: the settings lock is not held under the other one.
+    let persona = ctx.config.lock().assistant.persona;
+    let emotion =
+        POKES
+            .get_or_init(Default::default)
+            .lock()
+            .poke(std::time::Instant::now(), part, persona);
     ctx.bus.publish(mika_core::Event::EmotionCue { emotion });
+    // The page moves her body to the face she makes (decision 0055).
+    emotion
 }
 
 /// The Stop button: a full stop, then the pause until she is addressed

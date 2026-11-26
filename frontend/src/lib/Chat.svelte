@@ -108,7 +108,7 @@
     /** Hide a finished task panel. */
     ontaskhide?: () => void;
     /** A click on the avatar. */
-    onpoke?: (part: import('./model/touch').TouchPart | null) => void;
+    onpoke?: (part: import('./model/touch').TouchPart | null) => Promise<unknown> | void;
     /** Text selected in another program, sent by the shortcut. */
     selection?: Selection | null;
     onselection?: (action: string) => void;

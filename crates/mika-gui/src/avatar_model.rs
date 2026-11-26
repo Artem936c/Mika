@@ -372,10 +372,34 @@ pub fn avatar_motion_play(ctx: CtxState<'_>, id: String) -> Result<(), String> {
     Ok(())
 }
 
-/// How a model looks and moves: pose, size, frame, cursor, idle actions.
+/// The look of the model and the manner of her character (decision 0055).
+#[derive(serde::Serialize)]
+pub struct LookView {
+    #[serde(flatten)]
+    look: mika_core::config::AvatarLook,
+    /// The id of the ready character in force; `custom` for an own one.
+    persona: &'static str,
+}
+
+/// How a model looks and moves: pose, size, frame, cursor, idle actions,
+/// and whose manner she moves in.
 #[tauri::command]
-pub fn avatar_look(ctx: CtxState<'_>) -> mika_core::config::AvatarLook {
-    ctx.config.lock().avatar.look()
+pub fn avatar_look(ctx: CtxState<'_>) -> LookView {
+    let c = ctx.config.lock();
+    LookView {
+        look: c.avatar.look(),
+        persona: manner_of(&c.assistant),
+    }
+}
+
+/// The character whose manner her body takes: an own character, active or
+/// left without one, moves as `custom`.
+pub fn manner_of(a: &mika_core::config::AssistantConfig) -> &'static str {
+    if a.active_persona().is_some() {
+        mika_core::config::Persona::Custom.id()
+    } else {
+        a.persona.id()
+    }
 }
 
 /// Takes the look from the «Персонаж» page; a new size resizes the desktop window.
@@ -487,7 +511,7 @@ pub fn avatar_typing(
 }
 
 /// Tells every window the look of the model changed.
-fn look_changed(app: &AppHandle) {
+pub fn look_changed(app: &AppHandle) {
     let _ = app.emit(
         UI_CHANNEL,
         serde_json::json!({ "action": "avatar_look_changed" }),

@@ -54,7 +54,9 @@ import {
   endCue,
   idleActionPause,
   idleOffset,
+  limitHead,
   nextAutoPose,
+  autoPoseNow,
   saccade,
   sampleTimeline,
   windowLean,
@@ -68,6 +70,7 @@ import { REST_POSES, restPoseOf, type RestPose } from './poses';
 import { RIG_BONES, add, mix, withSign, type RigBone, type RigPose } from './rig';
 import { FULL_STILL, stillName } from './show';
 import { STATE_GAZE, aimAt, angleTo, cursorInterest, pickGaze } from './gaze';
+import { mannerOf, reactionFor, restingEmotion } from './manner';
 import { Probe, REACTION, nearestBone, partOf, type TouchPart } from './touch';
 import { currentPhrase, mouthNow, voice } from './voice.svelte';
 
@@ -97,6 +100,8 @@ export interface SceneInput {
   sentAt?: number;
   /** The rest pose from the settings, or `auto`. */
   pose?: string;
+  /** Whose manner her body takes: the id of the character in force (decision 0055). */
+  persona?: string;
   /** Idle actions now and then. */
   idleActions?: boolean;
   /** The user's animation she loops at rest instead of the rest pose. */
@@ -127,8 +132,8 @@ export interface Scene {
   gesture(kind: Emotion | 'poke'): void;
   /** The part of her under a point of the window; null when the point misses her. */
   touch(clientX: number, clientY: number): TouchPart | null;
-  /** Her body answers a click on `part`. */
-  react(part: TouchPart): void;
+  /** Her body answers a click on `part`, after the face it brought when known. */
+  react(part: TouchPart, emotion?: Emotion): void;
   /** How opaque she is under a point of the window, 0..255, as of the last frame drawn. */
   /** Asks how opaque she is under a point of the window, 0..255; the answer comes after her next frame. */
   probe(clientX: number, clientY: number, answer: (alpha: number) => void): void;
@@ -435,8 +440,10 @@ class LiveScene implements Scene {
     if (this.idle) return { ...FINGERS_AT_EASE, ...this.idle.first };
     const name = this.input.pose ?? 'relaxed';
     if (name !== 'auto') return restPoseOf(name);
-    if (now >= this.autoAt) {
-      this.autoRest = nextAutoPose(this.autoRest, Math.random());
+    const among = mannerOf(this.input.persona).autoPoses;
+    // Another character: a pose she does not take goes at once.
+    if (now >= this.autoAt || autoPoseNow(this.autoRest, among)) {
+      this.autoRest = nextAutoPose(this.autoRest, Math.random(), among);
       this.autoAt = now + autoPosePause(Math.random());
     }
     return REST_POSES[this.autoRest];
@@ -447,13 +454,16 @@ class LiveScene implements Scene {
     const { emotion, still, talking } = this.input;
     const state = bodyState(this.input.state ?? 'idle', this.input.working ?? false);
     this.wantIdle();
+    const manner = mannerOf(this.input.persona);
     let target = mix({ ...ZERO_TRUNK, ...this.restNow(now) }, EMOTION_BODY[emotion], 1);
     if (state) target = mix(target, STATE_BODY[state], 1);
+    // How her character holds her head, over whatever else turns it.
+    target = add(target, { head: manner.carriage }, 1);
     this.body = mix(this.body, target, 1 - Math.exp(-dt / BODY_TAU_MS));
     let pose = this.body;
     if (still) return pose;
     // The idle animation moves on its own; without it, the slow life of the layers.
-    pose = this.idle && !this.restOverride ? add(pose, motionOf(this.idleAt(now, this.idle.ms, this.idle.tracks), this.idle.first), 1) : add(pose, idleOffset(now, this.seed), 1);
+    pose = this.idle && !this.restOverride ? add(pose, motionOf(this.idleAt(now, this.idle.ms, this.idle.tracks), this.idle.first), 1) : add(pose, idleOffset(now, this.seed), manner.sway);
     // Thinking, her finger taps her chin.
     if (state === 'thinking') pose = add(pose, { rightIndexProximal: [0, 0, 16 * Math.max(0, Math.sin(now / 90))] }, 1);
 
@@ -465,10 +475,10 @@ class LiveScene implements Scene {
     }
     // Now and then an idle action, when nothing else goes on.
     if (now >= this.actionAt) {
-      this.actionAt = now + idleActionPause(Math.random());
+      this.actionAt = now + idleActionPause(Math.random()) * manner.actionPause;
       const busy = talking || voice.playing || state !== null || this.moves.length > 0 || this.input.idleActions === false;
       if (!busy) {
-        const names = Object.keys(IDLE_ACTIONS) as IdleAction[];
+        const names = manner.actions.length ? manner.actions : (Object.keys(IDLE_ACTIONS) as IdleAction[]);
         this.moves.push({
           tl: IDLE_ACTIONS[names[Math.floor(Math.random() * names.length)]],
           start: now,
@@ -484,7 +494,7 @@ class LiveScene implements Scene {
     if (this.beat) {
       const ms = now - this.beat.start;
       if (ms > 600) this.beat = null;
-      else pose = add(pose, beatOffset(ms, this.beat.side, speechStrength(emotion)), 1);
+      else pose = add(pose, beatOffset(ms, this.beat.side, speechStrength(emotion) * manner.hands), 1);
     }
     return pose;
   }
@@ -595,7 +605,8 @@ class LiveScene implements Scene {
 
   set(input: SceneInput) {
     const reframe = (input.frame ?? 'full') !== (this.input.frame ?? 'full');
-    this.input = input;
+    // A character with a face of her own wears it while nothing goes on.
+    this.input = { ...input, emotion: restingEmotion(input.emotion, input.state ?? 'idle', mannerOf(input.persona)) };
     if (reframe) this.resize();
   }
 
@@ -628,8 +639,9 @@ class LiveScene implements Scene {
     return partOf(bone, up);
   }
 
-  react(part: TouchPart) {
-    const tl = REACTION[part];
+  react(part: TouchPart, emotion?: Emotion) {
+    // The face the click brought decides how her body answers (decision 0055).
+    const tl = emotion ? reactionFor(part, emotion) : REACTION[part];
     if (tl && !this.input.still) this.moves.push({ tl, start: performance.now() });
   }
 
@@ -941,7 +953,8 @@ class LiveScene implements Scene {
 
   private applyPose(pose: Pose, breathing: number, move: { y: number; roll: number } | null, body: RigPose = this.body) {
     const trunk = trunkPose(pose, breathing, move?.roll ?? 0, this.bones.chest !== undefined);
-    this.applyRig(add(body, trunk, 1));
+    // The layers add up; the head still stops where a person's would.
+    this.applyRig(limitHead(add(body, trunk, 1)));
     const hips = this.bones.hips;
     // The hips stand where they stood: a clip that moved them gives them back.
     if (hips) hips.position.set(this.hipsRestX, this.hipsRest + (move?.y ?? 0) * this.height, this.hipsRestZ);

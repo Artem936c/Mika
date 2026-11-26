@@ -2,7 +2,7 @@
 // (decision 0040). Our own angles, written for a VRM 1.0 rig, left side; the
 // right side is the mirror image. Pure data, no DOM.
 
-import { both, type RigPose } from './rig';
+import { both, mirror, type RigPose } from './rig';
 
 export const REST_POSE_NAMES = ['relaxed', 'clasped', 'behind', 'hip', 'crossed'] as const;
 export type RestPose = (typeof REST_POSE_NAMES)[number];
@@ -74,14 +74,26 @@ const behind = both({
   ...FINGERS_SOFT,
 });
 
-/** Elbows by her sides, forearms across under the chest, each hand tucked at the other elbow. */
-const crossed = both({
-  leftShoulder: [0, 6, -2],
-  leftUpperArm: [0, -75, -68],
-  leftLowerArm: [0, -90, 0],
-  leftHand: [0, -40, 0],
+/**
+ * Forearms across before the chest, each hand tucked at the other elbow. The
+ * elbows come forward of the body (X below zero), or the forearms would pass
+ * through it; the right forearm lies a little lower than the left, so the two
+ * cross instead of running into each other.
+ */
+const crossed: RigPose = {
+  leftShoulder: [0, 4, -2],
+  leftUpperArm: [-26, -82, -72],
+  leftLowerArm: [0, -92, 0],
+  leftHand: [0, -25, 0],
   ...FINGERS_CURL,
-});
+  ...mirror({
+    leftShoulder: [0, 4, -2],
+    leftUpperArm: [-20, -82, -74],
+    leftLowerArm: [0, -98, 0],
+    leftHand: [0, -25, 0],
+    ...FINGERS_CURL,
+  }),
+};
 
 /** Her left hand rests on the side of her waist, the elbow out and back; the right arm hangs at ease. */
 const hip: RigPose = {

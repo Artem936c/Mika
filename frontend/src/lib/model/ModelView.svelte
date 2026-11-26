@@ -149,6 +149,7 @@
       working: live.working,
       sentAt: live.sentAt,
       pose: model.look.pose,
+      persona: model.look.persona,
       idleActions: model.look.idle_actions,
       idleMotion: model.look.idle_motion || null,
       frame: desktop ? 'full' : model.look.frame,

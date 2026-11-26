@@ -45,6 +45,8 @@ export interface Look {
   idle_actions: boolean;
   /** The user's animation she loops at rest; empty: the rest pose. */
   idle_motion: string;
+  /** Whose manner her body takes: the id of the character in force (decision 0055). */
+  persona?: string;
 }
 
 export const DEFAULT_LOOK: Look = {

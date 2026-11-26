@@ -4,7 +4,7 @@
 // VRM 1.0 rig, as in poses.ts. Pure functions, no DOM.
 
 import type { Emotion } from '../avatar';
-import { REST_POSES, REST_POSE_NAMES, type RestPose } from './poses';
+import { FINGERS_CURL, FINGERS_SOFT, REST_POSES, REST_POSE_NAMES, type RestPose } from './poses';
 import { both, mirror, type RigPose } from './rig';
 
 /** A movement played once: poses spread evenly over `ms`; it comes in and goes out softly. */
@@ -59,6 +59,31 @@ export function windowLean(vx: number): number {
   return Math.max(-MAX_WINDOW_LEAN, Math.min(MAX_WINDOW_LEAN, vx / 150)) + 0;
 }
 
+// ---- the head ----
+
+/**
+ * How far her head goes from straight, degrees, whatever adds up: the
+ * emotion, her state, the slow life, the end of a phrase, where she looks.
+ * Each of them alone stays small; together they once tipped her head over.
+ */
+export const HEAD_LIMITS = { down: 18, up: 15, yaw: 32, roll: 12 } as const;
+
+const clampTo = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v)) + 0;
+
+/** `pose` with its head turned no further than `HEAD_LIMITS`. Down and to her left are positive, as on a VRM 1.0 rig. */
+export function limitHead(pose: RigPose): RigPose {
+  const head = pose.head;
+  if (!head) return pose;
+  return {
+    ...pose,
+    head: [
+      clampTo(head[0], -HEAD_LIMITS.up, HEAD_LIMITS.down),
+      clampTo(head[1], -HEAD_LIMITS.yaw, HEAD_LIMITS.yaw),
+      clampTo(head[2], -HEAD_LIMITS.roll, HEAD_LIMITS.roll),
+    ],
+  };
+}
+
 // ---- standing still ----
 
 /** The body follows a new pose in about 400 ms. */
@@ -78,9 +103,14 @@ export const ZERO_TRUNK: RigPose = {
   rightLowerLeg: [0, 0, 0],
 };
 
-/** The next rest pose of `auto`: any of the five but the one she has. `r` in [0, 1). */
-export function nextAutoPose(current: RestPose, r: number): RestPose {
-  const others = REST_POSE_NAMES.filter((n) => n !== current);
+/**
+ * The next rest pose of `auto`: any of `among` but the one she has; the one
+ * she has when there is no other. `among` is all five, or the poses of her
+ * character (decision 0055). `r` in [0, 1).
+ */
+export function nextAutoPose(current: RestPose, r: number, among: readonly RestPose[] = REST_POSE_NAMES): RestPose {
+  const others = among.filter((n) => n !== current);
+  if (others.length === 0) return among[0] ?? current;
   return others[Math.min(others.length - 1, Math.floor(r * others.length))];
 }
 
@@ -105,6 +135,11 @@ export function idleOffset(ms: number, seed: number): RigPose {
     leftLowerLeg: [3 * Math.max(0, -shift), 0, 0],
     rightLowerLeg: [3 * Math.max(0, shift), 0, 0],
   };
+}
+
+/** Whether the `auto` pose changes now: her character does not take the one she has. */
+export function autoPoseNow(current: RestPose, among: readonly RestPose[]): boolean {
+  return among.length > 0 && !among.includes(current);
 }
 
 /** Pause before the next idle action, ms: 20 to 60 seconds. `r` in [0, 1). */
@@ -152,11 +187,13 @@ const stretchUp: RigPose = {
   head: [-8, 0, 0],
 };
 
+/** Her left hand raised before her shoulder, the palm to her; her head turns to it. */
 const handUp: RigPose = {
-  leftUpperArm: [-30, -30, -85],
-  leftLowerArm: [0, -100, 0],
-  leftHand: [-20, 0, -10],
-  head: [15, 15, 0],
+  leftUpperArm: [-40, 10, -74],
+  leftLowerArm: [0, -115, 0],
+  leftHand: [-60, 0, 0],
+  ...FINGERS_SOFT,
+  head: [10, -14, 0],
 };
 
 export const IDLE_ACTIONS: Record<IdleAction, Timeline> = {
@@ -217,11 +254,23 @@ function whole(pose: RigPose): RigPose {
 const wholeAll = <K extends string>(bodies: Record<K, RigPose>): Record<K, RigPose> =>
   Object.fromEntries(Object.entries<RigPose>(bodies).map(([k, v]) => [k, whole(v)])) as Record<K, RigPose>;
 
-/** Her right hand at her chin. */
+/**
+ * Her right hand under her chin. The elbow comes forward (X below zero) and
+ * folds far enough to bring the hand up to the chin, not to the neck or the hair.
+ */
 const chinHand: RigPose = mirror({
-  leftUpperArm: [-30, -45, -72],
-  leftLowerArm: [0, -125, 0],
-  leftHand: [0, 0, 15],
+  leftUpperArm: [-28, -42, -75],
+  leftLowerArm: [0, -142, 0],
+  leftHand: [-5, 0, 18],
+});
+
+/** Both hands held together before her chest, the elbows down by her sides. */
+const handsAtChest: RigPose = both({
+  leftShoulder: [0, 0, 2],
+  leftUpperArm: [-12, -32, -74],
+  leftLowerArm: [0, -112, 0],
+  leftHand: [0, 0, 5],
+  ...FINGERS_CURL,
 });
 
 /** What her body adds to each emotion, over the rest pose. */
@@ -229,24 +278,34 @@ export const EMOTION_BODY: Record<Emotion, RigPose> = wholeAll<Emotion>({
   neutral: {},
   // Joy lifts the shoulders; the arms stay as the rest pose holds them.
   joy: both({ leftShoulder: [0, 0, 4] }),
-  sad: both({
-    leftShoulder: [0, 0, -10],
-    leftUpperArm: [-4, 0, -80],
-    leftLowerArm: [0, -10, 0],
-  }),
+  // The shoulders drop and the hands hang together low before her.
+  sad: {
+    ...both({
+      leftShoulder: [0, 0, -8],
+      leftUpperArm: [-10, -40, -80],
+      leftLowerArm: [0, -40, 0],
+      leftHand: [10, 0, -8],
+      ...FINGERS_CURL,
+    }),
+    spine: [3, 0, 0],
+  },
   angry: armsOf(REST_POSES.crossed),
   shy: { ...armsOf(REST_POSES.clasped), spine: [0, 8, 0] },
   think: chinHand,
+  // The hands fly up beside the shoulders, apart, the palms forward.
   surprise: {
-    ...both({ leftUpperArm: [-15, 0, -55], leftLowerArm: [0, -40, 0] }),
+    ...both({
+      leftShoulder: [0, 0, 6],
+      leftUpperArm: [-12, 15, -74],
+      leftLowerArm: [0, -105, 0],
+      leftHand: [0, 0, -10],
+      ...FINGERS_SOFT,
+    }),
     spine: [-4, 0, 0],
   },
   sleepy: both({ leftShoulder: [0, 0, -6] }),
-  worry: both({
-    leftUpperArm: [-25, -50, -80],
-    leftLowerArm: [0, -120, 0],
-    leftHand: [0, 0, -10],
-  }),
+  // The hands clutched together at her chest, the shoulders drawn in.
+  worry: { ...handsAtChest, ...both({ leftShoulder: [0, 0, 4] }) },
   wink: armsOf(REST_POSES.hip),
 });
 
@@ -255,7 +314,8 @@ export type BodyState = (typeof BODY_STATES)[number];
 
 /** Her body while she is busy with something. */
 export const STATE_BODY: Record<BodyState, RigPose> = wholeAll<BodyState>({
-  thinking: { ...chinHand, head: [-6, -10, 6] },
+  // The emotion of thinking tilts the head as well: a small turn here, so the two do not add up to a crick.
+  thinking: { ...chinHand, head: [-5, -6, 4] },
   working: {
     ...both({
       leftUpperArm: [-25, -10, -78],
@@ -266,13 +326,9 @@ export const STATE_BODY: Record<BodyState, RigPose> = wholeAll<BodyState>({
   },
   confirm: { ...armsOf(REST_POSES.clasped), head: [0, 0, -9] },
   listening: {
-    ...mirror({
-      leftUpperArm: [-25, -30, -30],
-      leftLowerArm: [0, -140, 0],
-      leftHand: [0, 0, 20],
-    }),
-    spine: [6, 0, 0],
-    head: [0, 0, 8],
+    ...handsAtChest,
+    spine: [4, 0, 0],
+    head: [3, 0, 6],
   },
 });
 
@@ -339,7 +395,7 @@ export const END_CUES: Record<'nod' | 'tilt', Timeline> = {
     ms: 600,
     keys: [{ head: [0, 0, 0] }, { head: [9, 0, 0] }, { head: [0, 0, 0] }],
   },
-  tilt: { ms: 900, keys: [{ head: [0, 0, 9] }, { head: [-3, 0, 10] }] },
+  tilt: { ms: 900, keys: [{ head: [0, 0, 6] }, { head: [-3, 0, 7] }] },
 };
 
 // ---- gestures ----
@@ -355,10 +411,22 @@ const waveArm = (side: number): RigPose =>
     leftHand: [0, 0, side],
   });
 
-/** Both hands in front of her chest, `open` degrees apart at the elbows. */
+/** The shoulders up, the elbows by her sides, the forearms out and the palms up. */
+const shrugArms = (shoulders: number): RigPose => ({
+  ...both({
+    leftShoulder: [0, 0, shoulders],
+    leftUpperArm: [-8, 40, -78],
+    leftLowerArm: [0, -85, 0],
+    leftHand: [-30, 0, 10],
+    ...FINGERS_SOFT,
+  }),
+  head: [0, 0, 8],
+});
+
+/** Both hands before her chest, palm to palm, `open` degrees apart at the elbows. */
 const clapArms = (open: number): RigPose =>
   both({
-    leftUpperArm: [-35, -50 + open, -75],
+    leftUpperArm: [-22, -26 + open, -74],
     leftLowerArm: [0, -100 + open, 0],
     leftHand: [0, 0, 0],
   });
@@ -385,15 +453,29 @@ const peaceHand: RigPose = mirror({
   leftThumbDistal: [0, 0, -30],
 });
 
-/** One beat of her dance: the hips to one side, the arms up on the other. */
+/** A fist raised beside her head. */
+const danceUp: RigPose = {
+  leftUpperArm: [0, -30, -40],
+  leftLowerArm: [-90, -120, 0],
+  leftHand: [0, 0, 0],
+  ...FINGERS_CURL,
+};
+
+/** A fist before her chest, the elbow down. */
+const danceChest: RigPose = {
+  leftUpperArm: [-22, -20, -74],
+  leftLowerArm: [0, -100, 0],
+  leftHand: [0, 0, 0],
+  ...FINGERS_CURL,
+};
+
+/** One beat of her dance: the hips to one side, one fist up by her head and the other at her chest. */
 const danceBeat = (side: 1 | -1): RigPose => ({
   hips: [0, 8 * side, 6 * side],
   spine: [0, -4 * side, -5 * side],
   head: [0, 6 * side, 6 * side],
-  ...both({
-    leftUpperArm: [-20, 0, side > 0 ? -20 : -60],
-    leftLowerArm: [0, side > 0 ? -90 : -40, 0],
-  }),
+  ...(side > 0 ? danceUp : danceChest),
+  ...mirror(side > 0 ? danceChest : danceUp),
 });
 
 /** Her own gestures, played once when asked (the `avatar_gesture` tool). */
@@ -427,28 +509,10 @@ export const GESTURES: Record<GestureName, Timeline> = {
     ms: 1300,
     keys: [{ head: [0, 0, 0] }, { head: [0, 16, 0] }, { head: [0, -16, 0] }, { head: [0, 14, 0] }, { head: [0, 0, 0] }],
   },
+  // The elbows stay by her sides; the forearms open outwards, the palms up.
   shrug: {
     ms: 1500,
-    keys: [
-      {
-        ...both({
-          leftShoulder: [0, 0, 12],
-          leftUpperArm: [-10, 0, -62],
-          leftLowerArm: [-60, -60, 0],
-          leftHand: [0, 0, 20],
-        }),
-        head: [0, 0, 8],
-      },
-      {
-        ...both({
-          leftShoulder: [0, 0, 14],
-          leftUpperArm: [-10, 0, -60],
-          leftLowerArm: [-60, -62, 0],
-          leftHand: [0, 0, 20],
-        }),
-        head: [0, 0, 9],
-      },
-    ],
+    keys: [shrugArms(12), shrugArms(14)],
   },
   clap: {
     ms: 1600,

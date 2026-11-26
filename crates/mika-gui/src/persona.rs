@@ -59,6 +59,8 @@ fn change(
     ctx.save_config()?;
     ctx.refresh_prompt();
     crate::bridge::settings_changed(app);
+    // Her body takes the manner of the new character (decision 0055).
+    crate::avatar_model::look_changed(app);
     Ok(view)
 }
 

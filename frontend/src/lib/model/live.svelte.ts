@@ -4,6 +4,7 @@
 
 import { listen } from '@tauri-apps/api/event';
 import { isAssistantState, type AssistantState } from '../island';
+import type { Emotion } from '../avatar';
 import type { Scene } from './scene';
 import type { TouchPart } from './touch';
 
@@ -99,9 +100,9 @@ export function locate(clientX: number, clientY: number): TouchPart | null {
   return shown?.touch(clientX, clientY) ?? null;
 }
 
-/** Her body answers a click on `part`. */
-export function react(part: TouchPart) {
-  shown?.react(part);
+/** Her body answers a click on `part`, after the face the click brought when known. */
+export function react(part: TouchPart, emotion?: Emotion) {
+  shown?.react(part, emotion);
 }
 
 /** Asks how opaque the living model is under a point; false without one. The answer comes after her next frame. */

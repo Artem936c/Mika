@@ -12,6 +12,7 @@
     frameUrl,
     gesturePause,
     idleGesture,
+    isEmotion,
     nextMouth,
     type AvatarView,
     type Emotion,
@@ -42,7 +43,8 @@
     /** Round chip of this diameter, px. Without it the avatar fills its parent's width. */
     size?: number;
     /** A click on her, with the part of a living model it hit; without it she is not clickable. */
-    onpoke?: (part: TouchPart | null) => void;
+    /** The face the click brought, when the program tells it: her body follows it. */
+    onpoke?: (part: TouchPart | null) => Promise<unknown> | void;
   } = $props();
 
   // The built-in pictures, a picture of the chosen model, or the model itself.
@@ -143,10 +145,16 @@
     e.stopPropagation();
     play(POKE_MOTION);
     const part = show === 'live' ? locate(e.clientX, e.clientY) : null;
-    // A part with a movement of its own answers with it; the rest hops as before.
-    if (part && part !== 'other') react(part);
-    else pokes += 1;
-    onpoke(part);
+    const asked = onpoke(part);
+    if (!part) {
+      // The pictures and a click past her hop as before.
+      pokes += 1;
+      return;
+    }
+    // Her body answers the face the click brought (decision 0055).
+    Promise.resolve(asked)
+      .then((face) => react(part, isEmotion(face) ? face : undefined))
+      .catch(() => react(part));
   }
 
   // In the head chip the frame is enlarged and shifted so the face fills the circle.

@@ -16,11 +16,14 @@ import {
   idleActionPause,
   idleOffset,
   nextAutoPose,
+  autoPoseNow,
   saccade,
   twiceBlink,
   sampleTimeline,
   speechStrength,
   ZERO_TRUNK,
+  HEAD_LIMITS,
+  limitHead,
   type Timeline,
   windowLean,
 } from './body';
@@ -131,6 +134,18 @@ describe('the body over time', () => {
     expect(nextAutoPose('crossed', 0)).not.toBe('crossed');
   });
 
+  it('changes the auto pose among the poses of her character', () => {
+    for (const r of [0, 0.5, 0.99]) expect(nextAutoPose('relaxed', r, ['hip', 'crossed'])).toMatch(/^(hip|crossed)$/);
+    expect(nextAutoPose('hip', 0.3, ['hip', 'crossed'])).toBe('crossed');
+    // Only one pose to take: she keeps it.
+    expect(nextAutoPose('hip', 0.3, ['hip'])).toBe('hip');
+  });
+
+  it('leaves a pose her new character does not take at once, and keeps one it does', () => {
+    expect(autoPoseNow('relaxed', ['hip', 'crossed'])).toBe(true);
+    expect(autoPoseNow('hip', ['hip', 'crossed'])).toBe(false);
+  });
+
   it('keeps every bone of the trunk, so a pose that leaves goes back to rest', () => {
     for (const bone of ['hips', 'spine', 'chest', 'neck', 'head'] as const) expect(ZERO_TRUNK[bone]).toEqual([0, 0, 0]);
     expect(BODY_TAU_MS).toBeGreaterThan(100);
@@ -231,5 +246,35 @@ describe('an arm is moved whole', () => {
   it('joy keeps the arms of the rest pose and only lifts the shoulders', () => {
     expect(EMOTION_BODY.joy.leftUpperArm).toBeUndefined();
     expect(EMOTION_BODY.joy.leftShoulder![2]).toBeGreaterThan(0);
+  });
+
+  it('thinking puts her hand under the chin, not at the neck: the elbow is folded more', () => {
+    expect(STATE_BODY.thinking.rightLowerArm![1]).toBeGreaterThanOrEqual(135);
+    expect(EMOTION_BODY.think.rightLowerArm![1]).toBeGreaterThanOrEqual(135);
+  });
+
+  it('listening keeps the elbows down by her sides instead of sticking one out', () => {
+    expect(STATE_BODY.listening.leftUpperArm![2]).toBeLessThanOrEqual(-65);
+    expect(STATE_BODY.listening.rightUpperArm![2]).toBeGreaterThanOrEqual(65);
+  });
+});
+
+describe('the head', () => {
+  it('turns and tilts no further than a person would, whatever adds up', () => {
+    const pose = limitHead({ head: [40, -60, 30], spine: [5, 0, 0] });
+    expect(pose.head).toEqual([HEAD_LIMITS.down, -HEAD_LIMITS.yaw, HEAD_LIMITS.roll]);
+    expect(pose.spine).toEqual([5, 0, 0]);
+    expect(limitHead({ head: [-40, 60, -30] }).head).toEqual([-HEAD_LIMITS.up, HEAD_LIMITS.yaw, -HEAD_LIMITS.roll]);
+  });
+
+  it('leaves a head within the limits as it is', () => {
+    expect(limitHead({ head: [5, 10, -4] }).head).toEqual([5, 10, -4]);
+    expect(limitHead({ spine: [1, 2, 3] })).toEqual({ spine: [1, 2, 3] });
+  });
+
+  it('lets her look round and shake her head in full', () => {
+    for (const key of [...IDLE_ACTIONS.look_around.keys, ...GESTURES.shake_head.keys]) {
+      expect(Math.abs(key.head![1])).toBeLessThanOrEqual(HEAD_LIMITS.yaw);
+    }
   });
 });

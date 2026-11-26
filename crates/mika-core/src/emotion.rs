@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::broadcast::Receiver;
 
+use crate::config::Persona;
 use crate::events::{Event, EventBus};
 use crate::state::AssistantState;
 use crate::tools::RiskLevel;
@@ -168,19 +169,49 @@ pub struct Pokes {
 }
 
 impl Pokes {
-    /// The reaction to a click at `now` on `part` of her. The first two
-    /// clicks of a series answer the part; from the third the series decides.
-    pub fn poke(&mut self, now: Instant, part: Option<TouchPart>) -> Emotion {
+    /// The reaction to a click at `now` on `part` of her, in the manner of her
+    /// character (decision 0055). The first two clicks of a series answer the
+    /// part; from the third the series decides, the same for every character.
+    pub fn poke(&mut self, now: Instant, part: Option<TouchPart>, persona: Persona) -> Emotion {
         let n = match self.last {
             Some((t, n)) if now.duration_since(t) < POKE_SERIES => n + 1,
             _ => 1,
         };
         self.last = Some((now, n));
         match part {
-            Some(TouchPart::Crown | TouchPart::Hand) if n <= 2 => Emotion::Joy,
-            Some(TouchPart::Face) if n <= 2 => Emotion::Shy,
+            Some(part) if n <= 2 => touch_face(part, persona),
             _ => poke_reaction(n),
         }
+    }
+}
+
+/// Her face for a click on `part`, by her character. An own character
+/// answers as the caring one. A click on her body never pleases her: she
+/// startles, and the bold one is cross at once.
+pub fn touch_face(part: TouchPart, persona: Persona) -> Emotion {
+    use Emotion::*;
+    use Persona as P;
+    let persona = if persona == P::Custom {
+        P::Caring
+    } else {
+        persona
+    };
+    match (part, persona) {
+        (TouchPart::Crown, P::Bold | P::Business) => Shy,
+        (TouchPart::Crown, P::Sarcastic) => Wink,
+        (TouchPart::Crown, P::Sleepy) => Sleepy,
+        (TouchPart::Crown, _) => Joy,
+        (TouchPart::Face, P::Cheerful) => Joy,
+        (TouchPart::Face, P::Bold) => Angry,
+        (TouchPart::Face, P::Business) => Surprise,
+        (TouchPart::Face, P::Sarcastic) => Wink,
+        (TouchPart::Face, P::Sleepy) => Sleepy,
+        (TouchPart::Face, _) => Shy,
+        (TouchPart::Hand, P::Bold | P::Sarcastic) => Wink,
+        (TouchPart::Hand, P::Sleepy) => Sleepy,
+        (TouchPart::Hand, _) => Joy,
+        (TouchPart::Other, P::Bold) => Angry,
+        (TouchPart::Other, _) => Surprise,
     }
 }
 
@@ -381,7 +412,9 @@ mod tests {
         let t = Instant::now();
         let mut p = Pokes::default();
         let s = Duration::from_secs(1);
-        let faces: Vec<Emotion> = (0..6).map(|i| p.poke(t + s * i, None)).collect();
+        let faces: Vec<Emotion> = (0..6)
+            .map(|i| p.poke(t + s * i, None, Persona::Caring))
+            .collect();
         assert_eq!(
             faces,
             [
@@ -393,7 +426,10 @@ mod tests {
                 Emotion::Angry
             ]
         );
-        assert_eq!(p.poke(t + s * 5 + POKE_SERIES, None), Emotion::Joy);
+        assert_eq!(
+            p.poke(t + s * 5 + POKE_SERIES, None, Persona::Caring),
+            Emotion::Joy
+        );
     }
 
     #[test]
@@ -401,18 +437,84 @@ mod tests {
         let t = Instant::now();
         let s = Duration::from_secs(1);
         let mut p = Pokes::default();
-        assert_eq!(p.poke(t, Some(TouchPart::Face)), Emotion::Shy);
-        assert_eq!(p.poke(t + s, Some(TouchPart::Crown)), Emotion::Joy);
+        assert_eq!(
+            p.poke(t, Some(TouchPart::Face), Persona::Caring),
+            Emotion::Shy
+        );
+        assert_eq!(
+            p.poke(t + s, Some(TouchPart::Crown), Persona::Caring),
+            Emotion::Joy
+        );
         // From the third click of a series the series decides, whatever the part.
-        assert_eq!(p.poke(t + s * 2, Some(TouchPart::Crown)), Emotion::Wink);
-        assert_eq!(p.poke(t + s * 3, Some(TouchPart::Face)), Emotion::Surprise);
-        assert_eq!(p.poke(t + s * 4, Some(TouchPart::Hand)), Emotion::Angry);
+        assert_eq!(
+            p.poke(t + s * 2, Some(TouchPart::Crown), Persona::Caring),
+            Emotion::Wink
+        );
+        assert_eq!(
+            p.poke(t + s * 3, Some(TouchPart::Face), Persona::Caring),
+            Emotion::Surprise
+        );
+        assert_eq!(
+            p.poke(t + s * 4, Some(TouchPart::Hand), Persona::Caring),
+            Emotion::Angry
+        );
 
         let mut p = Pokes::default();
-        assert_eq!(p.poke(t, Some(TouchPart::Hand)), Emotion::Joy);
+        assert_eq!(
+            p.poke(t, Some(TouchPart::Hand), Persona::Caring),
+            Emotion::Joy
+        );
+    }
+
+    #[test]
+    fn a_click_on_her_body_startles_her_rather_than_pleases() {
+        let t = Instant::now();
+        let s = Duration::from_secs(1);
         let mut p = Pokes::default();
-        assert_eq!(p.poke(t, Some(TouchPart::Other)), Emotion::Joy);
-        assert_eq!(p.poke(t + s, Some(TouchPart::Other)), Emotion::Shy);
+        assert_eq!(
+            p.poke(t, Some(TouchPart::Other), Persona::Caring),
+            Emotion::Surprise
+        );
+        assert_eq!(
+            p.poke(t + s, Some(TouchPart::Other), Persona::Caring),
+            Emotion::Surprise
+        );
+        let mut p = Pokes::default();
+        assert_eq!(
+            p.poke(t, Some(TouchPart::Other), Persona::Bold),
+            Emotion::Angry
+        );
+    }
+
+    #[test]
+    fn each_character_answers_a_click_in_her_own_way() {
+        let t = Instant::now();
+        let first = |part, persona| Pokes::default().poke(t, Some(part), persona);
+        assert_eq!(first(TouchPart::Crown, Persona::Bold), Emotion::Shy);
+        assert_eq!(first(TouchPart::Crown, Persona::Sarcastic), Emotion::Wink);
+        assert_eq!(first(TouchPart::Crown, Persona::Sleepy), Emotion::Sleepy);
+        assert_eq!(first(TouchPart::Face, Persona::Cheerful), Emotion::Joy);
+        assert_eq!(first(TouchPart::Face, Persona::Bold), Emotion::Angry);
+        assert_eq!(first(TouchPart::Face, Persona::Business), Emotion::Surprise);
+        assert_eq!(first(TouchPart::Hand, Persona::Sarcastic), Emotion::Wink);
+        // An own character answers as the caring one.
+        assert_eq!(
+            first(TouchPart::Face, Persona::Custom),
+            first(TouchPart::Face, Persona::Caring)
+        );
+    }
+
+    #[test]
+    fn every_character_ends_a_long_series_cross() {
+        let t = Instant::now();
+        let s = Duration::from_secs(1);
+        for persona in Persona::READY {
+            let mut p = Pokes::default();
+            let last = (0..5)
+                .map(|i| p.poke(t + s * i, Some(TouchPart::Crown), persona))
+                .last();
+            assert_eq!(last, Some(Emotion::Angry), "{persona:?}");
+        }
     }
 
     #[test]

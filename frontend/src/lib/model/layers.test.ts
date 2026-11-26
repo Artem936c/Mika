@@ -153,8 +153,8 @@ describe('emotion', () => {
     expect(slotPose('sad').pitch).toBeGreaterThan(0);
     expect(slotPose('think')).toEqual({
       pitch: -6,
-      yaw: -12,
-      roll: 8,
+      yaw: -10,
+      roll: 6,
       spine: 0,
     });
   });

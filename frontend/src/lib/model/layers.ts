@@ -128,9 +128,9 @@ const POSES: Record<Emotion, Pose> = {
   angry: { pitch: 6, yaw: 0, roll: 0, spine: 3 },
   sad: { pitch: 12, yaw: 0, roll: 0, spine: 4 },
   shy: { pitch: 8, yaw: 12, roll: -6, spine: 0 },
-  think: { pitch: -6, yaw: -12, roll: 8, spine: 0 },
+  think: { pitch: -6, yaw: -10, roll: 6, spine: 0 },
   wink: { pitch: 0, yaw: 0, roll: 8, spine: 0 },
-  sleepy: { pitch: 14, yaw: 0, roll: 4, spine: 2 },
+  sleepy: { pitch: 9, yaw: 0, roll: 4, spine: 2 },
   worry: { pitch: 4, yaw: 6, roll: 0, spine: 1 },
 };
 

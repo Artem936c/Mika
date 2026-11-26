@@ -21,7 +21,18 @@ describe('rest poses', () => {
     }
   });
 
-  it.each(REST_POSE_NAMES.filter((n) => n !== 'hip'))('%s is the same on both sides', (name) => {
+  it('crossed brings the elbows in front of her, so the forearms cross before the chest and not through it', () => {
+    expect(REST_POSES.crossed.leftUpperArm![0]).toBeLessThanOrEqual(-15);
+    expect(REST_POSES.crossed.rightUpperArm![0]).toBeLessThanOrEqual(-15);
+  });
+
+  it('crossed lays one forearm over the other instead of through it', () => {
+    const left = REST_POSES.crossed.leftUpperArm!;
+    const right = mirror({ rightUpperArm: REST_POSES.crossed.rightUpperArm! }).leftUpperArm!;
+    expect(left).not.toEqual(right);
+  });
+
+  it.each(REST_POSE_NAMES.filter((n) => n !== 'hip' && n !== 'crossed'))('%s is the same on both sides', (name) => {
     const pose = REST_POSES[name];
     const seen = mirror(pose);
     for (const bone of Object.keys(pose) as RigBone[]) {

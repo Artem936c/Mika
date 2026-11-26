@@ -121,8 +121,14 @@
     if (!pressed) return;
     pressed = null;
     const part = locate(e.clientX, e.clientY);
-    if (part && part !== 'other') react(part);
-    invoke('poke_avatar', { part }).catch(() => {});
+    // The emotion core picks her face by her character; her body follows that face (decision 0055).
+    invoke<Emotion>('poke_avatar', { part })
+      .then((face) => {
+        if (part) react(part, isEmotion(face) ? face : undefined);
+      })
+      .catch(() => {
+        if (part && part !== 'other') react(part);
+      });
   }
 
   /** When the size last stepped under the wheel: a touchpad sends a flood. */

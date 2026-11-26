@@ -494,7 +494,7 @@
     }}
     onswitched={showConversation}
     ontaskhide={() => (task = null)}
-    onpoke={(part) => invoke('poke_avatar', { part })}
+    onpoke={(part) => invoke<string>('poke_avatar', { part })}
     onspeak={setSpeak}
     onscreen={setScreen}
     onmic={setMic}
