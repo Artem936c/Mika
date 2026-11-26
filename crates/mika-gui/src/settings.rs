@@ -1647,6 +1647,8 @@ pub fn finish_onboarding(app: AppHandle, ctx: CtxState<'_>) -> Result<(), String
 pub struct UpdateView {
     current: &'static str,
     manifest_url: String,
+    /// What an empty address means: the page shows it as the hint.
+    default_url: &'static str,
     check_at_start: bool,
     available: Option<crate::update::Manifest>,
 }
@@ -1657,6 +1659,7 @@ pub fn get_update_info(ctx: CtxState<'_>) -> UpdateView {
     UpdateView {
         current: env!("CARGO_PKG_VERSION"),
         manifest_url: c.manifest_url,
+        default_url: mika_core::config::DEFAULT_MANIFEST_URL,
         check_at_start: c.check_at_start,
         available: ctx.update.lock().clone(),
     }

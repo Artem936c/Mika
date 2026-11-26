@@ -584,14 +584,30 @@ impl BriefingConfig {
     }
 }
 
-/// Where to look for new versions. Nothing is checked while `manifest_url` is empty.
+/// The update file of the project on GitHub, which every release points at
+/// its installer: every copy looks there unless the user gives another address.
+pub const DEFAULT_MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/Artem936c/Mika/main/updates/latest.json";
+
+/// Where to look for new versions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UpdatesConfig {
-    /// https address of a JSON file: version, installer address, SHA-256, notes.
+    /// https address of a JSON file: version, installer address, SHA-256,
+    /// notes. Empty: `DEFAULT_MANIFEST_URL`.
     pub manifest_url: String,
     /// Look for a new version at start. Download and install only after a click.
     pub check_at_start: bool,
+}
+
+impl UpdatesConfig {
+    /// The address looked at: the user's own, else the project's releases.
+    pub fn effective_manifest_url(&self) -> &str {
+        match self.manifest_url.trim() {
+            "" => DEFAULT_MANIFEST_URL,
+            own => own,
+        }
+    }
 }
 
 impl Default for UpdatesConfig {
@@ -1318,6 +1334,22 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_update_address_means_the_releases_of_the_project() {
+        let fresh = UpdatesConfig::default();
+        assert_eq!(fresh.effective_manifest_url(), DEFAULT_MANIFEST_URL);
+        assert!(DEFAULT_MANIFEST_URL.starts_with("https://"));
+        assert!(DEFAULT_MANIFEST_URL.ends_with("/updates/latest.json"));
+        // A copy installed before kept an empty address: it now looks there too.
+        let old: UpdatesConfig = toml::from_str("manifest_url = \"  \"").unwrap();
+        assert_eq!(old.effective_manifest_url(), DEFAULT_MANIFEST_URL);
+        let own = UpdatesConfig {
+            manifest_url: " https://example.org/m.json ".into(),
+            check_at_start: true,
+        };
+        assert_eq!(own.effective_manifest_url(), "https://example.org/m.json");
+    }
 
     #[test]
     fn the_wake_engine_falls_back_to_what_is_downloaded() {

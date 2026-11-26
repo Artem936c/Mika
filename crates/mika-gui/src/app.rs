@@ -1321,13 +1321,15 @@ impl Ctx {
         report
     }
 
-    /// Looks for a newer version if an update address is set. Never downloads.
+    /// Looks for a newer version at the user's address, else at the
+    /// project's releases. Never downloads.
     pub async fn check_update(&self) -> Result<Option<crate::update::Manifest>, String> {
-        let url = self.config.lock().updates.manifest_url.clone();
-        if url.trim().is_empty() {
-            *self.update.lock() = None;
-            return Ok(None);
-        }
+        let url = self
+            .config
+            .lock()
+            .updates
+            .effective_manifest_url()
+            .to_string();
         let found = crate::update::check(&url).await?;
         *self.update.lock() = found.clone();
         Ok(found)

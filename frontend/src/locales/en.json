@@ -1237,7 +1237,7 @@
   "welcome.next": "Next",
   "welcome.done": "Done",
   "welcome.skip": "Skip",
-  "general.update_sub": "The current version is {version}. Updates are looked for at the address of a file that describes the version. Download and install happen only by the button.",
+  "general.update_sub": "The current version is {version}. Updates are looked for in Mika's releases on GitHub, or at your own address of a file that describes the version. Download and install happen only by the button.",
   "general.update_at_start": "Check at startup",
   "general.update_check": "Check",
   "general.update_none": "You have the latest version.",

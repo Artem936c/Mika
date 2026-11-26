@@ -101,13 +101,13 @@ An inexpensive set on [RouterAI](https://routerai.ru) (`https://routerai.ru/api/
 
 OpenAI, Anthropic, Ollama and any OpenAI-compatible server work too.
 
-**Updates from the app.** On the General page enter:
+**Updates from the app.** Mika looks for updates at
 
 ```
 https://raw.githubusercontent.com/Artem936c/Mika/main/updates/latest.json
 ```
 
-The installer is downloaded only when you press the button and installed only if its checksum matches. `updates/latest.json` in this repository always points to the latest release.
+There is nothing to enter: an empty field on the General page means this address, and your own address can be set there. The installer is downloaded only when you press the button and installed only if its checksum matches. `updates/latest.json` in this repository always points to the latest release.
 
 ## Building from source
 

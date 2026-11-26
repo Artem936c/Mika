@@ -26,6 +26,8 @@
   interface UpdateInfo {
     current: string;
     manifest_url: string;
+    /// What an empty address means: the project's releases.
+    default_url?: string;
     check_at_start: boolean;
     available: { version: string; notes: string } | null;
   }
@@ -157,12 +159,12 @@
   {#if upd}
     <div class="report">
       <p>{t('general.update_sub', { version: upd.current })}</p>
-      <input class="fld" bind:value={upd.manifest_url} placeholder="https://…/mika-update.json" spellcheck="false" />
+      <input class="fld" bind:value={upd.manifest_url} placeholder={upd.default_url ?? 'https://…/mika-update.json'} spellcheck="false" />
       <label class="chk">
         <input type="checkbox" bind:checked={upd.check_at_start} onchange={saveUpdate} />{t('general.update_at_start')}
       </label>
       <div class="acts">
-        <button class="bt" onclick={checkUpdate} disabled={updBusy || !upd.manifest_url.trim()}>{t('general.update_check')}</button>
+        <button class="bt" onclick={checkUpdate} disabled={updBusy}>{t('general.update_check')}</button>
         {#if upd.available}
           <button class="bt pri" onclick={installUpdate} disabled={updBusy}>
             {t(sureInstall ? 'general.update_sure' : 'general.update_install', { version: upd.available.version })}
