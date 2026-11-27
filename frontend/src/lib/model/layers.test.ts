@@ -18,6 +18,7 @@ import {
   shouldRender,
   slotPose,
   slotWeights,
+  speakingFace,
   trunkPose,
   type Profile,
   type Slot,
@@ -85,11 +86,37 @@ describe('lips', () => {
     expect(nextVowel(null, 0.999999)).not.toBeUndefined();
   });
 
-  it('lips are quieter under an emotion', () => {
+  it('lips are a little quieter under an emotion', () => {
     expect(lipGain(profile(1), 'neutral')).toBe(1);
-    expect(lipGain(profile(1), 'joy')).toBeCloseTo(0.6);
+    expect(lipGain(profile(1), 'joy')).toBeCloseTo(0.8);
     expect(lipGain(profile(1.5), 'neutral')).toBe(1.5);
     expect(lipGain(profile(0), 'sad')).toBe(0);
+  });
+});
+
+describe('the face while she speaks', () => {
+  const face = (mix: [string, number][]) => new Map(mix);
+
+  it('keeps the face as it is while she is silent', () => {
+    expect(speakingFace(face([['happy', 1]]), false)).toEqual(face([['happy', 1]]));
+  });
+
+  it('softens the emotion so its open mouth does not fight the lips', () => {
+    const out = speakingFace(face([['happy', 1]]), true);
+    expect(out.get('happy')).toBeCloseTo(0.35);
+  });
+
+  it('keeps closed eyes closed: a wink stays a wink', () => {
+    const out = speakingFace(
+      face([
+        ['blinkLeft', 1],
+        ['happy', 0.5],
+      ]),
+      true,
+    );
+    expect(out.get('blinkLeft')).toBe(1);
+    expect(out.get('happy')).toBeCloseTo(0.175);
+    expect(speakingFace(face([['blink', 0.6]]), true).get('blink')).toBe(0.6);
   });
 });
 

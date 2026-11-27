@@ -1,7 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
-  import { noteTyping } from './model/live.svelte';
   import { talkingNow } from './model/voice.svelte';
   import { tick } from 'svelte';
   import Avatar from './Avatar.svelte';
@@ -123,20 +122,6 @@
     draft?: string;
   } = $props();
 
-  /** When the desktop avatar was last told the user types, ms. */
-  let typingToldAt = 0;
-
-  /** The user types: a model looks at the field; the one on the desktop looks at the island. */
-  function ontyping() {
-    if (!input) return;
-    const box = input.getBoundingClientRect();
-    noteTyping(box.left + box.width / 2, box.top + box.height / 2);
-    const now = performance.now();
-    if (now - typingToldAt >= 500) {
-      typingToldAt = now;
-      invoke('avatar_typing').catch(() => {});
-    }
-  }
   let list: HTMLDivElement | undefined = $state();
   /** The list of conversations slides over the chat. */
   let conversations = $state(false);
@@ -476,7 +461,6 @@
       <textarea
         bind:this={input}
         bind:value={draft}
-        oninput={ontyping}
         onkeydown={onkey}
         onpaste={onpaste}
         rows="1"

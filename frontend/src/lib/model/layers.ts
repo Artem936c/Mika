@@ -61,9 +61,26 @@ export function nextVowel(prev: Vowel | null, r: number): Vowel | null {
   return shapes[Math.min(shapes.length - 1, Math.max(0, Math.floor(r * shapes.length)))];
 }
 
-/** Lip gain: the profile strength, times 0.6 under any emotion but the calm one. */
+/** Lip gain: the profile strength, times 0.8 under any emotion but the calm one. */
 export function lipGain(profile: Profile, emotion: Emotion): number {
-  return profile.lip * (emotion === 'neutral' ? 1 : 0.6);
+  return profile.lip * (emotion === 'neutral' ? 1 : 0.8);
+}
+
+/** The share of an emotion she keeps while her lips move (decision 0057). */
+export const SPEAKING_SHARE = 0.35;
+const EYELIDS: ReadonlySet<string> = new Set(['blink', 'blinkLeft', 'blinkRight']);
+
+/**
+ * Her face while she speaks: the expressions of an emotion often open the
+ * mouth (a wide smile, a cry), and the lips on top of them make a twisted
+ * mouth. So the emotion softens to a share while the lips move; closed
+ * eyes stay closed, so a wink stays a wink.
+ */
+export function speakingFace(weights: ReadonlyMap<string, number>, speaking: boolean): Map<string, number> {
+  if (!speaking) return new Map(weights);
+  const out = new Map<string, number>();
+  for (const [name, weight] of weights) out.set(name, EYELIDS.has(name) ? weight : weight * SPEAKING_SHARE);
+  return out;
 }
 
 /** One step of exponential smoothing towards `target`. */

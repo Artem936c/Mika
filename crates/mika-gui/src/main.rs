@@ -257,7 +257,6 @@ fn main() {
             avatar_model::avatar_hover,
             avatar_model::avatar_dragging,
             avatar_model::avatar_cursor_wanted,
-            avatar_model::avatar_typing,
             avatar_model::avatar_look,
             avatar_model::avatar_set_look,
             avatar_model::avatar_scale_step,

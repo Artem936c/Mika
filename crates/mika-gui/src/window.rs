@@ -248,8 +248,6 @@ pub fn resize_desktop_avatar(app: &tauri::AppHandle, avatar_scale: f32) -> tauri
     Ok(())
 }
 
-/// The page of the island asked for the cursor: a model there looks at it.
-pub static CURSOR_ISLAND: AtomicBool = AtomicBool::new(false);
 /// The page of the desktop avatar asked for the cursor.
 pub static CURSOR_AVATAR: AtomicBool = AtomicBool::new(false);
 /// Where the cursor is, in logical pixels of the window that gets it (decision 0040).
@@ -1038,7 +1036,6 @@ pub fn spawn_click_through(
         .spawn(move || {
             let mut inside_prev: Option<bool> = None;
             let mut tick: u32 = 0;
-            let mut feed = CursorFeed::default();
             loop {
                 tick = tick.wrapping_add(1);
                 if drag_ended() {
@@ -1060,14 +1057,6 @@ pub fn spawn_click_through(
                 }
                 if let Some(cursor) = cursor_position() {
                     let p = *placement.lock();
-                    feed_cursor(
-                        &window,
-                        &CURSOR_ISLAND,
-                        &mut feed,
-                        cursor,
-                        p.origin,
-                        p.scale,
-                    );
                     let inside = island_hit(cursor, p.origin, p.scale, *rect.lock())
                         && !passes_through(cursor, Instant::now(), *PASSING.lock());
                     if inside_prev != Some(inside) {

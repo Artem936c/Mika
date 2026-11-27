@@ -41,7 +41,6 @@ export interface Look {
   pose: string;
   scale: number;
   frame: 'full' | 'waist' | 'close';
-  follow_cursor: boolean;
   idle_actions: boolean;
   /** The user's animation she loops at rest; empty: the rest pose. */
   idle_motion: string;
@@ -53,7 +52,6 @@ export const DEFAULT_LOOK: Look = {
   pose: 'relaxed',
   scale: 1,
   frame: 'full',
-  follow_cursor: true,
   idle_actions: true,
   idle_motion: '',
 };

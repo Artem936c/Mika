@@ -447,15 +447,14 @@ pub fn avatar_scale_step(app: AppHandle, ctx: CtxState<'_>, delta: f32) -> Resul
     Ok(scale)
 }
 
-/// A page asks for the cursor while a model there looks at it (decision 0040).
+/// The desktop window asks for the cursor: it tells clicks on her from
+/// clicks past her. She no longer looks at it (decision 0057), so the
+/// island gets none.
 #[tauri::command]
 pub fn avatar_cursor_wanted(window: tauri::WebviewWindow, on: bool) {
-    let flag = if window.label() == crate::window::AVATAR_LABEL {
-        &crate::window::CURSOR_AVATAR
-    } else {
-        &crate::window::CURSOR_ISLAND
-    };
-    flag.store(on, std::sync::atomic::Ordering::Relaxed);
+    if window.label() == crate::window::AVATAR_LABEL {
+        crate::window::CURSOR_AVATAR.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The cursor is over her in the desktop window, or not: the window takes
@@ -473,41 +472,6 @@ pub fn avatar_hover(window: tauri::WebviewWindow, over: bool) {
 #[tauri::command]
 pub fn avatar_dragging() {
     crate::window::AVATAR_DRAGGED.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// The user types in the island: the desktop avatar looks at the island.
-/// Tells it where the bottom of the island is, in its own logical pixels.
-#[tauri::command]
-pub fn avatar_typing(
-    app: AppHandle,
-    rect: tauri::State<'_, Arc<parking_lot::Mutex<crate::window::IslandRect>>>,
-) {
-    use tauri::Manager;
-    let (Some(island), Some(avatar)) = (
-        app.get_webview_window("island"),
-        app.get_webview_window(crate::window::AVATAR_LABEL),
-    ) else {
-        return;
-    };
-    let r = *rect.lock();
-    let (Ok(io), Ok(ik), Ok(ao), Ok(ak)) = (
-        island.inner_position(),
-        island.scale_factor(),
-        avatar.inner_position(),
-        avatar.scale_factor(),
-    ) else {
-        return;
-    };
-    let at = (
-        io.x + ((r.x + r.w / 2.0) * ik).round() as i32,
-        io.y + ((r.y + r.h) * ik).round() as i32,
-    );
-    let (x, y) = crate::window::cursor_payload(at, (ao.x, ao.y), ak);
-    let _ = app.emit_to(
-        crate::window::AVATAR_LABEL,
-        UI_CHANNEL,
-        serde_json::json!({ "action": "typing", "x": x, "y": y }),
-    );
 }
 
 /// Tells every window the look of the model changed.

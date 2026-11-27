@@ -729,8 +729,6 @@ pub struct AvatarConfig {
     pub scale: f32,
     /// What part of a model the chat column shows: one of `AVATAR_FRAMES`.
     pub frame: String,
-    /// A model looks at the cursor.
-    pub follow_cursor: bool,
     /// A model does something now and then when nothing goes on.
     pub idle_actions: bool,
     /// Id of the user's animation a model loops at rest (decision 0041);
@@ -750,7 +748,6 @@ impl Default for AvatarConfig {
             pose: "relaxed".into(),
             scale: 1.0,
             frame: "full".into(),
-            follow_cursor: true,
             idle_actions: true,
             idle_motion: String::new(),
             position: None,
@@ -780,7 +777,6 @@ pub struct AvatarLook {
     pub pose: String,
     pub scale: f32,
     pub frame: String,
-    pub follow_cursor: bool,
     pub idle_actions: bool,
     /// Empty: no animation at rest.
     #[serde(default)]
@@ -800,7 +796,6 @@ impl AvatarConfig {
             pose: known(&self.pose, &AVATAR_POSES, "relaxed"),
             scale: clamp_avatar_scale(self.scale),
             frame: known(&self.frame, &AVATAR_FRAMES, "full"),
-            follow_cursor: self.follow_cursor,
             idle_actions: self.idle_actions,
             idle_motion: if crate::avatar::is_model_id(&self.idle_motion) {
                 self.idle_motion.clone()
@@ -824,7 +819,6 @@ impl AvatarConfig {
         self.pose = look.pose;
         self.scale = look.scale;
         self.frame = look.frame;
-        self.follow_cursor = look.follow_cursor;
         self.idle_actions = look.idle_actions;
         self.idle_motion = look.idle_motion;
         let fixed = self.look();
@@ -1647,9 +1641,30 @@ model = \"\"
         assert_eq!(c.avatar.pose, "relaxed");
         assert_eq!(c.avatar.scale, 1.0);
         assert_eq!(c.avatar.frame, "full");
-        assert!(c.avatar.follow_cursor && c.avatar.idle_actions);
+        assert!(c.avatar.idle_actions);
         assert_eq!(c.avatar.idle_motion, "");
         assert_eq!(c.avatar.position, None);
+    }
+
+    #[test]
+    fn a_config_that_still_has_the_cursor_setting_loads() {
+        // Decision 0057 dropped `follow_cursor`; configs written before keep it.
+        let (_d, p) = tmp();
+        std::fs::write(
+            &p,
+            "[avatar]
+follow_cursor = true
+idle_actions = false
+",
+        )
+        .unwrap();
+        let c = Config::load(&p).unwrap();
+        assert!(!c.avatar.idle_actions);
+        let back: AvatarLook = serde_json::from_str(
+            r#"{"pose":"hip","scale":1.0,"frame":"full","follow_cursor":true,"idle_actions":true}"#,
+        )
+        .unwrap();
+        assert_eq!(back.pose, "hip");
     }
 
     #[test]
@@ -1667,7 +1682,6 @@ model = \"\"
             pose: "dance".into(),
             scale: 3.0,
             frame: "feet".into(),
-            follow_cursor: false,
             idle_actions: false,
             idle_motion: "../motions".into(),
         });
@@ -1675,13 +1689,12 @@ model = \"\"
         assert_eq!(look.pose, "relaxed");
         assert_eq!(look.scale, 1.6);
         assert_eq!(look.frame, "full");
-        assert!(!look.follow_cursor && !look.idle_actions);
+        assert!(!look.idle_actions);
         assert_eq!(look.idle_motion, "");
         avatar.set_look(AvatarLook {
             pose: "auto".into(),
             scale: 0.8,
             frame: "close".into(),
-            follow_cursor: true,
             idle_actions: true,
             idle_motion: "0123456789abcdef".into(),
         });

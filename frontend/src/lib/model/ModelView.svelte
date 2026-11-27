@@ -6,7 +6,7 @@
   import type { Emotion } from '../avatar';
   import type { FailKind, Scene } from './scene';
   import { FULL_STILL, stillsKey, windowLabel } from './show';
-  import { cursorWanted, live, releaseShownScene, setShownScene } from './live.svelte';
+  import { live, releaseShownScene, setShownScene } from './live.svelte';
   import { model, onSceneDrop, reportFailure, reportStillsFailure } from './state.svelte';
 
   let {
@@ -126,19 +126,6 @@
     return () => clearTimeout(timer);
   });
 
-  // The cursor comes from Rust only while a model here wants it: on the
-  // desktop always, to tell clicks on her from clicks past her.
-  $effect(() => {
-    // The desktop window asks for the cursor itself, for the clicks too.
-    if (desktop || scene === null || !model.look.follow_cursor) return;
-    // Views of a window are counted: the one that leaves does not take the cursor from the one that came.
-    const tell = (on: boolean | null) => {
-      if (on !== null) invoke('avatar_cursor_wanted', { on }).catch(() => {});
-    };
-    tell(cursorWanted(1));
-    return () => tell(cursorWanted(-1));
-  });
-
   $effect(() => {
     scene?.set({
       emotion,
@@ -153,9 +140,6 @@
       idleActions: model.look.idle_actions,
       idleMotion: model.look.idle_motion || null,
       frame: desktop ? 'full' : model.look.frame,
-      follow: model.look.follow_cursor,
-      cursor: live.cursor,
-      typing: live.typing,
     });
   });
 

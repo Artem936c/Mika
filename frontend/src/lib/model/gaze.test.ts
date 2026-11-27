@@ -1,20 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { CURSOR_INTEREST_MS, aimAt, angleTo, cursorInterest, pickGaze, STATE_GAZE } from './gaze';
+import { aimAt, pickGaze, STATE_GAZE } from './gaze';
 
 describe('where she looks', () => {
   it('follows the order of the design', () => {
-    expect(
-      pickGaze({
-        reaction: true,
-        typing: true,
-        state: true,
-        cursor: true,
-        emotion: true,
-      }),
-    ).toBe('reaction');
-    expect(pickGaze({ typing: true, state: true, cursor: true, emotion: true })).toBe('typing');
-    expect(pickGaze({ state: true, cursor: true, emotion: true })).toBe('state');
-    expect(pickGaze({ cursor: true, emotion: true })).toBe('cursor');
+    expect(pickGaze({ reaction: true, state: true, emotion: true })).toBe('reaction');
+    expect(pickGaze({ state: true, emotion: true })).toBe('state');
     expect(pickGaze({ emotion: true })).toBe('emotion');
     expect(pickGaze({})).toBe('wander');
   });
@@ -24,14 +14,7 @@ describe('where she looks', () => {
   });
 });
 
-describe('turning to a point', () => {
-  it('looks to her left for a point on the right of the screen, and up for a point above', () => {
-    const a = angleTo({ x: 300, y: 50 }, { x: 100, y: 100 }, 400);
-    expect(a.yaw).toBeGreaterThan(0);
-    expect(a.pitch).toBeGreaterThan(0);
-    expect(angleTo({ x: 0, y: 100 }, { x: 100, y: 100 }, 400).yaw).toBeLessThan(0);
-  });
-
+describe('turning to a gaze', () => {
   it('turns the head at most 35 degrees aside and 20 up or down; the eyes do the rest', () => {
     const far = aimAt(60, -40);
     expect(far.headYaw).toBe(35);
@@ -56,13 +39,5 @@ describe('turning to a point', () => {
       eyePitch: 0,
       bodyYaw: 0,
     });
-  });
-});
-
-describe('interest in the cursor', () => {
-  it('goes after 5 seconds of a still cursor', () => {
-    expect(CURSOR_INTEREST_MS).toBe(5000);
-    expect(cursorInterest(1000, 3000)).toBe(true);
-    expect(cursorInterest(1000, 6001)).toBe(false);
   });
 });

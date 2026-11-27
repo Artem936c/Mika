@@ -4,14 +4,15 @@
 
 import type { BodyState } from './body';
 
-export type GazeSource = 'reaction' | 'typing' | 'state' | 'cursor' | 'emotion' | 'wander';
+export type GazeSource = 'reaction' | 'state' | 'emotion' | 'wander';
 
-/** What there is to look at now; the first in the order of the design wins. */
-export function pickGaze(c: { reaction?: boolean; typing?: boolean; state?: boolean; cursor?: boolean; emotion?: boolean }): GazeSource {
+/**
+ * What there is to look at now; the first in the order of the design wins.
+ * She follows neither the cursor nor the typing (decision 0057).
+ */
+export function pickGaze(c: { reaction?: boolean; state?: boolean; emotion?: boolean }): GazeSource {
   if (c.reaction) return 'reaction';
-  if (c.typing) return 'typing';
   if (c.state) return 'state';
-  if (c.cursor) return 'cursor';
   if (c.emotion) return 'emotion';
   return 'wander';
 }
@@ -35,15 +36,6 @@ const BODY_SHARE = 0.4;
 
 const clamp = (v: number, limit: number) => Math.max(-limit, Math.min(limit, v)) + 0;
 
-/** Turn to a point of the window from her eyes at `eye`, both in pixels; `depth` is how far the viewer sits, pixels. */
-export function angleTo(point: { x: number; y: number }, eye: { x: number; y: number }, depth: number): { yaw: number; pitch: number } {
-  const d = Math.max(1, depth);
-  return {
-    yaw: (Math.atan2(point.x - eye.x, d) * 180) / Math.PI,
-    pitch: (Math.atan2(eye.y - point.y, d) * 180) / Math.PI,
-  };
-}
-
 /** How a turn of `yaw` and `pitch` is shared between the head, the eyes and the body. */
 export function aimAt(
   yaw: number,
@@ -65,12 +57,4 @@ export function aimAt(
     eyePitch: clamp(pitch - headPitch, EYES),
     bodyYaw: over > 0 ? Math.sign(yaw) * over * BODY_SHARE + 0 : 0,
   };
-}
-
-/** A cursor that has not moved this long is not looked at any more, ms. */
-export const CURSOR_INTEREST_MS = 5000;
-
-/** Whether a cursor that last moved at `movedAt` still holds her eyes at `now`. */
-export function cursorInterest(movedAt: number, now: number): boolean {
-  return now - movedAt <= CURSOR_INTEREST_MS;
 }

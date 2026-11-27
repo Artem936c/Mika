@@ -850,7 +850,7 @@ export async function install(scenario: string) {
   let activeModel = hasModel ? MOCK_MODEL_ID : '';
   const modelChanged = () => emit('mika://ui', { action: 'avatar_model_changed' });
   // `&persona=bold` moves her in the manner of that character (decision 0055).
-  let look = { pose: params.get('pose') ?? 'relaxed', scale: 1, frame: params.get('frame') ?? 'full', follow_cursor: true, idle_actions: true, idle_motion: '', persona: params.get('persona') ?? 'caring' };
+  let look = { pose: params.get('pose') ?? 'relaxed', scale: 1, frame: params.get('frame') ?? 'full', idle_actions: true, idle_motion: '', persona: params.get('persona') ?? 'caring' };
   // `&window` starts the preview as an ordinary window.
   let windowed = params.has('window');
   const ffmpeg = {
@@ -1891,8 +1891,6 @@ export async function install(scenario: string) {
         case 'avatar_hover':
         case 'avatar_dragging':
         case 'avatar_cursor_wanted':
-        case 'avatar_typing':
-          return null;
         case 'avatar_look':
           return look;
         case 'poke_avatar': {

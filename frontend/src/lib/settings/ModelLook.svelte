@@ -55,9 +55,6 @@
   <p class="lead">{t('persona.look_scale_lead')}</p>
 
   <div class="chips">
-    <button class="tg" aria-pressed={model.look.follow_cursor} class:on={model.look.follow_cursor} onclick={() => save({ follow_cursor: !model.look.follow_cursor })}>
-      {t('persona.look_cursor')}
-    </button>
     <button class="tg" aria-pressed={model.look.idle_actions} class:on={model.look.idle_actions} onclick={() => save({ idle_actions: !model.look.idle_actions })}>
       {t('persona.look_idle')}
     </button>

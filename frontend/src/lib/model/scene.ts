@@ -31,6 +31,7 @@ import {
   shouldRender,
   slotPose,
   slotWeights,
+  speakingFace,
   trunkPose,
   type ModelFrame,
   type Pose,
@@ -69,7 +70,7 @@ import {
 import { REST_POSES, restPoseOf, type RestPose } from './poses';
 import { RIG_BONES, add, mix, withSign, type RigBone, type RigPose } from './rig';
 import { FULL_STILL, stillName } from './show';
-import { STATE_GAZE, aimAt, angleTo, cursorInterest, pickGaze } from './gaze';
+import { STATE_GAZE, aimAt, pickGaze } from './gaze';
 import { mannerOf, reactionFor, restingEmotion } from './manner';
 import { Probe, REACTION, nearestBone, partOf, type TouchPart } from './touch';
 import { currentPhrase, mouthNow, voice } from './voice.svelte';
@@ -108,12 +109,6 @@ export interface SceneInput {
   idleMotion?: string | null;
   /** What part of her the view shows. */
   frame?: 'full' | 'waist' | 'close';
-  /** She looks at the cursor. */
-  follow?: boolean;
-  /** The cursor in pixels of the window, and when it last moved. */
-  cursor?: { x: number; y: number; movedAt: number } | null;
-  /** Where the user types, in pixels of the window, and when. */
-  typing?: { x: number; y: number; at: number } | null;
 }
 
 export interface Scene {
@@ -166,8 +161,6 @@ const EYES_GLIDE_MS = 70;
 const EYES_MAX_SPEED = 400;
 /** A small eye jump takes about this long, ms. */
 const JUMP_TAU = 20;
-/** A cursor that moved this recently is pursued, ms. */
-const PURSUIT_MS = 400;
 
 class LiveScene implements Scene {
   readonly expressions: ReadonlySet<string>;
@@ -271,12 +264,10 @@ class LiveScene implements Scene {
   /** How far her head and body are turned to what she looks at, degrees. */
   /** Head and body turn to what she looks at, gliding: degrees, degrees a millisecond. */
   private readonly turn = { yaw: { x: 0, v: 0 }, pitch: { x: 0, v: 0 }, body: { x: 0, v: 0 } };
-  /** Her eyes glide too, so a cursor that moves in steps does not shake them. */
+  /** Her eyes glide too, so a new target does not jerk them. */
   private readonly eyes = { yaw: { x: 0, v: 0 }, pitch: { x: 0, v: 0 } };
   /** The small eye jump as shown: it moves fast, but never in one frame. */
   private readonly jumpNow = { yaw: 0, pitch: 0 };
-  /** She follows a cursor that moves right now: the eyes pursue it without jumps. */
-  private pursuing = false;
   private readonly at = new THREE.Vector3();
   /** A small jump of the eyes on top of where they look. */
   private jump = { yaw: 0, pitch: 0 };
@@ -786,7 +777,8 @@ class LiveScene implements Scene {
     const slot = this.profile.slots[emotion];
 
     // The emotion comes in and the previous one goes out.
-    const targets = slotWeights(slot, this.expressions);
+    // While she speaks the emotion softens, so its mouth does not fight the lips.
+    const targets = speakingFace(slotWeights(slot, this.expressions), talking || voice.playing);
     for (const name of new Set([...this.emo.keys(), ...targets.keys()])) {
       const value = approach(this.emo.get(name) ?? 0, targets.get(name) ?? 0, dt, EMOTION_TAU);
       if (value < 0.001 && !targets.has(name)) this.emo.delete(name);
@@ -832,7 +824,7 @@ class LiveScene implements Scene {
     this.applyExpressions(out);
 
     // What she looks at: the head and body turn to it, the eyes do the rest.
-    const eyes = this.aimNow(now, dt, slot.gaze ?? null);
+    const eyes = this.aimNow(dt, slot.gaze ?? null);
 
     // Head and spine of the emotion, breathing, a one-off gesture.
     const want = slotPose(emotion);
@@ -882,9 +874,8 @@ class LiveScene implements Scene {
       this.jump = still ? { yaw: 0, pitch: 0 } : j;
       this.jumpAt = now + j.ms;
     }
-    const jumpTo = this.pursuing ? { yaw: 0, pitch: 0 } : this.jump;
-    this.jumpNow.yaw = approach(this.jumpNow.yaw, jumpTo.yaw, dt, JUMP_TAU);
-    this.jumpNow.pitch = approach(this.jumpNow.pitch, jumpTo.pitch, dt, JUMP_TAU);
+    this.jumpNow.yaw = approach(this.jumpNow.yaw, this.jump.yaw, dt, JUMP_TAU);
+    this.jumpNow.pitch = approach(this.jumpNow.pitch, this.jump.pitch, dt, JUMP_TAU);
     this.applyGaze(this.eyes.yaw.x + this.jumpNow.yaw, this.eyes.pitch.x + this.jumpNow.pitch);
 
     this.vrm.update(dt / 1000);
@@ -895,50 +886,21 @@ class LiveScene implements Scene {
    * eyes look past the head; null when the eyes keep their own way (the
    * gaze of the emotion or a glance aside).
    */
-  private aimNow(now: number, dt: number, emotionGaze: [number, number] | null): [number, number] | null {
-    const { still, cursor, typing } = this.input;
+  private aimNow(dt: number, emotionGaze: [number, number] | null): [number, number] | null {
     const state = bodyState(this.input.state ?? 'idle', this.input.working ?? false);
-    const typingNow = typing != null && now - typing.at < 1500;
-    const cursorNow = this.input.follow !== false && !still && cursor != null && cursorInterest(cursor.movedAt, now);
-    const source = pickGaze({
-      typing: typingNow,
-      state: state !== null,
-      cursor: cursorNow,
-      emotion: emotionGaze !== null,
-    });
+    const source = pickGaze({ state: state !== null, emotion: emotionGaze !== null });
     let want = { headYaw: 0, headPitch: 0, eyeYaw: 0, eyePitch: 0, bodyYaw: 0 };
     let eyes: [number, number] | null = null;
-    if ((source === 'typing' || source === 'cursor') && this.host) {
-      const point = source === 'typing' ? typing! : cursor!;
-      const a = angleTo(point, this.headOnScreen(), this.host.clientHeight * 1.5);
-      want = aimAt(a.yaw, a.pitch);
-      eyes = [want.eyeYaw, want.eyePitch];
-    } else if (source === 'state' && state) {
+    if (source === 'state' && state) {
       const [yaw, pitch] = STATE_GAZE[state];
       want = aimAt(yaw * 0.5, pitch * 0.5);
       eyes = [yaw * 0.5, pitch * 0.5];
     }
-    this.pursuing = source === 'cursor' && now - cursor!.movedAt < PURSUIT_MS;
     // The head gets there in about 350 ms, the body later; both start and stop softly.
     glide(this.turn.yaw, want.headYaw, dt, HEAD_GLIDE_MS, HEAD_MAX_SPEED);
     glide(this.turn.pitch, want.headPitch, dt, HEAD_GLIDE_MS, HEAD_MAX_SPEED);
     glide(this.turn.body, want.bodyYaw, dt, BODY_GLIDE_MS, BODY_MAX_SPEED);
     return eyes;
-  }
-
-  /** Her eyes on the page, pixels of the window. */
-  private headOnScreen(): { x: number; y: number } {
-    const host = this.host!;
-    const box = host.getBoundingClientRect();
-    const head = this.bones.head;
-    if (!head) return { x: box.left + box.width / 2, y: box.top + box.height * 0.2 };
-    head.getWorldPosition(this.at);
-    this.at.y += 0.06;
-    this.at.project(this.camera);
-    return {
-      x: box.left + ((this.at.x + 1) / 2) * box.width,
-      y: box.top + ((1 - this.at.y) / 2) * box.height,
-    };
   }
 
   private applyExpressions(weights: ReadonlyMap<string, number>) {
